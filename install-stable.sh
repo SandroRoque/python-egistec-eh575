@@ -7,6 +7,34 @@ CALIBRATION_DIR="/var/lib/open-fprintd/egis-calibration"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/open-fprintd-eh575"
 
+check_python_module() {
+    local module="$1"
+    python3 - "$module" <<'PY'
+import importlib
+import sys
+
+module = sys.argv[1]
+try:
+    importlib.import_module(module)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+echo "[*] Checking Python dependencies..."
+missing=()
+for module in cv2 numpy skimage usb dbus gi; do
+    if ! check_python_module "$module"; then
+        missing+=("$module")
+    fi
+done
+
+if [ "${#missing[@]}" -ne 0 ]; then
+    echo "[ERROR] Missing Python modules: ${missing[*]}"
+    echo "Install the matching distro packages before rerunning install-stable.sh."
+    exit 1
+fi
+
 echo "[*] Starting Installation from $SCRIPT_DIR..."
 echo "[*] Source directory: $PROJECT_DIR"
 
