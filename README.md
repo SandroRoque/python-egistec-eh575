@@ -234,23 +234,3 @@ sudo journalctl -u egis-bridge -n 80 --no-pager
 ls -ld /var/lib/open-fprintd/egis
 ls -ld /var/lib/open-fprintd/egis-calibration
 ```
-
-## Repository Hygiene
-
-The runtime driver lives under `open-fprintd-eh575/`. Reverse-engineering dumps, USB captures, calibration samples, and debug reports are intentionally not part of the public source tree.
-
-Keep generated artifacts out of commits:
-```bash
-find . -type d -name __pycache__ -prune -exec rm -rf {} +
-rm -rf tmp-egis-inspect
-rm -rf ghidra_dumps wireshark
-```
-
-## Submitting to AUR
-
-To publish this fork to the Arch User Repository:
-
-1. Update `PKGBUILD` with your name and GitHub URL
-2. Run `makepkg --printsrcinfo > .SRCINFO` to regenerate metadata
-3. Create an AUR account at [aur.archlinux.org](https://aur.archlinux.org)
-4. Submit via `git push` to `ssh://aur@aur.archlinux.org/open-fprintd-eh575.git`
