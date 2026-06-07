@@ -1,0 +1,343 @@
+#!/usr/bin/python3
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+import time
+import threading
+
+from egis_driver import egis_driver
+from egis_driver import fingerprint_matcher
+
+# --- Configuration ---
+DEVICE_IFACE = 'io.github.uunicorn.Fprint.Device'
+MANAGER_IFACE = 'net.reactivated.Fprint.Manager'
+MANAGER_OBJ = '/net/reactivated/Fprint/Manager'
+MANAGER_BUS = 'net.reactivated.Fprint'
+
+# Must be absolute because we are a system service now
+ENROLL_DIR = "/var/lib/open-fprintd/egis"
+
+# Config constants (formerly in egis_config.py)
+ENROLL_STAGES = 10
+VERIFY_FRAME_COUNT = 3
+
+class EgisBridge(dbus.service.Object):
+    def __init__(self, bus):
+        self.bus = bus
+        self.path = "/org/reactivated/Fprint/Device/Egis"
+        dbus.service.Object.__init__(self, bus, self.path)
+
+        print("[BRIDGE] Initializing Driver...")
+        self.driver = egis_driver.EgisDriver()
+
+        print(f"[BRIDGE] Initializing Matcher (Storage: {ENROLL_DIR})...")
+        self.matcher = fingerprint_matcher.FingerprintMatcher(enroll_dir=ENROLL_DIR)
+
+        self.scanning = False
+        self.scan_thread = None
+        self.enroll_scans = []
+
+        self._register_with_manager()
+
+    def _register_with_manager(self):
+        try:
+            manager_proxy = self.bus.get_object(MANAGER_BUS, MANAGER_OBJ)
+            manager = dbus.Interface(manager_proxy, MANAGER_IFACE)
+
+            manager.RegisterDevice(dbus.ObjectPath(self.path))
+
+            print("[BRIDGE] Successfully registered with open-fprintd!")
+        except Exception as e:
+            print(f"[BRIDGE] Failed to register: {e}")
+
+    # --- Thread Safety ---
+    def _stop_scan(self):
+        if self.scanning:
+            print("[BRIDGE] Stopping active scan...")
+            self.scanning = False
+
+        if self.scan_thread and self.scan_thread.is_alive():
+            self.scan_thread.join(timeout=2.0)
+            if self.scan_thread.is_alive():
+                print("[BRIDGE] WARNING: Thread did not exit cleanly!")
+            else:
+                print("[BRIDGE] Thread stopped.")
+
+    def _start_scan(self, target_func, args):
+        self._stop_scan()
+        self.scanning = True
+        self.scan_thread = threading.Thread(target=target_func, args=args)
+        self.scan_thread.start()
+
+    # --- DBus Methods ---
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='ss', out_signature='')
+    def VerifyStart(self, username, finger_name):
+        print(f"[BRIDGE] Verify Requested for user: {username}")
+        try:
+            self.driver._ensure_connected()
+            self.driver._initialize_sensor()
+        except Exception as e:
+            print(f"[BRIDGE] Sensor init warning: {e}")
+        target_finger = str(finger_name).strip() if finger_name else None
+        if target_finger == "any":
+            target_finger = None
+        print(f"[BRIDGE] Verify target: {target_finger or 'any enrolled finger'}")
+        self._start_scan(self._scan_loop, ("verify", username, target_finger))
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
+    def VerifyStop(self):
+        print("[BRIDGE] Verify Stopped")
+        self._stop_scan()
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='ss', out_signature='')
+    def EnrollStart(self, username, finger_name):
+        print(f"[BRIDGE] Enroll Requested for user: {username}")
+        self._stop_scan()
+        time.sleep(0.1)
+        try:
+            self.driver._ensure_connected()
+            self.driver._initialize_sensor()
+        except Exception as e:
+            print(f"[BRIDGE] Warning: Sensor init failed: {e}")
+
+        self.enroll_scans = []
+        self._enroll_touch_count = 0
+        target_finger = finger_name if finger_name else "right-index-finger"
+        self._start_scan(self._scan_loop, ("enroll", username, target_finger))
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
+    def EnrollStop(self):
+        print("[BRIDGE] Enroll Stopped")
+        self._stop_scan()
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
+    def Cancel(self):
+        print("[BRIDGE] Cancel Requested")
+        self._stop_scan()
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
+    def Suspend(self):
+        print("[BRIDGE] Suspend Requested")
+        self._stop_scan()
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
+    def Resume(self):
+        print("[BRIDGE] Resume Requested")
+        try:
+            self.driver._ensure_connected()
+            self.driver._initialize_sensor()
+        except Exception as e:
+            print(f"[BRIDGE] Resume sensor init warning: {e}")
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='s', out_signature='as')
+    def ListEnrolledFingers(self, username):
+        fingers = self.matcher.get_enrolled_fingers(username)
+        print(f"[BRIDGE] Listing fingers for {username}: {fingers}")
+        return fingers
+
+    @dbus.service.method(DEVICE_IFACE, in_signature='s', out_signature='')
+    def DeleteEnrolledFingers(self, username):
+        print(f"[BRIDGE] Deleting prints for {username}")
+        self.matcher.delete_user_fingers(username)
+
+    # --- Logic Core ---
+
+    def _wait_for_finger_release(self):
+        print("[BRIDGE] Waiting for finger release...")
+        time.sleep(0.3)
+        consecutive_clears = 0
+        while self.scanning:
+            _, _, is_present = self.driver.capture_presence_frame()
+            if not is_present:
+                consecutive_clears += 1
+                if consecutive_clears >= 2:
+                    print("[BRIDGE] Sensor clear. Ready.")
+                    return
+            else:
+                consecutive_clears = 0
+            time.sleep(0.1)
+
+    def _scan_loop(self, mode, username, finger_name):
+        print(f"[BRIDGE] Starting {mode} loop for {username} ({finger_name})...")
+        self.driver._ensure_connected()
+        self._wait_for_finger_release()
+
+        while self.scanning:
+            img, contrast, is_present = self.driver.capture_presence_frame()
+            if is_present:
+                print("[BRIDGE] Finger detected!")
+
+                if mode == "enroll":
+                    if img is not None:
+                        print(f"[BRIDGE] Captured frame. Contrast: {contrast:.2f}")
+                        self._handle_enroll(img, username, finger_name)
+                elif mode == "verify":
+                    self._handle_verify_continuous(username, finger_name, img, contrast)
+
+            time.sleep(0.05)
+
+    def _handle_enroll(self, img, username, finger_name):
+        time.sleep(0.05)
+
+        touch_frames = [img]
+        start = time.time()
+        capture_start = start
+        max_duration = 3.0
+
+        while time.time() - start < max_duration and self.scanning:
+            extra_img, contrast = self.driver.get_live_frame()
+            if extra_img is None or contrast < 15:
+                break
+            touch_frames.append(extra_img)
+
+        capture_ms = (time.time() - capture_start) * 1000.0
+        analysis = self.matcher.analyze_touch(touch_frames)
+        print("[BRIDGE] Enroll touch summary: frames=%d usable=%d contrast=%.1f/%.1f/%.1f "
+              "quality=%.3f max_kp=%d accepted=%s capture_ms=%.0f" % (
+                  analysis["frames"],
+                  analysis["usable_frames"],
+                  analysis["contrast_min"],
+                  analysis["contrast_avg"],
+                  analysis["contrast_max"],
+                  analysis["quality_avg"],
+                  analysis["max_keypoints"],
+                  analysis["usable"],
+                  capture_ms,
+              ))
+
+        if not analysis["usable"]:
+            print("[BRIDGE] Enrollment touch too weak; retrying same stage.")
+            GLib.idle_add(self.EnrollStatus, "enroll-retry-scan", False)
+            if self.scanning:
+                self._wait_for_finger_release()
+            return
+
+        self.enroll_scans.extend(touch_frames)
+
+        if not hasattr(self, '_enroll_touch_count'):
+            self._enroll_touch_count = 0
+        self._enroll_touch_count += 1
+
+        count = self._enroll_touch_count
+        target = ENROLL_STAGES
+
+        print(f"[BRIDGE] Enroll Progress: {count}/{target} "
+              f"(touch: {len(touch_frames)} frames, total: {len(self.enroll_scans)})")
+
+        if count < target:
+            GLib.idle_add(self.EnrollStatus, "enroll-stage-passed", False)
+        else:
+            unique_name = f"{username}_{finger_name}"
+            print(f"[BRIDGE] Processing enrollment for {unique_name} "
+                  f"({len(self.enroll_scans)} total frames)...")
+            success = self.matcher.enroll_finger(unique_name, self.enroll_scans)
+
+            if success:
+                print("[BRIDGE] Enrollment Successful!")
+                GLib.idle_add(self.EnrollStatus, "enroll-completed", True)
+            else:
+                print("[BRIDGE] Enrollment Failed")
+                GLib.idle_add(self.EnrollStatus, "enroll-failed", True)
+
+            self.scanning = False
+            self._enroll_touch_count = 0
+
+        if self.scanning:
+            self._wait_for_finger_release()
+
+    def _handle_verify_continuous(self, username, finger_name, initial_img=None, initial_contrast=0.0):
+        print("[BRIDGE] Continuous verify - trying while finger is on sensor...")
+        attempt = 0
+        low_contrast_streak = 0
+        pending_img = initial_img
+        pending_contrast = initial_contrast
+
+        while self.scanning:
+            capture_start = time.time()
+            frames = []
+            if pending_img is not None and pending_contrast >= 15:
+                frames.append(pending_img)
+            pending_img = None
+            pending_contrast = 0.0
+
+            while len(frames) < VERIFY_FRAME_COUNT:
+                extra_img, contrast = self.driver.get_live_frame()
+                if extra_img is None or contrast < 15:
+                    break
+                frames.append(extra_img)
+                time.sleep(0.01)
+
+            if len(frames) < VERIFY_FRAME_COUNT:
+                low_contrast_streak += 1
+                if low_contrast_streak >= 10:
+                    print("[BRIDGE] Finger lifted")
+                    break
+                time.sleep(0.05)
+                continue
+
+            low_contrast_streak = 0
+            attempt += 1
+
+            match_start = time.time()
+            match_name, score = self.matcher.verify_finger_multiframe(
+                frames,
+                username=username,
+                finger_name=finger_name,
+            )
+            match_ms = (time.time() - match_start) * 1000.0
+            total_ms = (time.time() - capture_start) * 1000.0
+            stats = getattr(self.matcher, "last_verify_stats", {})
+            best = stats.get("best", {})
+            print("[BRIDGE] Verify attempt summary: attempt=%d frames=%d keypoints=%d "
+                  "good=%d candidates=%d best_inliers=%d ridge=%.2f ncc=%.2f orient=%.2f "
+                  "calibrated=%s match=%s reject=%s capture_match_ms=%.0f/%.0f" % (
+                      attempt,
+                      len(frames),
+                      stats.get("keypoints", 0),
+                      stats.get("good_matches", 0),
+                      stats.get("candidates", 0),
+                      stats.get("best_inliers", 0),
+                      best.get("ridge_score", 0.0),
+                      best.get("ncc", 0.0),
+                      best.get("orientation", 0.0),
+                      stats.get("calibrated", False),
+                      match_name if match_name else "none",
+                      stats.get("reject_reason", "none"),
+                      total_ms - match_ms,
+                      match_ms,
+                  ))
+
+            if match_name:
+                print(f"[BRIDGE] Match: {match_name} (Inliers: {score}, Frames: {len(frames)})")
+                if match_name.startswith(username + "_"):
+                    print("[BRIDGE] AUTHENTICATED!")
+                    GLib.idle_add(self.VerifyStatus, "verify-match", True)
+                    self.scanning = False
+                    return
+                else:
+                    print(f"[BRIDGE] Wrong user! ({match_name})")
+
+            time.sleep(0.05)
+
+        print(f"[BRIDGE] No match after {attempt} attempts")
+        GLib.idle_add(self.VerifyStatus, "verify-retry-scan", False)
+
+    # --- Signals ---
+    @dbus.service.signal(DEVICE_IFACE, signature='sb')
+    def VerifyStatus(self, result, done): pass
+
+    @dbus.service.signal(DEVICE_IFACE, signature='s')
+    def VerifyFingerSelected(self, finger): pass
+
+    @dbus.service.signal(DEVICE_IFACE, signature='sb')
+    def EnrollStatus(self, result, done): pass
+
+if __name__ == '__main__':
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    name = dbus.service.BusName("io.github.uunicorn.Fprint.Device.Egis", bus)
+    device = EgisBridge(bus)
+    loop = GLib.MainLoop()
+    loop.run()

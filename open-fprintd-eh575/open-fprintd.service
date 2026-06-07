@@ -1,0 +1,18 @@
+[Unit]
+Description=Open Fprintd Manager (Opt Install)
+After=dbus.service
+Wants=dbus.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+# CRITICAL: Forces Python to look in /opt/egis-driver
+Environment="PYTHONPATH=/opt/egis-driver"
+WorkingDirectory=/opt/egis-driver
+ExecStart=/usr/bin/python3 -u ./open-fprintd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

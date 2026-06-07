@@ -1,0 +1,2 @@
+# EgisTec EH575 Fingerprint Sensor
+SUBSYSTEM=="usb", ATTR{idVendor}=="1c7a", ATTR{idProduct}=="0575", MODE="0660", GROUP="input"

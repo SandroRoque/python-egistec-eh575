@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.log
+*.tar.gz
+*.tar.xz
+*.pkg.tar.zst
+.vscode/
+.egistec/
+tmp-egis-inspect/
+ghidra_dumps/
+src/
+pkg/
+python-egistec-eh575/
+
+wireshark/

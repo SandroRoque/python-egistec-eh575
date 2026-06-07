@@ -1,0 +1,370 @@
+#!/usr/bin/python3
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+
+from egis_driver import egis_driver
+from egis_driver.fingerprint_matcher import (
+    CALIBRATION_DIR,
+    MATCHER_VERSION,
+    THRESHOLD_FILE,
+    FingerprintMatcher,
+)
+
+ENROLL_DIR = "/var/lib/open-fprintd/egis"
+SAMPLE_DIR = os.path.join(CALIBRATION_DIR, "samples")
+IDENTITY_POLICY = {
+    "min_inliers": 5,
+    "min_inlier_ratio": 0.35,
+    "min_inlier_frames": 1,
+    "min_frame_inliers": 5,
+    "min_margin": 1.0,
+    "min_ncc": 0.35,
+    "min_orientation": 0.75,
+    "min_ridge_score": 0.55,
+}
+
+
+def ensure_dirs():
+    os.makedirs(SAMPLE_DIR, mode=0o700, exist_ok=True)
+
+
+def wait_for_release(driver):
+    clear_count = 0
+    while clear_count < 2:
+        _, _, present = driver.capture_presence_frame()
+        clear_count = 0 if present else clear_count + 1
+        time.sleep(0.1)
+
+
+def capture_attempt(driver, frame_count):
+    wait_for_release(driver)
+    print("Touch the sensor now...")
+
+    frames = []
+    while len(frames) < frame_count:
+        img, contrast, present = driver.capture_presence_frame()
+        if present and img is not None:
+            frames.append(bytes(img))
+            print(f"  frame {len(frames)}/{frame_count}, contrast={contrast:.1f}")
+            time.sleep(0.02)
+        else:
+            time.sleep(0.05)
+
+    wait_for_release(driver)
+    return frames
+
+
+def save_sample(args, frames):
+    ensure_dirs()
+    ts = int(time.time() * 1000)
+    safe_user = args.username.replace("/", "_")
+    safe_target = args.target_finger.replace("/", "_")
+    safe_actual = args.actual_finger.replace("/", "_")
+    filename = f"{ts}_{safe_user}_{safe_target}_{args.label}_{safe_actual}.npy"
+    path = os.path.join(SAMPLE_DIR, filename)
+    sample = {
+        "matcher_version": MATCHER_VERSION,
+        "timestamp": ts,
+        "username": args.username,
+        "target_finger": args.target_finger,
+        "actual_finger": args.actual_finger,
+        "label": args.label,
+        "frames": frames,
+    }
+    np.save(path, np.array(sample, dtype=object))
+    os.chmod(path, 0o600)
+    print(f"Saved {path}")
+
+
+def collect(args):
+    driver = egis_driver.EgisDriver()
+    for idx in range(args.samples):
+        print(f"\nSample {idx + 1}/{args.samples}: {args.label} actual={args.actual_finger} target={args.target_finger}")
+        frames = capture_attempt(driver, args.frames)
+        save_sample(args, frames)
+
+
+def load_samples():
+    samples = []
+    if not os.path.isdir(SAMPLE_DIR):
+        return samples
+    for filename in sorted(os.listdir(SAMPLE_DIR)):
+        if not filename.endswith(".npy"):
+            continue
+        path = os.path.join(SAMPLE_DIR, filename)
+        try:
+            data = np.load(path, allow_pickle=True).item()
+            data["_path"] = path
+            samples.append(data)
+        except Exception as e:
+            print(f"Skipping {path}: {e}")
+    return samples
+
+
+def summarize_scores(records):
+    genuine = [r for r in records if r["label"] == "genuine"]
+    impostor = [r for r in records if r["label"] == "impostor"]
+
+    def metric_summary(items, metric):
+        values = sorted(
+            float(r["best"].get(metric, 0.0))
+            for r in items
+            if r["best"]
+        )
+        if not values:
+            return {"count": 0, "min": 0.0, "median": 0.0, "max": 0.0}
+        return {
+            "count": len(values),
+            "min": values[0],
+            "median": values[len(values) // 2],
+            "max": values[-1],
+        }
+
+    return {
+        "samples": len(records),
+        "genuine_samples": len(genuine),
+        "impostor_samples": len(impostor),
+        "genuine_scores": [r["best"].get("score", 0.0) for r in genuine],
+        "impostor_scores": [r["best"].get("score", 0.0) for r in impostor],
+        "genuine_scored": sum(1 for r in genuine if r["best"]),
+        "impostor_scored": sum(1 for r in impostor if r["best"]),
+        "metrics": {
+            "score": {
+                "genuine": metric_summary(genuine, "score"),
+                "impostor": metric_summary(impostor, "score"),
+            },
+            "inliers": {
+                "genuine": metric_summary(genuine, "inliers"),
+                "impostor": metric_summary(impostor, "inliers"),
+            },
+            "ncc": {
+                "genuine": metric_summary(genuine, "ncc"),
+                "impostor": metric_summary(impostor, "ncc"),
+            },
+            "orientation": {
+                "genuine": metric_summary(genuine, "orientation"),
+                "impostor": metric_summary(impostor, "orientation"),
+            },
+            "ridge_score": {
+                "genuine": metric_summary(genuine, "ridge_score"),
+                "impostor": metric_summary(impostor, "ridge_score"),
+            },
+        },
+    }
+
+
+def passes_thresholds(metrics, thresholds):
+    if not metrics:
+        return False
+    return (
+        metrics.get("inliers", 0) >= thresholds["min_inliers"] and
+        metrics.get("inlier_ratio", 0.0) >= thresholds["min_inlier_ratio"] and
+        metrics.get("inlier_frames", 0) >= thresholds["min_inlier_frames"] and
+        metrics.get("max_frame_inliers", 0) >= thresholds["min_frame_inliers"] and
+        metrics.get("margin", 0.0) >= thresholds["min_margin"] and
+        metrics.get("ncc", 0.0) >= thresholds["min_ncc"] and
+        metrics.get("orientation", 0.0) >= thresholds["min_orientation"] and
+        metrics.get("ridge_score", 0.0) >= thresholds["min_ridge_score"]
+    )
+
+
+def target_key(record):
+    return f"{record['username']}/{record['target_finger']}"
+
+
+def recommend_thresholds(records, min_genuine_samples=8, min_impostor_samples=8):
+    all_genuine = [r["best"] for r in records if r["label"] == "genuine" and r["best"]]
+    all_impostor_records = [r for r in records if r["label"] == "impostor"]
+    all_impostor = [r["best"] for r in records if r["label"] == "impostor" and r["best"]]
+
+    if not all_genuine:
+        raise RuntimeError("No genuine samples with scores; collect genuine samples first.")
+    if not all_impostor_records:
+        raise RuntimeError("No impostor samples; collect wrong-finger samples before writing thresholds.")
+
+    # Wrong-finger samples are an audit set, not training data. The identity
+    # policy is fixed and only genuine samples determine whether enrollment is
+    # usable enough to enable authentication.
+    thresholds = dict(IDENTITY_POLICY)
+    thresholds_by_target = {}
+
+    warnings = []
+    counts = {}
+    for record in records:
+        key = target_key(record)
+        counts.setdefault(key, {"genuine": 0, "impostor": 0})
+        counts[key][record["label"]] += 1
+
+    validation_targets = {}
+    for key, label_counts in sorted(counts.items()):
+        if label_counts["genuine"] < min_genuine_samples:
+            warnings.append(
+                f"{key} has {label_counts['genuine']} genuine samples; "
+                f"collect at least {min_genuine_samples}"
+            )
+        if label_counts["impostor"] < min_impostor_samples:
+            warnings.append(
+                f"{key} has {label_counts['impostor']} impostor samples; "
+                f"collect at least {min_impostor_samples}"
+            )
+
+        target_records = [r for r in records if target_key(r) == key]
+        genuine = [r["best"] for r in target_records if r["label"] == "genuine" and r["best"]]
+        impostor = [r["best"] for r in target_records if r["label"] == "impostor" and r["best"]]
+        target_thresholds = thresholds
+
+        genuine_pass = sum(1 for m in genuine if passes_thresholds(m, target_thresholds))
+        impostor_pass = sum(1 for m in impostor if passes_thresholds(m, target_thresholds))
+        validation_targets[key] = {
+            "genuine_pass": genuine_pass,
+            "genuine_scored": len(genuine),
+            "impostor_pass": impostor_pass,
+            "impostor_scored": len(impostor),
+            "uses_global_thresholds": True,
+            "thresholds": target_thresholds,
+        }
+
+        minimum_pass = max(1, len(genuine) // 2)
+        if genuine_pass < minimum_pass:
+            warnings.append(
+                f"{key} thresholds accept {genuine_pass}/{len(genuine)} scored genuine samples; "
+                "re-enroll or collect stronger genuine samples"
+            )
+        if impostor_pass > 0:
+            warnings.append(
+                f"{key} fixed identity policy accepted {impostor_pass} audit impostor sample(s); "
+                "do not enable authentication until the matcher or enrollment quality improves"
+            )
+
+    genuine_pass = sum(1 for m in all_genuine if passes_thresholds(m, thresholds))
+    impostor_pass = sum(1 for m in all_impostor if passes_thresholds(m, thresholds))
+    if genuine_pass == 0:
+        warnings.append("recommended thresholds accept zero genuine samples; re-enroll or collect stronger genuine samples")
+    if impostor_pass > 0:
+        warnings.append(
+            f"fixed identity policy accepted {impostor_pass} audit impostor sample(s); "
+            "negative samples are not used for tuning"
+        )
+
+    validation = {
+        "genuine_pass": genuine_pass,
+        "genuine_scored": len(all_genuine),
+        "impostor_pass": impostor_pass,
+        "impostor_scored": len(all_impostor),
+        "policy": "fixed_positive_identity",
+        "per_target_counts": dict(sorted(counts.items())),
+        "per_target": validation_targets,
+    }
+
+    return thresholds, thresholds_by_target, warnings, validation
+
+
+def analyze(args):
+    samples = load_samples()
+    if not samples:
+        raise RuntimeError(f"No samples found in {SAMPLE_DIR}")
+
+    matcher = FingerprintMatcher(enroll_dir=ENROLL_DIR)
+    records = []
+
+    for sample in samples:
+        frames = sample["frames"]
+        matcher.verify_finger_multiframe(
+            frames,
+            username=sample["username"],
+            finger_name=sample["target_finger"],
+            apply_thresholds=False,
+        )
+        best = matcher.last_verify_stats.get("best", {})
+        records.append({
+            "path": sample["_path"],
+            "label": sample["label"],
+            "username": sample["username"],
+            "target_finger": sample["target_finger"],
+            "actual_finger": sample["actual_finger"],
+            "best": best,
+        })
+
+    thresholds, thresholds_by_target, warnings, validation = recommend_thresholds(
+        records,
+        min_genuine_samples=args.min_genuine_samples,
+        min_impostor_samples=args.min_impostor_samples,
+    )
+    report = {
+        "matcher_version": MATCHER_VERSION,
+        "generated_at": int(time.time()),
+        "summary": summarize_scores(records),
+        "thresholds": thresholds,
+        "thresholds_by_target": thresholds_by_target,
+        "validation": validation,
+        "separable": not warnings,
+        "warnings": warnings,
+        "records": records,
+    }
+
+    ensure_dirs()
+    report_path = os.path.join(CALIBRATION_DIR, "report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+    os.chmod(report_path, 0o600)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    print(f"Wrote {report_path}")
+
+    if args.write_thresholds:
+        if warnings:
+            raise RuntimeError(
+                "Refusing to write thresholds because calibration has warnings. "
+                "Collect stronger genuine samples and representative impostor samples, then analyze again."
+            )
+        with open(THRESHOLD_FILE, "w") as f:
+            json.dump({
+                "matcher_version": MATCHER_VERSION,
+                "generated_at": report["generated_at"],
+                "validated": True,
+                "validation": validation,
+                "warnings": warnings,
+                "thresholds": thresholds,
+                "thresholds_by_target": thresholds_by_target,
+            }, f, indent=2, sort_keys=True)
+        os.chmod(THRESHOLD_FILE, 0o600)
+        print(f"Wrote {THRESHOLD_FILE}")
+
+
+def main():
+    parser = argparse.ArgumentParser("Egis EH575 calibration tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    collect_p = sub.add_parser("collect")
+    collect_p.add_argument("--username", required=True)
+    collect_p.add_argument("--target-finger", required=True)
+    collect_p.add_argument("--actual-finger", required=True)
+    collect_p.add_argument("--label", choices=["genuine", "impostor"], required=True)
+    collect_p.add_argument("--samples", type=int, default=5)
+    collect_p.add_argument("--frames", type=int, default=3)
+    collect_p.set_defaults(func=collect)
+
+    analyze_p = sub.add_parser("analyze")
+    analyze_p.add_argument("--write-thresholds", action="store_true")
+    analyze_p.add_argument("--min-genuine-samples", type=int, default=8)
+    analyze_p.add_argument("--min-impostor-samples", type=int, default=8)
+    analyze_p.set_defaults(func=analyze)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

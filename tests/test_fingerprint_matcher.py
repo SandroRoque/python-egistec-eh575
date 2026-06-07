@@ -1,0 +1,117 @@
+import json
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+import cv2
+import numpy as np
+
+from egis_driver import fingerprint_matcher
+
+
+class FingerprintMatcherStorageTests(unittest.TestCase):
+    def _matcher(self, enroll_dir, threshold_file=None):
+        patcher = mock.patch.object(
+            fingerprint_matcher,
+            "THRESHOLD_FILE",
+            threshold_file or os.path.join(enroll_dir, "thresholds.json"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fingerprint_matcher.FingerprintMatcher(enroll_dir=enroll_dir)
+
+    def test_unvalidated_threshold_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            threshold_file = os.path.join(tmp, "thresholds.json")
+            with open(threshold_file, "w") as f:
+                json.dump({
+                    "matcher_version": fingerprint_matcher.MATCHER_VERSION,
+                    "thresholds": {
+                        "min_inliers": 1,
+                        "min_inlier_ratio": 0.1,
+                        "min_inlier_frames": 1,
+                        "min_frame_inliers": 1,
+                        "min_margin": 0.0,
+                        "min_ncc": 0.0,
+                        "min_orientation": 0.0,
+                        "min_ridge_score": 0.0,
+                    },
+                }, f)
+
+            matcher = self._matcher(tmp, threshold_file)
+
+            self.assertFalse(matcher.calibrated)
+
+    def test_legacy_template_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kp = [(cv2.KeyPoint(x=1, y=1, size=1).pt, 1, -1, 0, 0, -1)]
+            des = np.ones((4, 128), dtype=np.float32)
+            np.save(os.path.join(tmp, "testuser_right-index-finger.npy"), np.array([(kp, des)], dtype=object))
+
+            matcher = self._matcher(tmp)
+
+            self.assertIsNone(matcher.train_descriptors)
+            self.assertEqual(matcher.get_enrolled_fingers("testuser"), [])
+            self.assertEqual(matcher.legacy_templates, ["testuser_right-index-finger.npy"])
+
+    def test_v3_template_loads_into_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = self._matcher(tmp)
+            img = np.zeros((52, 103), dtype=np.uint8)
+            cv2.line(img, (8, 8), (95, 44), 255, 2)
+            kp = [
+                (p.pt, p.size, p.angle, p.response, p.octave, p.class_id)
+                for p in [
+                    cv2.KeyPoint(x=10, y=10, size=2),
+                    cv2.KeyPoint(x=30, y=18, size=2),
+                    cv2.KeyPoint(x=50, y=26, size=2),
+                    cv2.KeyPoint(x=70, y=34, size=2),
+                ]
+            ]
+            data = {
+                "schema_version": fingerprint_matcher.TEMPLATE_SCHEMA_VERSION,
+                "matcher_version": fingerprint_matcher.MATCHER_VERSION,
+                "name": "testuser_right-index-finger",
+                "templates": [{
+                    "keypoints": kp,
+                    "descriptors": np.ones((4, 128), dtype=np.float32),
+                    "image": img,
+                    "ridge": matcher._template_descriptor(img),
+                    "quality": 0.5,
+                }],
+            }
+            np.save(os.path.join(tmp, "testuser_right-index-finger.npy"), np.array(data, dtype=object))
+
+            matcher.rebuild_index()
+
+            self.assertIsNotNone(matcher.train_descriptors)
+            self.assertEqual(matcher.get_enrolled_fingers("testuser"), ["right-index-finger"])
+
+    def test_any_finger_is_identification_not_literal_template_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = self._matcher(tmp)
+            default_thresholds = matcher._default_thresholds()
+            specific_thresholds = dict(default_thresholds)
+            specific_thresholds["min_inliers"] = default_thresholds["min_inliers"] + 10
+            matcher.thresholds_by_target = {
+                "testuser/right-index-finger": specific_thresholds,
+            }
+
+            self.assertIsNone(matcher._normalize_verify_finger("any"))
+            self.assertIsNone(matcher._normalize_verify_finger(""))
+            self.assertEqual(
+                matcher._normalize_verify_finger("right-index-finger"),
+                "right-index-finger",
+            )
+            self.assertEqual(
+                matcher._active_thresholds(
+                    "testuser",
+                    matcher._normalize_verify_finger("any"),
+                ),
+                default_thresholds,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
