@@ -3,6 +3,10 @@
 Linux driver for the EgisTec EH575 fingerprint sensor (USB VID `0x1c7a`, PID `0x0575`).
 Integrates with `open-fprintd` / `fprintd` for desktop fingerprint authentication.
 
+This is a fork of the original [python-egistec-eh575](https://github.com/abbhinavjayaraman/python-egistec-eh575) / `open-fprintd-eh575` work.
+It keeps the upstream reverse-engineering lineage intact while extending the driver,
+matcher, calibration flow, and lock-screen integration.
+
 ## Supported Devices
 
 Found in some ASUS and Lenovo laptops with onboard fingerprint readers using this sensor.
