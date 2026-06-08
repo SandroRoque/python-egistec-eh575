@@ -47,7 +47,6 @@ chmod 755 %{buildroot}/opt/egis-driver/egis-calibrate
 install -d %{buildroot}%{_unitdir}
 install -m 0644 open-fprintd.service %{buildroot}%{_unitdir}/
 install -m 0644 egis-bridge.service %{buildroot}%{_unitdir}/
-install -m 0644 egis-sleep-recovery.service %{buildroot}%{_unitdir}/
 
 # --- 3. Install Polkit Policy ---
 install -d %{buildroot}%{_datadir}/polkit-1/actions
@@ -67,15 +66,15 @@ install -d %{buildroot}%{_sharedstatedir}/open-fprintd/egis
 install -d %{buildroot}%{_sharedstatedir}/open-fprintd/egis-calibration
 
 %post
-%systemd_post open-fprintd.service egis-bridge.service egis-sleep-recovery.service
+%systemd_post open-fprintd.service egis-bridge.service
 # Reload udev rules
 udevadm control --reload-rules && udevadm trigger || :
 
 %preun
-%systemd_preun open-fprintd.service egis-bridge.service egis-sleep-recovery.service
+%systemd_preun open-fprintd.service egis-bridge.service
 
 %postun
-%systemd_postun_with_restart open-fprintd.service egis-bridge.service egis-sleep-recovery.service
+%systemd_postun_with_restart open-fprintd.service egis-bridge.service
 
 %files
 %license LICENSE
@@ -85,7 +84,6 @@ udevadm control --reload-rules && udevadm trigger || :
 # Systemd Units
 %{_unitdir}/open-fprintd.service
 %{_unitdir}/egis-bridge.service
-%{_unitdir}/egis-sleep-recovery.service
 
 # Configs
 %{_datadir}/polkit-1/actions/net.reactivated.fprint.policy

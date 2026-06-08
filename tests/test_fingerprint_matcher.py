@@ -2,28 +2,29 @@ import json
 import os
 import tempfile
 import unittest
-from unittest import mock
 
 import cv2
 import numpy as np
 
 from egis_driver import fingerprint_matcher
+from egis_driver.persistence import Persistence
 
 
 class FingerprintMatcherStorageTests(unittest.TestCase):
-    def _matcher(self, enroll_dir, threshold_file=None):
-        patcher = mock.patch.object(
-            fingerprint_matcher,
-            "THRESHOLD_FILE",
-            threshold_file or os.path.join(enroll_dir, "thresholds.json"),
+    def _persistence(self, root_dir):
+        persistence = Persistence(root_dir)
+        persistence.ensure_dirs()
+        return persistence
+
+    def _matcher(self, root_dir):
+        return fingerprint_matcher.FingerprintMatcher(
+            persistence=self._persistence(root_dir),
         )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return fingerprint_matcher.FingerprintMatcher(enroll_dir=enroll_dir)
 
     def test_unvalidated_threshold_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            threshold_file = os.path.join(tmp, "thresholds.json")
+            persistence = self._persistence(tmp)
+            threshold_file = os.path.join(persistence.calibration_dir, "thresholds.json")
             with open(threshold_file, "w") as f:
                 json.dump({
                     "matcher_version": fingerprint_matcher.MATCHER_VERSION,
@@ -39,17 +40,21 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
                     },
                 }, f)
 
-            matcher = self._matcher(tmp, threshold_file)
+            matcher = fingerprint_matcher.FingerprintMatcher(persistence=persistence)
 
             self.assertFalse(matcher.calibrated)
 
     def test_legacy_template_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
+            persistence = self._persistence(tmp)
             kp = [(cv2.KeyPoint(x=1, y=1, size=1).pt, 1, -1, 0, 0, -1)]
             des = np.ones((4, 128), dtype=np.float32)
-            np.save(os.path.join(tmp, "testuser_right-index-finger.npy"), np.array([(kp, des)], dtype=object))
+            np.save(
+                os.path.join(persistence.enroll_dir, "testuser_right-index-finger.npy"),
+                np.array([(kp, des)], dtype=object),
+            )
 
-            matcher = self._matcher(tmp)
+            matcher = fingerprint_matcher.FingerprintMatcher(persistence=persistence)
 
             self.assertIsNone(matcher.train_descriptors)
             self.assertEqual(matcher.get_enrolled_fingers("testuser"), [])
@@ -57,7 +62,8 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
 
     def test_v4_template_loads_into_index(self):
         with tempfile.TemporaryDirectory() as tmp:
-            matcher = self._matcher(tmp)
+            persistence = self._persistence(tmp)
+            matcher = fingerprint_matcher.FingerprintMatcher(persistence=persistence)
             img = np.zeros((52, 103), dtype=np.uint8)
             cv2.line(img, (8, 8), (95, 44), 255, 2)
             kp_points = [
@@ -66,11 +72,11 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
                 cv2.KeyPoint(x=50, y=26, size=2),
                 cv2.KeyPoint(x=70, y=34, size=2),
             ]
-            ridge = matcher._template_descriptor(img)
+            ridge = matcher.features.template_descriptor(img)
 
             base = "testuser_right-index-finger"
-            json_path = os.path.join(tmp, base + ".json")
-            npz_path = os.path.join(tmp, base + ".npz")
+            json_path = os.path.join(persistence.enroll_dir, base + ".json")
+            npz_path = os.path.join(persistence.enroll_dir, base + ".npz")
 
             meta = {
                 "schema_version": fingerprint_matcher.TEMPLATE_SCHEMA_VERSION,

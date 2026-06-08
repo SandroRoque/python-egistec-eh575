@@ -5,6 +5,7 @@ from openfprintd.device import Device, PermissionDenied
 import openfprintd.polkit as polkit
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Manager'
+logger = logging.getLogger("MANAGER")
 
 class NoSuchDevice(dbus.DBusException):
     _dbus_error_name = 'net.reactivated.Fprint.Error.NoSuchDevice'
@@ -24,11 +25,10 @@ class Manager(dbus.service.Object):
                 path='/org/freedesktop/login1',
             )
         except Exception as e:
-            logging.warning("Failed to subscribe to logind sleep signals: %s", e)
+            logger.warning("Failed to subscribe to logind sleep signals: %s", e)
 
     def _prepare_for_sleep(self, sleeping):
-        print("[MANAGER] PrepareForSleep %s" % sleeping)
-        logging.debug("PrepareForSleep %s", sleeping)
+        logger.info("PrepareForSleep %s", sleeping)
         for dev in self.devices.values():
             try:
                 if sleeping:
@@ -36,7 +36,7 @@ class Manager(dbus.service.Object):
                 else:
                     dev.Resume()
             except Exception as e:
-                logging.warning("Sleep transition handling failed: %s", e)
+                logger.warning("Sleep transition handling failed: %s", e)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='',

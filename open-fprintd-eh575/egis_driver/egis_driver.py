@@ -1,5 +1,6 @@
 import usb.core
 import usb.util
+import logging
 import time
 import numpy as np
 import threading
@@ -12,6 +13,8 @@ ENDPOINT_IN = 0x82
 IMG_WIDTH = 103
 IMG_HEIGHT = 52
 
+logger = logging.getLogger("DRIVER")
+
 class EgisDriver:
     def __init__(self):
         self._usb_lock = threading.RLock()
@@ -19,6 +22,7 @@ class EgisDriver:
         self.touch_threshold = 31.0
         self._last_iok = 0
         self._reconnect_delay = 10
+        self._released_for_sleep = False
         self._initialize_sensor()
 
     def _find_device(self):
@@ -44,7 +48,7 @@ class EgisDriver:
         return None
 
     def _initialize_sensor(self):
-        print("[DRIVER] Initializing Hardware...")
+        logger.info("Initializing Hardware...")
         patches = [
             "45 47 49 53 60 00 06", "45 47 49 53 60 01 06", "45 47 49 53 60 40 06",
             "45 47 49 53 61 0a f4", "45 47 49 53 61 0c 44", "45 47 49 53 61 40 00",
@@ -81,7 +85,7 @@ class EgisDriver:
         ]
         for c in final_cmds: self._send_hex(c)
         self._mark_iok()
-        print("[DRIVER] Hardware Ready.")
+        logger.info("Hardware Ready.")
 
     def _rearm(self):
         # The critical sequence from your working test
@@ -100,15 +104,27 @@ class EgisDriver:
         except Exception:
             pass
 
+    def release_for_sleep(self):
+        with self._usb_lock:
+            logger.info("Releasing USB resources for sleep")
+            self._dispose_device()
+            self._last_iok = 0
+            self._released_for_sleep = True
+
     def _reconnect(self):
         self._dispose_device()
         self.dev = self._find_device()
         self._initialize_sensor()
         self._last_iok = time.time()
+        self._released_for_sleep = False
 
     def _ensure_connected(self, force=False):
         with self._usb_lock:
             idle_for = time.time() - self._last_iok
+            if self._released_for_sleep:
+                logger.info("USB was released for sleep; forcing reconnect")
+                force = True
+
             if not force and idle_for < self._reconnect_delay:
                 return True
 
@@ -121,13 +137,13 @@ class EgisDriver:
                     return True
 
             reason = "forced" if force else "stale"
-            print("[DRIVER] USB %s (idle for %.0fs), reconnecting..." % (reason, idle_for))
+            logger.info("USB %s (idle for %.0fs), reconnecting...", reason, idle_for)
             try:
                 self._reconnect()
-                print("[DRIVER] Reconnected successfully.")
+                logger.info("Reconnected successfully.")
                 return True
             except Exception as e:
-                print(f"[DRIVER] Reconnect failed: {e}")
+                logger.warning("Reconnect failed: %s", e)
                 return False
 
     def force_reconnect(self):
@@ -140,13 +156,13 @@ class EgisDriver:
             self._initialize_sensor()
             return True
         except Exception as e:
-            print(f"[DRIVER] Refresh failed: {e}")
+            logger.warning("Refresh failed: %s", e)
             return self.force_reconnect()
 
     def _mark_iok(self):
         self._last_iok = time.time()
 
-    def get_live_frame(self):
+    def get_live_frame(self, read_timeout=1500):
         """
         Performs ONE atomic capture cycle: Rearm -> Trigger -> Read -> Contrast.
         Returns: (image_data, contrast_value)
@@ -159,7 +175,7 @@ class EgisDriver:
                 self.dev.write(ENDPOINT_OUT, bytes.fromhex("45 47 49 53 64 14 ec"))
 
                 # 2. The read logic stays inside the try block
-                data = self.dev.read(ENDPOINT_IN, 10000, timeout=1500)
+                data = self.dev.read(ENDPOINT_IN, 10000, timeout=read_timeout)
 
                 # Drain pipe
                 try: self.dev.read(ENDPOINT_IN, 512, timeout=20)
@@ -178,14 +194,14 @@ class EgisDriver:
                     return data, contrast
 
             except usb.core.USBError as e:
-                print(f"[DRIVER] USB Error: {e}")
+                logger.warning("USB Error: %s", e)
                 self._ensure_connected(force=True)
 
         return None, 0.0
 
-    def capture_presence_frame(self):
+    def capture_presence_frame(self, read_timeout=1500):
         """Capture once and return the frame, contrast, and touch decision."""
-        img, contrast = self.get_live_frame()
+        img, contrast = self.get_live_frame(read_timeout=read_timeout)
         return img, contrast, img is not None and contrast >= self.touch_threshold
 
     def check_sensor_clear(self):

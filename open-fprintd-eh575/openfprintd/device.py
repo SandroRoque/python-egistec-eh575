@@ -1,15 +1,14 @@
 import dbus
 import dbus.service
-import concurrent.futures
 import logging
 import os
-import pwd
-import threading
 from gi.repository import GLib
 import openfprintd.polkit as polkit
+import openfprintd.users as users
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Device'
 ENROLL_STAGES = 10
+logger = logging.getLogger("DEVICE")
 
 class AlreadyInUse(dbus.DBusException):
     _dbus_error_name = 'net.reactivated.Fprint.Error.AlreadyInUse'
@@ -27,10 +26,8 @@ class PermissionDenied(dbus.DBusException):
         super().__init__('Permission denied')
 
 class Device(dbus.service.Object):
-    cnt=0
-    _AUTH_MAX_WORKERS = 8
-    _auth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AUTH_MAX_WORKERS)
-    _auth_semaphore = threading.BoundedSemaphore(_AUTH_MAX_WORKERS * 2)
+    cnt = 0
+    _auth = polkit.AuthExecutor(max_workers=8, max_pending=16)
 
     def __init__(self, mgr):
         self.manager = mgr
@@ -53,35 +50,7 @@ class Device(dbus.service.Object):
 
     # --- Helper: Async Auth Wrapper ---
     def _run_with_auth(self, sender, action, success_cb, error_cb, operation_cb):
-        """
-        Runs the Polkit check in a thread to avoid blocking the main loop.
-        If successful, executes operation_cb() on the main thread.
-        Bounded by a thread pool and semaphore to prevent resource exhaustion.
-        """
-        if not Device._auth_semaphore.acquire(blocking=False):
-            GLib.idle_add(error_cb, PermissionDenied())
-            return
-
-        def auth_thread():
-            try:
-                polkit.check_privilege(sender, action)
-                GLib.idle_add(run_op)
-            except Exception:
-                GLib.idle_add(error_cb, PermissionDenied())
-            finally:
-                Device._auth_semaphore.release()
-
-        def run_op():
-            try:
-                result = operation_cb()
-                if result is not None:
-                    success_cb(result)
-                else:
-                    success_cb()
-            except Exception as e:
-                error_cb(e)
-
-        Device._auth_executor.submit(auth_thread)
+        Device._auth.authorize(sender, action, success_cb, error_cb, operation_cb)
 
     # --- Standard Methods ---
 
@@ -122,14 +91,18 @@ class Device(dbus.service.Object):
         self.target = None
 
     def Resume(self):
-        self.suspended = False
         if self.target is not None:
-            self.target.Resume()
-            self.call_cbs()
+            try:
+                self.target.Resume()
+            except Exception as e:
+                logger.warning("Target resume failed: %s", e)
+                self.suspended = True
+                return
+        self.call_cbs()
 
-    def Suspend(self):
+    def _clear_suspend_state(self):
         if self.owner_watcher is not None or self.busy:
-            print("[DEVICE] Clearing active fingerprint claim for suspend")
+            logger.info("Clearing active fingerprint claim for suspend")
         self.suspended = True
         self.callbacks = []
         self.claimed_by = None
@@ -138,8 +111,14 @@ class Device(dbus.service.Object):
         if self.owner_watcher is not None:
             self.owner_watcher.cancel()
             self.owner_watcher = None
+
+    def Suspend(self):
+        self._clear_suspend_state()
         if self.target is not None:
-            self.target.Suspend()
+            try:
+                self.target.Suspend()
+            except Exception as e:
+                logger.warning("Target suspend failed: %s", e)
 
     # ------------------ Template Database --------------------------
 
@@ -151,15 +130,10 @@ class Device(dbus.service.Object):
                          async_callbacks=('callback', 'errback'))
     def ListEnrolledFingers(self, username, sender, connection, callback, errback):
         logging.debug('ListEnrolledFingers')
-        if username is None or username == '':
-            uid=self.bus.get_unix_user(sender)
-            pw=pwd.getpwuid(uid)
-            username=pw.pw_name
-        else:
-            uid = self.bus.get_unix_user(sender)
-            pw = pwd.getpwuid(uid)
-            if username != pw.pw_name and uid != 0:
-                 raise PermissionDenied()
+        try:
+            username = users.resolve_username(self.bus, sender, username)
+        except users.PermissionError:
+            raise PermissionDenied()
 
         def cb():
             callback(self.target.ListEnrolledFingers(username, signature='s'))
@@ -175,12 +149,9 @@ class Device(dbus.service.Object):
         logging.debug('DeleteEnrolledFingers: %s' % username)
 
         def op():
-            uid = self.bus.get_unix_user(sender)
-            pw = pwd.getpwuid(uid)
-            target_user = username
-            if target_user is None or len(target_user) == 0:
-                target_user = pw.pw_name
-            elif target_user != pw.pw_name and uid != 0:
+            try:
+                target_user = users.resolve_username(self.bus, sender, username)
+            except users.PermissionError:
                 raise PermissionDenied()
             return self.target.DeleteEnrolledFingers(target_user, signature='s')
 
@@ -195,11 +166,9 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def Claim(self, username, sender, connection):
         logging.debug('Claim')
-        uid=self.bus.get_unix_user(sender)
-        pw=pwd.getpwuid(uid)
-        if username is None or len(username) == 0:
-            username = pw.pw_name
-        elif username != pw.pw_name and uid != 0:
+        try:
+            username = users.resolve_username(self.bus, sender, username)
+        except users.PermissionError:
             raise PermissionDenied()
 
         if self.owner_watcher is not None:

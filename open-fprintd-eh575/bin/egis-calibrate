@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 import argparse
 import json
-import os
 import sys
 import time
 
@@ -9,14 +8,11 @@ import numpy as np
 
 from egis_driver import egis_driver
 from egis_driver.fingerprint_matcher import (
-    CALIBRATION_DIR,
     MATCHER_VERSION,
-    THRESHOLD_FILE,
     FingerprintMatcher,
 )
+from egis_driver.persistence import Persistence
 
-ENROLL_DIR = "/var/lib/open-fprintd/egis"
-SAMPLE_DIR = os.path.join(CALIBRATION_DIR, "samples")
 IDENTITY_POLICY = {
     "min_inliers": 5,
     "min_inlier_ratio": 0.35,
@@ -28,9 +24,18 @@ IDENTITY_POLICY = {
     "min_ridge_score": 0.55,
 }
 
+_persistence = None
+
+
+def get_persistence():
+    global _persistence
+    if _persistence is None:
+        _persistence = Persistence("/var/lib/open-fprintd")
+    return _persistence
+
 
 def ensure_dirs():
-    os.makedirs(SAMPLE_DIR, mode=0o700, exist_ok=True)
+    get_persistence().ensure_dirs()
 
 
 def wait_for_release(driver):
@@ -66,8 +71,6 @@ def save_sample(args, frames):
     safe_target = args.target_finger.replace("/", "_")
     safe_actual = args.actual_finger.replace("/", "_")
     base = f"{ts}_{safe_user}_{safe_target}_{args.label}_{safe_actual}"
-    json_path = os.path.join(SAMPLE_DIR, base + ".json")
-    npz_path = os.path.join(SAMPLE_DIR, base + ".npz")
 
     meta = {
         "matcher_version": MATCHER_VERSION,
@@ -78,16 +81,12 @@ def save_sample(args, frames):
         "label": args.label,
         "num_frames": len(frames),
     }
-    with open(json_path, "w") as f:
-        json.dump(meta, f)
-    os.chmod(json_path, 0o600)
 
     save_data = {}
     for i, frame in enumerate(frames):
         save_data[f"frame_{i}"] = np.frombuffer(frame, dtype=np.uint8)
-    np.savez(npz_path, **save_data)
-    os.chmod(npz_path, 0o600)
 
+    get_persistence().save_sample(base, save_data, meta)
     print(f"Saved {base}")
 
 
@@ -101,42 +100,10 @@ def collect(args):
 
 def load_samples():
     samples = []
-    if not os.path.isdir(SAMPLE_DIR):
-        return samples
-    for filename in sorted(os.listdir(SAMPLE_DIR)):
-        if not filename.endswith(".npz"):
-            continue
-        base = filename[:-4]
-        json_path = os.path.join(SAMPLE_DIR, base + ".json")
-        npz_path = os.path.join(SAMPLE_DIR, filename)
-
-        try:
-            with open(json_path, "r") as f:
-                meta = json.load(f)
-        except Exception as e:
-            print(f"Skipping {base}: missing or corrupt metadata ({e})")
-            continue
-
-        try:
-            npz = np.load(npz_path, allow_pickle=False)
-        except Exception as e:
-            print(f"Skipping {base}: {e}")
-            continue
-
-        num_frames = meta.get("num_frames", 0)
-        frames = []
-        for i in range(num_frames):
-            key = f"frame_{i}"
-            if key in npz:
-                frames.append(npz[key].tobytes())
-            else:
-                break
-
+    for base, meta, frames in get_persistence().list_samples():
         meta["frames"] = frames
-        meta["_path"] = json_path
-        del meta["num_frames"]
+        meta["_path"] = ""  # not a real path anymore, kept for compat
         samples.append(meta)
-
     return samples
 
 
@@ -301,9 +268,10 @@ def recommend_thresholds(records, min_genuine_samples=8, min_impostor_samples=8)
 def analyze(args):
     samples = load_samples()
     if not samples:
-        raise RuntimeError(f"No samples found in {SAMPLE_DIR}")
+        raise RuntimeError("No samples found in calibration directory")
 
-    matcher = FingerprintMatcher(enroll_dir=ENROLL_DIR)
+    persistence = get_persistence()
+    matcher = FingerprintMatcher(persistence=persistence)
     records = []
 
     for sample in samples:
@@ -342,12 +310,9 @@ def analyze(args):
     }
 
     ensure_dirs()
-    report_path = os.path.join(CALIBRATION_DIR, "report.json")
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2, sort_keys=True)
-    os.chmod(report_path, 0o600)
+    persistence.save_report(report)
     print(json.dumps(report, indent=2, sort_keys=True))
-    print(f"Wrote {report_path}")
+    print("Wrote calibration report")
 
     if args.write_thresholds:
         if warnings:
@@ -355,18 +320,16 @@ def analyze(args):
                 "Refusing to write thresholds because calibration has warnings. "
                 "Collect stronger genuine samples and representative impostor samples, then analyze again."
             )
-        with open(THRESHOLD_FILE, "w") as f:
-            json.dump({
-                "matcher_version": MATCHER_VERSION,
-                "generated_at": report["generated_at"],
-                "validated": True,
-                "validation": validation,
-                "warnings": warnings,
-                "thresholds": thresholds,
-                "thresholds_by_target": thresholds_by_target,
-            }, f, indent=2, sort_keys=True)
-        os.chmod(THRESHOLD_FILE, 0o600)
-        print(f"Wrote {THRESHOLD_FILE}")
+        persistence.save_thresholds({
+            "matcher_version": MATCHER_VERSION,
+            "generated_at": report["generated_at"],
+            "validated": True,
+            "validation": validation,
+            "warnings": warnings,
+            "thresholds": thresholds,
+            "thresholds_by_target": thresholds_by_target,
+        })
+        print("Wrote thresholds")
 
 
 def main():

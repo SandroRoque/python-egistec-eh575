@@ -40,9 +40,10 @@ echo "[*] Source directory: $PROJECT_DIR"
 
 # 1. Clean up old mess
 echo "[*] Cleaning up old services and paths..."
-sudo systemctl stop open-fprintd egis-bridge 2>/dev/null
-sudo systemctl disable open-fprintd egis-bridge 2>/dev/null
+sudo systemctl stop open-fprintd egis-bridge egis-sleep-recovery 2>/dev/null
+sudo systemctl disable open-fprintd egis-bridge egis-sleep-recovery 2>/dev/null
 sudo rm -f /usr/bin/open-fprintd /usr/bin/egis-bridge
+sudo rm -f /etc/systemd/system/egis-sleep-recovery.service
 
 # 2. Create Directory Structure
 echo "[*] Creating /opt directory structure..."
@@ -151,23 +152,6 @@ SystemCallArchitectures=native
 WantedBy=multi-user.target
 EOF
 
-# -- Sleep Recovery Service --
-sudo tee /etc/systemd/system/egis-sleep-recovery.service > /dev/null <<EOF
-[Unit]
-Description=Egis Fingerprint Sleep Recovery
-Before=sleep.target
-StopWhenUnneeded=yes
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/systemctl stop egis-bridge.service
-ExecStop=/usr/bin/systemctl restart egis-bridge.service
-
-[Install]
-WantedBy=sleep.target
-EOF
-
 # 7. Finalize
 echo "[*] Setting permissions..."
 sudo chmod +x "$INSTALL_DIR/open-fprintd"
@@ -179,7 +163,7 @@ sudo chmod 700 "$CALIBRATION_DIR"
 echo "[*] reloading udev and systemd..."
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo systemctl daemon-reload
-sudo systemctl enable open-fprintd egis-bridge egis-sleep-recovery
+sudo systemctl enable open-fprintd egis-bridge
 sudo systemctl restart open-fprintd egis-bridge
 
 echo "[SUCCESS] Installation Complete."
