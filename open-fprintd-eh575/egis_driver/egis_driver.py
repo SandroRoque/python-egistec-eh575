@@ -37,29 +37,30 @@ class EgisDriver:
         dev.set_configuration()
         return dev
 
-    def _send_hex(self, hex_str, read_resp=True):
+    def _send_hex(self, hex_str, read_resp=True, timeout_ms=1000):
         cmd = bytes.fromhex(hex_str)
         try:
             self.dev.write(ENDPOINT_OUT, cmd)
             if read_resp:
-                return self.dev.read(ENDPOINT_IN, 64, timeout=1000)
+                return self.dev.read(ENDPOINT_IN, 64, timeout=timeout_ms)
         except usb.core.USBError:
             pass
         return None
 
-    def _initialize_sensor(self):
-        logger.info("Initializing Hardware...")
+    def _initialize_sensor(self, fast=False):
+        read_timeout = 200 if fast else 500
+        logger.info("Initializing Hardware (fast=%s, timeout=%dms)...", fast, read_timeout)
         patches = [
             "45 47 49 53 60 00 06", "45 47 49 53 60 01 06", "45 47 49 53 60 40 06",
             "45 47 49 53 61 0a f4", "45 47 49 53 61 0c 44", "45 47 49 53 61 40 00",
             "45 47 49 53 60 40 00", "45 47 49 53 71 02 02 01 0c", "45 47 49 53 61 0c 22",
             "45 47 49 53 61 0b 03", "45 47 49 53 61 0a fc"
         ]
-        for p in patches: self._send_hex(p)
+        for p in patches: self._send_hex(p, timeout_ms=read_timeout)
 
-        self._send_hex("45 47 49 53 60 00 fc")
-        self._send_hex("45 47 49 53 60 01 fc")
-        self._send_hex("45 47 49 53 60 41 fc")
+        self._send_hex("45 47 49 53 60 00 fc", timeout_ms=read_timeout)
+        self._send_hex("45 47 49 53 60 01 fc", timeout_ms=read_timeout)
+        self._send_hex("45 47 49 53 60 41 fc", timeout_ms=read_timeout)
 
         init_cmds = [
             "45 47 49 53 97 00 00",
@@ -72,7 +73,7 @@ class EgisDriver:
             "45 47 49 53 61 0c 44", "45 47 49 53 61 50 03", "45 47 49 53 60 50 03",
         ]
         for c in init_cmds:
-            self._send_hex(c)
+            self._send_hex(c, timeout_ms=read_timeout)
             time.sleep(0.002)
 
         final_cmds = [
@@ -83,20 +84,20 @@ class EgisDriver:
             "45 47 49 53 61 24 33", "45 47 49 53 61 20 00", "45 47 49 53 61 21 66",
             "45 47 49 53 60 00 66", "45 47 49 53 60 01 66",
         ]
-        for c in final_cmds: self._send_hex(c)
+        for c in final_cmds: self._send_hex(c, timeout_ms=read_timeout)
         self._mark_iok()
         logger.info("Hardware Ready.")
 
     def _rearm(self):
         # The critical sequence from your working test
-        self._send_hex("45 47 49 53 61 2d 20")
-        self._send_hex("45 47 49 53 60 00 20")
-        self._send_hex("45 47 49 53 60 01 20")
-        self._send_hex("45 47 49 53 63 2c 02 00 57")
-        self._send_hex("45 47 49 53 60 2d 02")
-        self._send_hex("45 47 49 53 62 67 03")
-        self._send_hex("45 47 49 53 63 2c 02 00 13")
-        self._send_hex("45 47 49 53 60 00 02")
+        self._send_hex("45 47 49 53 61 2d 20", timeout_ms=200)
+        self._send_hex("45 47 49 53 60 00 20", timeout_ms=200)
+        self._send_hex("45 47 49 53 60 01 20", timeout_ms=200)
+        self._send_hex("45 47 49 53 63 2c 02 00 57", timeout_ms=200)
+        self._send_hex("45 47 49 53 60 2d 02", timeout_ms=200)
+        self._send_hex("45 47 49 53 62 67 03", timeout_ms=200)
+        self._send_hex("45 47 49 53 63 2c 02 00 13", timeout_ms=200)
+        self._send_hex("45 47 49 53 60 00 02", timeout_ms=200)
 
     def _dispose_device(self):
         try:
@@ -111,19 +112,29 @@ class EgisDriver:
             self._last_iok = 0
             self._released_for_sleep = True
 
-    def _reconnect(self):
+    def _reconnect(self, reset=False):
+        was_sleeping = self._released_for_sleep
+        self._released_for_sleep = False
         self._dispose_device()
         self.dev = self._find_device()
-        self._initialize_sensor()
+        if reset:
+            try:
+                logger.info("Resetting USB device")
+                self.dev.reset()
+                time.sleep(0.25)
+                self.dev = self._find_device()
+            except Exception as e:
+                logger.warning("USB reset failed: %s", e)
+        self._initialize_sensor(fast=was_sleeping)
         self._last_iok = time.time()
-        self._released_for_sleep = False
 
-    def _ensure_connected(self, force=False):
+    def _ensure_connected(self, force=False, reset=False):
         with self._usb_lock:
             idle_for = time.time() - self._last_iok
             if self._released_for_sleep:
                 logger.info("USB was released for sleep; forcing reconnect")
                 force = True
+                reset = True
 
             if not force and idle_for < self._reconnect_delay:
                 return True
@@ -137,17 +148,23 @@ class EgisDriver:
                     return True
 
             reason = "forced" if force else "stale"
-            logger.info("USB %s (idle for %.0fs), reconnecting...", reason, idle_for)
+            reset_label = " with reset" if reset else ""
+            logger.info(
+                "USB %s%s (idle for %.0fs), reconnecting...",
+                reason,
+                reset_label,
+                idle_for,
+            )
             try:
-                self._reconnect()
+                self._reconnect(reset=reset)
                 logger.info("Reconnected successfully.")
                 return True
             except Exception as e:
                 logger.warning("Reconnect failed: %s", e)
                 return False
 
-    def force_reconnect(self):
-        return self._ensure_connected(force=True)
+    def force_reconnect(self, reset=False):
+        return self._ensure_connected(force=True, reset=reset)
 
     def refresh_after_idle(self, idle_seconds=300):
         if time.time() - self._last_iok >= idle_seconds:

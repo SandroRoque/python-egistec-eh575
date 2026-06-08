@@ -12,6 +12,10 @@ VERIFY_FRAME_COUNT = 3
 RESUME_RECOVERY_WAIT_SECONDS = 2.5
 RESUME_RECOVERY_MAX_ATTEMPTS = 3
 RESUME_RECOVERY_WARMUP_FRAMES = 4
+VERIFY_NO_TOUCH_TIMEOUT_SECONDS = 15.0
+VERIFY_PRESENCE_THRESHOLD = 24.0
+VERIFY_PRESENCE_DELTA = 8.0
+VERIFY_BASELINE_SAMPLE_COUNT = 12
 
 
 class EgisService:
@@ -41,7 +45,14 @@ class EgisService:
         self._resume_recovery_thread = None
         self._resume_recovery_running = False
         self._resume_generation = 0
+        self._last_suspend_at = None
+        self._last_resume_at = None
         self._last_resume_result = None
+        self._verify_session_id = 0
+        self._active_verify_terminal = False
+        self._last_no_touch_timeout_at = None
+        self._last_no_touch_timeout_session = None
+        self._verify_baseline_contrast = None
 
         self.on_enroll_status = on_enroll_status
         self.on_verify_status = on_verify_status
@@ -55,7 +66,7 @@ class EgisService:
         try:
             if force:
                 logger.info("Preparing sensor (%s): forced reconnect", reason)
-                ok = self._driver.force_reconnect()
+                ok = self._driver.force_reconnect(reset=reason.startswith("resume"))
                 if ok:
                     self._warm_sensor(reason)
                 if ok:
@@ -129,24 +140,54 @@ class EgisService:
     def start_enroll(self, username, finger_name):
         self._stop_scan()
         time.sleep(0.1)
-        self.prepare_sensor("enroll-start")
 
         self._enroll_scans = []
         self._enroll_touch_count = 0
         target_finger = finger_name if finger_name else "right-index-finger"
-        self._start_scan(self._scan_loop, ("enroll", username, target_finger, False))
+        self._start_scan(self._scan_loop, ("enroll", username, target_finger, True))
 
     # ------------------------------------------------------------------
     #  Verification
     # ------------------------------------------------------------------
 
     def start_verify(self, username, finger_name):
-        prepared = self.prepare_sensor("verify-start")
+        self._verify_session_id += 1
+        session_id = self._verify_session_id
+        now = time.time()
+        seconds_since_resume = self._seconds_since(self._last_resume_at, now)
+        seconds_since_suspend = self._seconds_since(self._last_suspend_at, now)
+        resume_result = self._last_resume_result or {}
+        logger.info(
+            "Verify session %d requested: user=%s raw_finger=%s "
+            "seconds_since_resume=%s seconds_since_suspend=%s "
+            "resume_generation=%s resume_ok=%s resume_elapsed_ms=%s "
+            "resume_ready=%s recovery_running=%s last_no_touch_session=%s",
+            session_id,
+            username,
+            finger_name or "none",
+            self._format_seconds(seconds_since_resume),
+            self._format_seconds(seconds_since_suspend),
+            resume_result.get("generation", "none"),
+            resume_result.get("ok", "none"),
+            self._format_ms(resume_result.get("elapsed_ms")),
+            self._resume_ready.is_set(),
+            self._resume_recovery_running,
+            self._last_no_touch_timeout_session or "none",
+        )
+
+        self._active_verify_terminal = False
         target_finger = str(finger_name).strip() if finger_name else None
         if target_finger == "any":
             target_finger = None
-        logger.info("Verify target: %s", target_finger or "any enrolled finger")
-        self._start_scan(self._scan_loop, ("verify", username, target_finger, not prepared))
+        logger.info(
+            "Verify session %d target: %s",
+            session_id,
+            target_finger or "any enrolled finger",
+        )
+        self._start_scan(
+            self._scan_loop,
+            ("verify", username, target_finger, True, session_id),
+        )
 
     # ------------------------------------------------------------------
     #  Lifecycle
@@ -154,20 +195,27 @@ class EgisService:
 
     def cancel(self):
         scan_mode = self._scan_mode
+        active_verify_terminal = self._active_verify_terminal
         self._stop_scan()
-        if scan_mode == "verify":
+        if scan_mode == "verify" and not active_verify_terminal:
             logger.info("Verify canceled; emitting terminal no-match")
             self._emit_verify("verify-no-match", True)
+        elif scan_mode == "verify":
+            logger.info("Verify canceled after terminal status; no extra status emitted")
         elif scan_mode == "enroll":
             logger.info("Enroll canceled; emitting terminal failure")
             self._emit_enroll("enroll-failed", True)
 
     def suspend(self):
+        self._last_suspend_at = time.time()
+        logger.info("Service suspend: active_mode=%s", self._scan_mode)
         self._resume_ready.clear()
         self._stop_scan()
         self._driver.release_for_sleep()
 
     def resume(self):
+        self._last_resume_at = time.time()
+        logger.info("Service resume: starting recovery")
         self._start_resume_recovery()
 
     def _start_resume_recovery(self):
@@ -214,6 +262,7 @@ class EgisService:
                     "ok": ok,
                     "generation": generation,
                     "elapsed_ms": elapsed_ms,
+                    "completed_at": time.time(),
                 }
                 self._resume_recovery_running = False
                 self._resume_ready.set()
@@ -253,6 +302,37 @@ class EgisService:
         self._scan_thread = threading.Thread(target=target_func, args=args)
         self._scan_thread.start()
 
+    def _seconds_since(self, timestamp, now=None):
+        if timestamp is None:
+            return None
+        return (now or time.time()) - timestamp
+
+    def _format_seconds(self, value):
+        if value is None:
+            return "none"
+        return f"{value:.1f}s"
+
+    def _format_ms(self, value):
+        if value is None:
+            return "none"
+        return f"{float(value):.0f}"
+
+    def _format_float(self, value):
+        if value is None:
+            return "none"
+        return f"{float(value):.1f}"
+
+    def _is_verify_touch(self, contrast):
+        if contrast >= self._driver.touch_threshold:
+            return True, "driver-threshold"
+        if contrast >= VERIFY_PRESENCE_THRESHOLD:
+            return True, "verify-threshold"
+        if (
+                self._verify_baseline_contrast is not None and
+                contrast >= self._verify_baseline_contrast + VERIFY_PRESENCE_DELTA):
+            return True, "baseline-delta"
+        return False, "none"
+
     # ------------------------------------------------------------------
     #  Scan loop
     # ------------------------------------------------------------------
@@ -272,27 +352,78 @@ class EgisService:
                 consecutive_clears = 0
             time.sleep(0.1)
 
-    def _scan_loop(self, mode, username, finger_name, prepare_before_loop=True):
-        logger.info("Starting %s loop for %s (%s)...", mode, username, finger_name)
+    def _scan_loop(self, mode, username, finger_name, prepare_before_loop=True, session_id=None):
+        session_label = session_id if session_id is not None else "none"
+        now = time.time()
+        logger.info(
+            "Starting %s loop session=%s user=%s finger=%s "
+            "prepare_before_loop=%s seconds_since_resume=%s",
+            mode,
+            session_label,
+            username,
+            finger_name,
+            prepare_before_loop,
+            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
+        )
         if prepare_before_loop:
             self.prepare_sensor(f"{mode}-loop")
         self._wait_for_finger_release()
         empty_frames = 0
         no_touch_since = time.time()
+        verify_started_at = no_touch_since
         last_idle_recovery = no_touch_since
+        no_touch_contrasts = []
+        baseline_samples = []
 
         while self._scanning:
             img, contrast, is_present = self._driver.capture_presence_frame()
+            touch_reason = "driver-threshold" if is_present else "none"
+            if mode == "verify" and img is not None:
+                if self._verify_baseline_contrast is None:
+                    baseline_samples.append(float(contrast))
+                    if len(baseline_samples) >= VERIFY_BASELINE_SAMPLE_COUNT:
+                        self._verify_baseline_contrast = (
+                            sum(baseline_samples) / len(baseline_samples)
+                        )
+                        logger.info(
+                            "Verify baseline contrast established: baseline=%.1f "
+                            "samples=%d session=%s threshold=%.1f verify_threshold=%.1f "
+                            "delta=%.1f seconds_since_resume=%s",
+                            self._verify_baseline_contrast,
+                            len(baseline_samples),
+                            session_label,
+                            self._driver.touch_threshold,
+                            VERIFY_PRESENCE_THRESHOLD,
+                            VERIFY_PRESENCE_DELTA,
+                            self._format_seconds(self._seconds_since(self._last_resume_at)),
+                        )
+                is_present, touch_reason = self._is_verify_touch(float(contrast))
+
             if img is None:
                 empty_frames += 1
                 if empty_frames >= 10:
                     logger.warning("No sensor frames; forcing USB recovery...")
-                    self._driver.force_reconnect()
+                    self._driver.force_reconnect(reset=True)
                     empty_frames = 0
             else:
                 empty_frames = 0
 
             if is_present:
+                if no_touch_contrasts:
+                    logger.info(
+                        "Touch detected after no-touch window: reason=%s contrast_now=%.1f "
+                        "window_avg=%.1f window_max=%.1f samples=%d session=%s "
+                        "baseline=%s seconds_since_resume=%s",
+                        touch_reason,
+                        contrast,
+                        sum(no_touch_contrasts) / len(no_touch_contrasts),
+                        max(no_touch_contrasts),
+                        len(no_touch_contrasts),
+                        session_label,
+                        self._format_float(self._verify_baseline_contrast),
+                        self._format_seconds(self._seconds_since(self._last_resume_at)),
+                    )
+                    no_touch_contrasts = []
                 no_touch_since = time.time()
                 logger.info("Finger detected!")
 
@@ -304,13 +435,63 @@ class EgisService:
                     self._handle_verify_continuous(username, finger_name, img, contrast)
                     no_touch_since = time.time()
             elif mode == "verify":
+                if img is not None:
+                    no_touch_contrasts.append(float(contrast))
+                    if len(no_touch_contrasts) > 200:
+                        no_touch_contrasts = no_touch_contrasts[-200:]
                 now = time.time()
+                if now - verify_started_at >= VERIFY_NO_TOUCH_TIMEOUT_SECONDS:
+                    if no_touch_contrasts:
+                        logger.info(
+                            "Verify timed out with no touch: avg=%.1f max=%.1f "
+                            "samples=%d threshold=%.1f timeout=%.1fs session=%s "
+                            "seconds_since_resume=%s",
+                            sum(no_touch_contrasts) / len(no_touch_contrasts),
+                            max(no_touch_contrasts),
+                            len(no_touch_contrasts),
+                            self._driver.touch_threshold,
+                            VERIFY_NO_TOUCH_TIMEOUT_SECONDS,
+                            session_label,
+                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
+                        )
+                    else:
+                        logger.warning(
+                            "Verify timed out with no touch and no valid frames "
+                            "(timeout=%.1fs session=%s seconds_since_resume=%s)",
+                            VERIFY_NO_TOUCH_TIMEOUT_SECONDS,
+                            session_label,
+                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
+                        )
+                    self._emit_verify("verify-no-match", True)
+                    self._last_no_touch_timeout_at = time.time()
+                    self._last_no_touch_timeout_session = session_id
+                    self._scanning = False
+                    self._scan_mode = None
+                    break
+
                 if now - no_touch_since >= 10.0 and now - last_idle_recovery >= 10.0:
-                    logger.info("Verify armed but no touch detected; refreshing USB...")
-                    self._driver.force_reconnect()
+                    if no_touch_contrasts:
+                        logger.info(
+                            "Verify no-touch contrast window: avg=%.1f max=%.1f "
+                            "samples=%d threshold=%.1f session=%s seconds_since_resume=%s",
+                            sum(no_touch_contrasts) / len(no_touch_contrasts),
+                            max(no_touch_contrasts),
+                            len(no_touch_contrasts),
+                            self._driver.touch_threshold,
+                            session_label,
+                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
+                        )
+                    else:
+                        logger.warning("Verify no-touch window had no valid frames")
+                    logger.info(
+                        "Verify armed but no touch detected; leaving USB stable "
+                        "(empty_frames=%d baseline=%s)",
+                        empty_frames,
+                        self._format_float(self._verify_baseline_contrast),
+                    )
                     last_idle_recovery = now
                     no_touch_since = now
-                    self._wait_for_finger_release()
+                    no_touch_contrasts = []
 
             time.sleep(0.05)
 
@@ -462,6 +643,7 @@ class EgisService:
                         logger.info("AUTHENTICATED!")
                         self._emit_verify("verify-match", True)
                         self._scanning = False
+                        self._scan_mode = None
                         return
                     else:
                         logger.info("Username collision: %s is not %s",
@@ -487,5 +669,7 @@ class EgisService:
             self.on_enroll_status(result, done)
 
     def _emit_verify(self, result, done):
+        if done:
+            self._active_verify_terminal = True
         if self.on_verify_status:
             self.on_verify_status(result, done)

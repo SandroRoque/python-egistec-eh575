@@ -57,12 +57,15 @@ class EgisBridge(dbus.service.Object):
     # ------------------------------------------------------------------
 
     def _on_enroll_status(self, result, done):
+        logger.info("Emitting EnrollStatus result=%s done=%s", result, done)
         GLib.idle_add(self.EnrollStatus, result, done)
 
     def _on_verify_status(self, result, done):
+        logger.info("Emitting VerifyStatus result=%s done=%s", result, done)
         GLib.idle_add(self.VerifyStatus, result, done)
 
     def _on_verify_finger_selected(self, finger):
+        logger.info("Emitting VerifyFingerSelected finger=%s", finger)
         GLib.idle_add(self.VerifyFingerSelected, finger)
 
     # ------------------------------------------------------------------
