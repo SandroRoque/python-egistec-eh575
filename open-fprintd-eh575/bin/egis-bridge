@@ -37,8 +37,29 @@ class EgisBridge(dbus.service.Object):
         self.scanning = False
         self.scan_thread = None
         self.enroll_scans = []
+        self._last_prepare_reason = None
 
         self._register_with_manager()
+
+    def _prepare_sensor(self, reason, force=False):
+        try:
+            if force:
+                print(f"[BRIDGE] Preparing sensor ({reason}): forced reconnect")
+                ok = self.driver.force_reconnect()
+                if ok:
+                    self._last_prepare_reason = reason
+                return ok
+
+            print(f"[BRIDGE] Preparing sensor ({reason})")
+            if not self.driver._ensure_connected():
+                return False
+            ok = self.driver.refresh_after_idle()
+            if ok:
+                self._last_prepare_reason = reason
+            return ok
+        except Exception as e:
+            print(f"[BRIDGE] Sensor prepare failed ({reason}): {e}")
+            return False
 
     def _register_with_manager(self):
         try:
@@ -75,16 +96,12 @@ class EgisBridge(dbus.service.Object):
     @dbus.service.method(DEVICE_IFACE, in_signature='ss', out_signature='')
     def VerifyStart(self, username, finger_name):
         print(f"[BRIDGE] Verify Requested for user: {username}")
-        try:
-            self.driver._ensure_connected()
-            self.driver._initialize_sensor()
-        except Exception as e:
-            print(f"[BRIDGE] Sensor init warning: {e}")
+        prepared = self._prepare_sensor("verify-start")
         target_finger = str(finger_name).strip() if finger_name else None
         if target_finger == "any":
             target_finger = None
         print(f"[BRIDGE] Verify target: {target_finger or 'any enrolled finger'}")
-        self._start_scan(self._scan_loop, ("verify", username, target_finger))
+        self._start_scan(self._scan_loop, ("verify", username, target_finger, not prepared))
 
     @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
     def VerifyStop(self):
@@ -96,16 +113,12 @@ class EgisBridge(dbus.service.Object):
         print(f"[BRIDGE] Enroll Requested for user: {username}")
         self._stop_scan()
         time.sleep(0.1)
-        try:
-            self.driver._ensure_connected()
-            self.driver._initialize_sensor()
-        except Exception as e:
-            print(f"[BRIDGE] Warning: Sensor init failed: {e}")
+        self._prepare_sensor("enroll-start")
 
         self.enroll_scans = []
         self._enroll_touch_count = 0
         target_finger = finger_name if finger_name else "right-index-finger"
-        self._start_scan(self._scan_loop, ("enroll", username, target_finger))
+        self._start_scan(self._scan_loop, ("enroll", username, target_finger, False))
 
     @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
     def EnrollStop(self):
@@ -125,11 +138,7 @@ class EgisBridge(dbus.service.Object):
     @dbus.service.method(DEVICE_IFACE, in_signature='', out_signature='')
     def Resume(self):
         print("[BRIDGE] Resume Requested")
-        try:
-            self.driver._ensure_connected()
-            self.driver._initialize_sensor()
-        except Exception as e:
-            print(f"[BRIDGE] Resume sensor init warning: {e}")
+        self._prepare_sensor("resume", force=True)
 
     @dbus.service.method(DEVICE_IFACE, in_signature='s', out_signature='as')
     def ListEnrolledFingers(self, username):
@@ -159,13 +168,24 @@ class EgisBridge(dbus.service.Object):
                 consecutive_clears = 0
             time.sleep(0.1)
 
-    def _scan_loop(self, mode, username, finger_name):
+    def _scan_loop(self, mode, username, finger_name, prepare_before_loop=True):
         print(f"[BRIDGE] Starting {mode} loop for {username} ({finger_name})...")
-        self.driver._ensure_connected()
+        if prepare_before_loop:
+            self._prepare_sensor(f"{mode}-loop")
         self._wait_for_finger_release()
+        empty_frames = 0
 
         while self.scanning:
             img, contrast, is_present = self.driver.capture_presence_frame()
+            if img is None:
+                empty_frames += 1
+                if empty_frames >= 10:
+                    print("[BRIDGE] No sensor frames; forcing USB recovery...")
+                    self.driver.force_reconnect()
+                    empty_frames = 0
+            else:
+                empty_frames = 0
+
             if is_present:
                 print("[BRIDGE] Finger detected!")
 
@@ -312,10 +332,14 @@ class EgisBridge(dbus.service.Object):
             if match_name:
                 print(f"[BRIDGE] Match: {match_name} (Inliers: {score}, Frames: {len(frames)})")
                 if match_name.startswith(username + "_"):
-                    print("[BRIDGE] AUTHENTICATED!")
-                    GLib.idle_add(self.VerifyStatus, "verify-match", True)
-                    self.scanning = False
-                    return
+                    name_rest = match_name[len(username) + 1:]
+                    if "_" not in name_rest:
+                        print("[BRIDGE] AUTHENTICATED!")
+                        GLib.idle_add(self.VerifyStatus, "verify-match", True)
+                        self.scanning = False
+                        return
+                    else:
+                        print(f"[BRIDGE] Username collision: {match_name} is not {username}")
                 else:
                     print(f"[BRIDGE] Wrong user! ({match_name})")
 
@@ -323,6 +347,8 @@ class EgisBridge(dbus.service.Object):
 
         print(f"[BRIDGE] No match after {attempt} attempts")
         GLib.idle_add(self.VerifyStatus, "verify-retry-scan", False)
+        if self.scanning:
+            print("[BRIDGE] Ready for another verification touch.")
 
     # --- Signals ---
     @dbus.service.signal(DEVICE_IFACE, signature='sb')

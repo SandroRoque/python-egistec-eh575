@@ -55,33 +55,47 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
             self.assertEqual(matcher.get_enrolled_fingers("testuser"), [])
             self.assertEqual(matcher.legacy_templates, ["testuser_right-index-finger.npy"])
 
-    def test_v3_template_loads_into_index(self):
+    def test_v4_template_loads_into_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             matcher = self._matcher(tmp)
             img = np.zeros((52, 103), dtype=np.uint8)
             cv2.line(img, (8, 8), (95, 44), 255, 2)
-            kp = [
-                (p.pt, p.size, p.angle, p.response, p.octave, p.class_id)
-                for p in [
-                    cv2.KeyPoint(x=10, y=10, size=2),
-                    cv2.KeyPoint(x=30, y=18, size=2),
-                    cv2.KeyPoint(x=50, y=26, size=2),
-                    cv2.KeyPoint(x=70, y=34, size=2),
-                ]
+            kp_points = [
+                cv2.KeyPoint(x=10, y=10, size=2),
+                cv2.KeyPoint(x=30, y=18, size=2),
+                cv2.KeyPoint(x=50, y=26, size=2),
+                cv2.KeyPoint(x=70, y=34, size=2),
             ]
-            data = {
+            ridge = matcher._template_descriptor(img)
+
+            base = "testuser_right-index-finger"
+            json_path = os.path.join(tmp, base + ".json")
+            npz_path = os.path.join(tmp, base + ".npz")
+
+            meta = {
                 "schema_version": fingerprint_matcher.TEMPLATE_SCHEMA_VERSION,
                 "matcher_version": fingerprint_matcher.MATCHER_VERSION,
-                "name": "testuser_right-index-finger",
-                "templates": [{
-                    "keypoints": kp,
-                    "descriptors": np.ones((4, 128), dtype=np.float32),
-                    "image": img,
-                    "ridge": matcher._template_descriptor(img),
-                    "quality": 0.5,
-                }],
+                "name": base,
+                "created_at": 0,
             }
-            np.save(os.path.join(tmp, "testuser_right-index-finger.npy"), np.array(data, dtype=object))
+            with open(json_path, "w") as f:
+                json.dump(meta, f)
+
+            kp_arr = np.array([
+                [p.pt[0], p.pt[1], p.size, p.angle, p.response, p.octave, p.class_id]
+                for p in kp_points
+            ], dtype=np.float32)
+            orient = ridge["orientation"]
+            np.savez(npz_path,
+                num_templates=np.array(1, dtype=np.int32),
+                kp_0=kp_arr,
+                desc_0=np.ones((4, 128), dtype=np.float32),
+                img_0=img,
+                ridge_cos2_0=orient["cos2"].astype(np.float32),
+                ridge_sin2_0=orient["sin2"].astype(np.float32),
+                ridge_weight_0=orient["weight"].astype(np.float32),
+                quality_0=np.float32(0.5),
+            )
 
             matcher.rebuild_index()
 

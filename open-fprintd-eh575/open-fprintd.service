@@ -7,12 +7,26 @@ Wants=dbus.service
 Type=simple
 User=root
 Group=root
-# CRITICAL: Forces Python to look in /opt/egis-driver
 Environment="PYTHONPATH=/opt/egis-driver"
 WorkingDirectory=/opt/egis-driver
 ExecStart=/usr/bin/python3 -u ./open-fprintd
 Restart=on-failure
 RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service @signal @io-event
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -31,6 +31,7 @@ package() {
   install -d "$pkgdir/usr/lib/systemd/system"
   install -m 0644 open-fprintd.service "$pkgdir/usr/lib/systemd/system/"
   install -m 0644 egis-bridge.service "$pkgdir/usr/lib/systemd/system/"
+  install -m 0644 egis-sleep-recovery.service "$pkgdir/usr/lib/systemd/system/"
 
   install -D -m 0644 net.reactivated.fprint.policy "$pkgdir/usr/share/polkit-1/actions/net.reactivated.fprint.policy"
   install -D -m 0644 io.github.uunicorn.Fprint.Device.Egis.conf "$pkgdir/usr/share/dbus-1/system.d/io.github.uunicorn.Fprint.Device.Egis.conf"

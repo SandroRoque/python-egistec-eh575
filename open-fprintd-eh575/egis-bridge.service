@@ -7,12 +7,26 @@ Requires=open-fprintd.service
 Type=simple
 User=root
 Group=root
-# CRITICAL: Forces Python to look in /opt/egis-driver
 Environment="PYTHONPATH=/opt/egis-driver"
 WorkingDirectory=/opt/egis-driver
 ExecStart=/usr/bin/python3 -u ./egis-bridge
 Restart=always
 RestartSec=2
+
+ReadWritePaths=/var/lib/open-fprintd
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

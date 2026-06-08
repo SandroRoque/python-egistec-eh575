@@ -1,0 +1,13 @@
+[Unit]
+Description=Egis Fingerprint Sleep Recovery
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl stop egis-bridge.service
+ExecStop=/usr/bin/systemctl restart egis-bridge.service
+
+[Install]
+WantedBy=sleep.target

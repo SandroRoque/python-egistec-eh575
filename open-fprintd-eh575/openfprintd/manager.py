@@ -14,6 +14,29 @@ class Manager(dbus.service.Object):
         dbus.service.Object.__init__(self, bus_name, '/net/reactivated/Fprint/Manager')
         self.bus_name = bus_name
         self.devices = {}
+        self.bus = bus_name.get_bus()
+        try:
+            self.bus.add_signal_receiver(
+                self._prepare_for_sleep,
+                signal_name='PrepareForSleep',
+                dbus_interface='org.freedesktop.login1.Manager',
+                bus_name='org.freedesktop.login1',
+                path='/org/freedesktop/login1',
+            )
+        except Exception as e:
+            logging.warning("Failed to subscribe to logind sleep signals: %s", e)
+
+    def _prepare_for_sleep(self, sleeping):
+        print("[MANAGER] PrepareForSleep %s" % sleeping)
+        logging.debug("PrepareForSleep %s", sleeping)
+        for dev in self.devices.values():
+            try:
+                if sleeping:
+                    dev.Suspend()
+                else:
+                    dev.Resume()
+            except Exception as e:
+                logging.warning("Sleep transition handling failed: %s", e)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='',

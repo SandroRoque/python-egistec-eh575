@@ -2,6 +2,7 @@ import usb.core
 import usb.util
 import time
 import numpy as np
+import threading
 
 # --- Hardware Constants ---
 VENDOR_ID = 0x1c7a
@@ -13,6 +14,7 @@ IMG_HEIGHT = 52
 
 class EgisDriver:
     def __init__(self):
+        self._usb_lock = threading.RLock()
         self.dev = self._find_device()
         self.touch_threshold = 31.0
         self._last_iok = 0
@@ -92,24 +94,54 @@ class EgisDriver:
         self._send_hex("45 47 49 53 63 2c 02 00 13")
         self._send_hex("45 47 49 53 60 00 02")
 
-    def _ensure_connected(self):
-        if time.time() - self._last_iok < self._reconnect_delay:
-            return
+    def _dispose_device(self):
         try:
-            self.dev.get_active_configuration()
+            usb.util.dispose_resources(self.dev)
         except Exception:
             pass
-        else:
-            return
 
-        print("[DRIVER] USB stale (idle for %.0fs), reconnecting..." % (time.time() - self._last_iok))
+    def _reconnect(self):
+        self._dispose_device()
+        self.dev = self._find_device()
+        self._initialize_sensor()
+        self._last_iok = time.time()
+
+    def _ensure_connected(self, force=False):
+        with self._usb_lock:
+            idle_for = time.time() - self._last_iok
+            if not force and idle_for < self._reconnect_delay:
+                return True
+
+            if not force:
+                try:
+                    self.dev.get_active_configuration()
+                except Exception:
+                    pass
+                else:
+                    return True
+
+            reason = "forced" if force else "stale"
+            print("[DRIVER] USB %s (idle for %.0fs), reconnecting..." % (reason, idle_for))
+            try:
+                self._reconnect()
+                print("[DRIVER] Reconnected successfully.")
+                return True
+            except Exception as e:
+                print(f"[DRIVER] Reconnect failed: {e}")
+                return False
+
+    def force_reconnect(self):
+        return self._ensure_connected(force=True)
+
+    def refresh_after_idle(self, idle_seconds=300):
+        if time.time() - self._last_iok >= idle_seconds:
+            return self.force_reconnect()
         try:
-            self.dev = self._find_device()
             self._initialize_sensor()
-            self._last_iok = time.time()
-            print("[DRIVER] Reconnected successfully.")
+            return True
         except Exception as e:
-            print(f"[DRIVER] Reconnect failed: {e}")
+            print(f"[DRIVER] Refresh failed: {e}")
+            return self.force_reconnect()
 
     def _mark_iok(self):
         self._last_iok = time.time()
@@ -121,33 +153,33 @@ class EgisDriver:
         If no data read (USB error), returns (None, 0.0)
         """
         # 1. We move the try block UP to cover the rearm and the write
-        try:
-            self._rearm()
-            self.dev.write(ENDPOINT_OUT, bytes.fromhex("45 47 49 53 64 14 ec"))
+        with self._usb_lock:
+            try:
+                self._rearm()
+                self.dev.write(ENDPOINT_OUT, bytes.fromhex("45 47 49 53 64 14 ec"))
 
-            # 2. The read logic stays inside the try block
-            data = self.dev.read(ENDPOINT_IN, 10000, timeout=1500)
+                # 2. The read logic stays inside the try block
+                data = self.dev.read(ENDPOINT_IN, 10000, timeout=1500)
 
-            # Drain pipe
-            try: self.dev.read(ENDPOINT_IN, 512, timeout=20)
-            except: pass
+                # Drain pipe
+                try: self.dev.read(ENDPOINT_IN, 512, timeout=20)
+                except: pass
 
-            if len(data) > 5000:
-                target = IMG_WIDTH * IMG_HEIGHT
-                if len(data) < target:
-                    data += bytes(target - len(data))
-                else:
-                    data = data[:target]
+                if len(data) > 5000:
+                    target = IMG_WIDTH * IMG_HEIGHT
+                    if len(data) < target:
+                        data += bytes(target - len(data))
+                    else:
+                        data = data[:target]
 
-                arr = np.array(list(data), dtype=np.uint8)
-                contrast = np.std(arr)
-                self._mark_iok()
-                return data, contrast
+                    arr = np.array(list(data), dtype=np.uint8)
+                    contrast = np.std(arr)
+                    self._mark_iok()
+                    return data, contrast
 
-        except usb.core.USBError as e:
-            print(f"[DRIVER] USB Error: {e}")
-            self._ensure_connected()
-            pass
+            except usb.core.USBError as e:
+                print(f"[DRIVER] USB Error: {e}")
+                self._ensure_connected(force=True)
 
         return None, 0.0
 

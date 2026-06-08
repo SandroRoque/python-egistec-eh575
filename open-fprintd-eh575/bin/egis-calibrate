@@ -65,20 +65,30 @@ def save_sample(args, frames):
     safe_user = args.username.replace("/", "_")
     safe_target = args.target_finger.replace("/", "_")
     safe_actual = args.actual_finger.replace("/", "_")
-    filename = f"{ts}_{safe_user}_{safe_target}_{args.label}_{safe_actual}.npy"
-    path = os.path.join(SAMPLE_DIR, filename)
-    sample = {
+    base = f"{ts}_{safe_user}_{safe_target}_{args.label}_{safe_actual}"
+    json_path = os.path.join(SAMPLE_DIR, base + ".json")
+    npz_path = os.path.join(SAMPLE_DIR, base + ".npz")
+
+    meta = {
         "matcher_version": MATCHER_VERSION,
         "timestamp": ts,
         "username": args.username,
         "target_finger": args.target_finger,
         "actual_finger": args.actual_finger,
         "label": args.label,
-        "frames": frames,
+        "num_frames": len(frames),
     }
-    np.save(path, np.array(sample, dtype=object))
-    os.chmod(path, 0o600)
-    print(f"Saved {path}")
+    with open(json_path, "w") as f:
+        json.dump(meta, f)
+    os.chmod(json_path, 0o600)
+
+    save_data = {}
+    for i, frame in enumerate(frames):
+        save_data[f"frame_{i}"] = np.frombuffer(frame, dtype=np.uint8)
+    np.savez(npz_path, **save_data)
+    os.chmod(npz_path, 0o600)
+
+    print(f"Saved {base}")
 
 
 def collect(args):
@@ -94,15 +104,39 @@ def load_samples():
     if not os.path.isdir(SAMPLE_DIR):
         return samples
     for filename in sorted(os.listdir(SAMPLE_DIR)):
-        if not filename.endswith(".npy"):
+        if not filename.endswith(".npz"):
             continue
-        path = os.path.join(SAMPLE_DIR, filename)
+        base = filename[:-4]
+        json_path = os.path.join(SAMPLE_DIR, base + ".json")
+        npz_path = os.path.join(SAMPLE_DIR, filename)
+
         try:
-            data = np.load(path, allow_pickle=True).item()
-            data["_path"] = path
-            samples.append(data)
+            with open(json_path, "r") as f:
+                meta = json.load(f)
         except Exception as e:
-            print(f"Skipping {path}: {e}")
+            print(f"Skipping {base}: missing or corrupt metadata ({e})")
+            continue
+
+        try:
+            npz = np.load(npz_path, allow_pickle=False)
+        except Exception as e:
+            print(f"Skipping {base}: {e}")
+            continue
+
+        num_frames = meta.get("num_frames", 0)
+        frames = []
+        for i in range(num_frames):
+            key = f"frame_{i}"
+            if key in npz:
+                frames.append(npz[key].tobytes())
+            else:
+                break
+
+        meta["frames"] = frames
+        meta["_path"] = json_path
+        del meta["num_frames"]
+        samples.append(meta)
+
     return samples
 
 

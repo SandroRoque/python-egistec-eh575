@@ -90,12 +90,26 @@ Wants=dbus.service
 Type=simple
 User=root
 Group=root
-# FORCE Python to look in /opt/egis-driver
 Environment="PYTHONPATH=$INSTALL_DIR"
 WorkingDirectory=$INSTALL_DIR
 ExecStart=/usr/bin/python3 -u ./open-fprintd
 Restart=on-failure
 RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service @signal @io-event
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
@@ -112,15 +126,46 @@ Requires=open-fprintd.service
 Type=simple
 User=root
 Group=root
-# FORCE Python to look in /opt/egis-driver
 Environment="PYTHONPATH=$INSTALL_DIR"
 WorkingDirectory=$INSTALL_DIR
 ExecStart=/usr/bin/python3 -u ./egis-bridge
 Restart=always
 RestartSec=2
 
+ReadWritePaths=/var/lib/open-fprintd
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# -- Sleep Recovery Service --
+sudo tee /etc/systemd/system/egis-sleep-recovery.service > /dev/null <<EOF
+[Unit]
+Description=Egis Fingerprint Sleep Recovery
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl stop egis-bridge.service
+ExecStop=/usr/bin/systemctl restart egis-bridge.service
+
+[Install]
+WantedBy=sleep.target
 EOF
 
 # 7. Finalize
@@ -134,7 +179,7 @@ sudo chmod 700 "$CALIBRATION_DIR"
 echo "[*] reloading udev and systemd..."
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo systemctl daemon-reload
-sudo systemctl enable open-fprintd egis-bridge
+sudo systemctl enable open-fprintd egis-bridge egis-sleep-recovery
 sudo systemctl restart open-fprintd egis-bridge
 
 echo "[SUCCESS] Installation Complete."

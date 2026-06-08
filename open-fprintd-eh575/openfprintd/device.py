@@ -1,6 +1,8 @@
 import dbus
 import dbus.service
+import concurrent.futures
 import logging
+import os
 import pwd
 import threading
 from gi.repository import GLib
@@ -26,6 +28,9 @@ class PermissionDenied(dbus.DBusException):
 
 class Device(dbus.service.Object):
     cnt=0
+    _AUTH_MAX_WORKERS = 8
+    _auth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AUTH_MAX_WORKERS)
+    _auth_semaphore = threading.BoundedSemaphore(_AUTH_MAX_WORKERS * 2)
 
     def __init__(self, mgr):
         self.manager = mgr
@@ -51,22 +56,24 @@ class Device(dbus.service.Object):
         """
         Runs the Polkit check in a thread to avoid blocking the main loop.
         If successful, executes operation_cb() on the main thread.
+        Bounded by a thread pool and semaphore to prevent resource exhaustion.
         """
+        if not Device._auth_semaphore.acquire(blocking=False):
+            GLib.idle_add(error_cb, PermissionDenied())
+            return
+
         def auth_thread():
             try:
-                # This blocks, but now it's in a thread so the daemon stays alive
                 polkit.check_privilege(sender, action)
-                # Success! Schedule the actual work on the main loop
                 GLib.idle_add(run_op)
             except Exception:
-                # Map all auth failures to PermissionDenied
                 GLib.idle_add(error_cb, PermissionDenied())
+            finally:
+                Device._auth_semaphore.release()
 
         def run_op():
             try:
-                # Execute the actual DBus target call
                 result = operation_cb()
-                # If the target returned a value, pass it back, else just None
                 if result is not None:
                     success_cb(result)
                 else:
@@ -74,8 +81,7 @@ class Device(dbus.service.Object):
             except Exception as e:
                 error_cb(e)
 
-        t = threading.Thread(target=auth_thread)
-        t.start()
+        Device._auth_executor.submit(auth_thread)
 
     # --- Standard Methods ---
 
@@ -122,7 +128,16 @@ class Device(dbus.service.Object):
             self.call_cbs()
 
     def Suspend(self):
+        if self.owner_watcher is not None or self.busy:
+            print("[DEVICE] Clearing active fingerprint claim for suspend")
         self.suspended = True
+        self.callbacks = []
+        self.claimed_by = None
+        self.claim_sender = None
+        self.busy = False
+        if self.owner_watcher is not None:
+            self.owner_watcher.cancel()
+            self.owner_watcher = None
         if self.target is not None:
             self.target.Suspend()
 
@@ -303,6 +318,9 @@ class Device(dbus.service.Object):
                          async_callbacks=('success_cb', 'error_cb'))
     def RunCmd(self, s, sender, connection, success_cb, error_cb):
         logging.debug('RunCmd')
+        if os.environ.get("EGIS_DEBUG") != "1":
+            error_cb(PermissionDenied())
+            return
         def op():
             if self.target is None:
                 logging.debug('No target driver registered for RunCmd')

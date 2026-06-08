@@ -6,7 +6,7 @@ import time
 from skimage.metrics import structural_similarity as ssim
 
 MATCHER_VERSION = 3
-TEMPLATE_SCHEMA_VERSION = 3
+TEMPLATE_SCHEMA_VERSION = 4
 CALIBRATION_DIR = "/var/lib/open-fprintd/egis-calibration"
 THRESHOLD_FILE = os.path.join(CALIBRATION_DIR, "thresholds.json")
 THRESHOLD_KEYS = (
@@ -390,71 +390,98 @@ class FingerprintMatcher:
 
         current_idx_offset = 0
 
-        for filename in os.listdir(self.enroll_dir):
-            if not filename.endswith(".npy"):
+        for filename in sorted(os.listdir(self.enroll_dir)):
+            if filename.endswith(".npy"):
+                self.legacy_templates.append(filename)
+                continue
+
+            if not filename.endswith(".npz"):
+                continue
+
+            safe_name = filename[:-4]
+            json_path = os.path.join(self.enroll_dir, safe_name + ".json")
+            try:
+                with open(json_path, "r") as f:
+                    meta = json.load(f)
+            except Exception as e:
+                print(f"[MATCHER] Missing or corrupt metadata for {filename}: {e}")
+                continue
+
+            if meta.get("schema_version") != TEMPLATE_SCHEMA_VERSION:
+                self.legacy_templates.append(filename)
+                print(f"[MATCHER] Ignoring incompatible template {filename}; re-enrollment required.")
                 continue
 
             try:
-                raw_data = np.load(os.path.join(self.enroll_dir, filename), allow_pickle=True)
-                try:
-                    data = raw_data.item()
-                except ValueError:
-                    data = None
-
-                if not isinstance(data, dict):
-                    self.legacy_templates.append(filename)
-                    print(f"[MATCHER] Ignoring legacy template {filename}; re-enrollment required for matcher v{MATCHER_VERSION}.")
-                    continue
-
-                if data.get("schema_version") != TEMPLATE_SCHEMA_VERSION:
-                    self.legacy_templates.append(filename)
-                    print(f"[MATCHER] Ignoring incompatible template {filename}; re-enrollment required.")
-                    continue
-
-                unpacked_templates = []
-                for t_idx, template in enumerate(data.get("templates", [])):
-                    packed_kp = template.get("keypoints", [])
-                    des = template.get("descriptors")
-                    image = template.get("image")
-                    ridge = template.get("ridge")
-                    if des is None or len(des) < 2:
-                        continue
-                    if image is None or ridge is None:
-                        continue
-
-                    kp = [cv2.KeyPoint(x=pt[0], y=pt[1], size=sz, angle=ang, response=resp, octave=oct, class_id=cid)
-                          for (pt, sz, ang, resp, oct, cid) in packed_kp]
-
-                    unpacked_templates.append({
-                        "keypoints": kp,
-                        "descriptors": des,
-                        "image": image.astype(np.uint8),
-                        "ridge": ridge,
-                        "quality": float(template.get("quality", 0.0)),
-                    })
-
-                    all_descriptors.append(des)
-
-                    num_des = len(des)
-                    self.descriptor_map.append({
-                        "start": current_idx_offset,
-                        "end": current_idx_offset + num_des,
-                        "file": filename,
-                        "idx": t_idx
-                    })
-
-                    for gi in range(current_idx_offset, current_idx_offset + num_des):
-                        self.descriptor_lookup[gi] = (
-                            filename, t_idx, gi - current_idx_offset
-                        )
-
-                    current_idx_offset += num_des
-
-                if unpacked_templates:
-                    self.cached_templates[filename] = unpacked_templates
-
+                npz = np.load(os.path.join(self.enroll_dir, filename), allow_pickle=False)
             except Exception as e:
                 print(f"[MATCHER] Failed to load {filename}: {e}")
+                continue
+
+            try:
+                num_templates = int(npz["num_templates"])
+            except KeyError:
+                print(f"[MATCHER] Corrupt template {filename}: missing num_templates")
+                continue
+
+            unpacked_templates = []
+            for t_idx in range(num_templates):
+                try:
+                    kp_data = npz[f"kp_{t_idx}"]
+                    des = npz[f"desc_{t_idx}"]
+                    image = npz[f"img_{t_idx}"]
+                    ridge_cos2 = npz[f"ridge_cos2_{t_idx}"]
+                    ridge_sin2 = npz[f"ridge_sin2_{t_idx}"]
+                    ridge_weight = npz[f"ridge_weight_{t_idx}"]
+                    quality = float(npz[f"quality_{t_idx}"])
+                except KeyError:
+                    continue
+
+                if des is None or len(des) < 2:
+                    continue
+
+                kp = [cv2.KeyPoint(
+                    x=float(row[0]), y=float(row[1]),
+                    size=float(row[2]), angle=float(row[3]),
+                    response=float(row[4]), octave=int(row[5]),
+                    class_id=int(row[6]))
+                    for row in kp_data]
+
+                ridge = {
+                    "orientation": {
+                        "cos2": ridge_cos2,
+                        "sin2": ridge_sin2,
+                        "weight": ridge_weight,
+                    }
+                }
+
+                unpacked_templates.append({
+                    "keypoints": kp,
+                    "descriptors": des,
+                    "image": image.astype(np.uint8),
+                    "ridge": ridge,
+                    "quality": quality,
+                })
+
+                all_descriptors.append(des)
+
+                num_des = len(des)
+                self.descriptor_map.append({
+                    "start": current_idx_offset,
+                    "end": current_idx_offset + num_des,
+                    "file": filename,
+                    "idx": t_idx
+                })
+
+                for gi in range(current_idx_offset, current_idx_offset + num_des):
+                    self.descriptor_lookup[gi] = (
+                        filename, t_idx, gi - current_idx_offset
+                    )
+
+                current_idx_offset += num_des
+
+            if unpacked_templates:
+                self.cached_templates[filename] = unpacked_templates
 
         if all_descriptors:
             self.train_descriptors = np.vstack(all_descriptors)
@@ -507,14 +534,37 @@ class FingerprintMatcher:
             return False
 
         safe_name = name.replace("/", "_")
-        file_path = os.path.join(self.enroll_dir, f"{safe_name}.npy")
-        np.save(file_path, np.array({
+        base_path = os.path.join(self.enroll_dir, safe_name)
+        json_path = base_path + ".json"
+        npz_path = base_path + ".npz"
+
+        save_data = {"num_templates": np.array(len(new_templates), dtype=np.int32)}
+        for i, template in enumerate(new_templates):
+            kp_arr = np.array([
+                [p[0][0], p[0][1], p[1], p[2], p[3], p[4], p[5]]
+                for p in template["keypoints"]
+            ], dtype=np.float32)
+            ridge = template["ridge"]["orientation"]
+            save_data[f"kp_{i}"] = kp_arr
+            save_data[f"desc_{i}"] = template["descriptors"].astype(np.float32)
+            save_data[f"img_{i}"] = template["image"].astype(np.uint8)
+            save_data[f"ridge_cos2_{i}"] = ridge["cos2"].astype(np.float32)
+            save_data[f"ridge_sin2_{i}"] = ridge["sin2"].astype(np.float32)
+            save_data[f"ridge_weight_{i}"] = ridge["weight"].astype(np.float32)
+            save_data[f"quality_{i}"] = np.float32(template["quality"])
+
+        np.savez(npz_path, **save_data)
+        os.chmod(npz_path, 0o600)
+
+        meta = {
             "schema_version": TEMPLATE_SCHEMA_VERSION,
             "matcher_version": MATCHER_VERSION,
             "name": name,
             "created_at": int(time.time()),
-            "templates": new_templates,
-        }, dtype=object))
+        }
+        with open(json_path, "w") as f:
+            json.dump(meta, f)
+        os.chmod(json_path, 0o600)
 
         print(f"[MATCHER] Saved {len(new_templates)} templates for {name}")
         self.rebuild_index()
@@ -612,7 +662,7 @@ class FingerprintMatcher:
 
         candidate_votes = {}
         user_prefix = f"{username}_" if username else None
-        target_filename = f"{username}_{finger_name}.npy" if username and finger_name else None
+        target_filename = f"{username}_{finger_name}.npz" if username and finger_name else None
 
         for m in good_matches:
             global_idx = m.trainIdx
@@ -623,6 +673,8 @@ class FingerprintMatcher:
 
             filename, t_idx, local_idx = owner
             if user_prefix and not filename.startswith(user_prefix):
+                continue
+            if user_prefix and "_" in filename[len(user_prefix):].rsplit(".", 1)[0]:
                 continue
 
             key = (filename, t_idx)
@@ -757,7 +809,7 @@ class FingerprintMatcher:
             best_inliers = max(best_inliers, inliers)
             candidate_metrics = {
                 "filename": filename,
-                "name": filename.replace(".npy", ""),
+                "name": filename.replace(".npz", ""),
                 "score": float(diagnostic_score),
                 "inliers": int(inliers),
                 "inlier_ratio": float(inlier_ratio),
@@ -867,20 +919,32 @@ class FingerprintMatcher:
         fingers = []
         prefix = f"{username}_"
         for filename in os.listdir(self.enroll_dir):
-            if filename.startswith(prefix) and filename.endswith(".npy"):
-                if filename not in self.cached_templates:
-                    continue
-                fingers.append(filename[len(prefix):-4])
+            if not filename.startswith(prefix) or not filename.endswith(".npz"):
+                continue
+            rest = filename[len(prefix):-4]
+            if "_" in rest:
+                continue
+            if filename not in self.cached_templates:
+                continue
+            fingers.append(rest)
         return fingers
 
     def delete_user_fingers(self, username):
         """Wipes all fingers for a user"""
         prefix = f"{username}_"
         deleted = False
-        for filename in os.listdir(self.enroll_dir):
-            if filename.startswith(prefix):
+        for filename in sorted(os.listdir(self.enroll_dir)):
+            if not filename.startswith(prefix):
+                continue
+            rest = filename[len(prefix):]
+            stem = rest.rsplit(".", 1)[0] if "." in rest else rest
+            if "_" in stem:
+                continue
+            try:
                 os.remove(os.path.join(self.enroll_dir, filename))
                 deleted = True
+            except OSError:
+                pass
 
         if deleted:
             self.rebuild_index()
