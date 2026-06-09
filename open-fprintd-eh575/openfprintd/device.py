@@ -1,7 +1,6 @@
 import dbus
 import dbus.service
 import logging
-import os
 from gi.repository import GLib
 import openfprintd.polkit as polkit
 import openfprintd.users as users
@@ -290,32 +289,6 @@ class Device(dbus.service.Object):
         if done:
             self.busy = False
             self.busy_operation = None
-
-    # ------------------ Debug --------------------------
-
-    @dbus.service.method(dbus_interface=INTERFACE_NAME,
-                         in_signature='s',
-                         out_signature='s',
-                         connection_keyword='connection',
-                         sender_keyword='sender',
-                         async_callbacks=('success_cb', 'error_cb'))
-    def RunCmd(self, s, sender, connection, success_cb, error_cb):
-        logging.debug('RunCmd')
-        if os.environ.get("EGIS_DEBUG") != "1":
-            error_cb(PermissionDenied())
-            return
-        def op():
-            if self.target is None:
-                logging.debug('No target driver registered for RunCmd')
-                return ''
-            try:
-                return self.target.RunCmd(s, signature='s')
-            except dbus.exceptions.DBusException as e:
-                if 'UnknownMethod' not in getattr(e, '_dbus_error_name', ''):
-                    raise
-                logging.debug('Target driver does not support RunCmd')
-                return ''
-        self._run_with_auth(sender, "net.reactivated.fprint.manager.register", success_cb, error_cb, op)
 
     # ------------------ Props --------------------------
 

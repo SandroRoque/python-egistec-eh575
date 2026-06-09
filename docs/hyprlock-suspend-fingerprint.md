@@ -118,6 +118,5 @@ These pieces are load-bearing for idle-suspend fingerprint unlock:
 These pieces are diagnostic or optional and can be reconsidered later:
 
 - Very verbose matcher/contrast logging.
-- Windows wake control-transfer experiment, which currently fails with pipe error.
 - Some USB sysfs reauthorization machinery, if future logs show normal reconnect is enough.
 - Extra no-touch refresh logic, as long as resume recovery and paused-verify restart still work.

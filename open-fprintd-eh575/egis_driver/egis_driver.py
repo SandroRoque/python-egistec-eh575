@@ -62,28 +62,9 @@ class EgisDriver:
             pass
         return None
 
-    def _send_wake_control_transfer(self):
-        """Mirror the Windows driver's post-init control setup packet.
-
-        Ghidra dump EgisTouchFP0575.c:FUN_18001b078 builds a
-        WDF_USB_CONTROL_SETUP_PACKET from 0x500000014. WDF's setup packet is
-        8 raw bytes, so that decodes to:
-        bmRequestType=0x14, bRequest=0x00, wValue=0x0000,
-        wIndex=0x0005, wLength=0x0000.
-        """
-        try:
-            logger.info("Sending Windows wake control transfer")
-            self.dev.ctrl_transfer(0x14, 0x00, 0x0000, 0x0005, None, timeout=500)
-            logger.info("Windows wake control transfer complete")
-            return True
-        except usb.core.USBError as e:
-            logger.warning("Windows wake control transfer failed: %s", e)
-            return False
-
     def _initialize_sensor(self):
         read_timeout = 500
         logger.info("Initializing Hardware (timeout=%dms)...", read_timeout)
-        self._send_wake_control_transfer()
         ok_responses = 0
         null_responses = 0
         bad_responses = 0
