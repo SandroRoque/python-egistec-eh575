@@ -1,7 +1,6 @@
 import dbus
 import dbus.service
 import logging
-from gi.repository import GLib
 import openfprintd.polkit as polkit
 import openfprintd.users as users
 
@@ -46,7 +45,6 @@ class Device(dbus.service.Object):
         self.busy = False
         self.busy_operation = None
         self.suspended = False
-        self.callbacks = []
 
     # --- Helper: Async Auth Wrapper ---
     def _run_with_auth(self, sender, action, success_cb, error_cb, operation_cb):
@@ -63,20 +61,12 @@ class Device(dbus.service.Object):
 
     # --- Standard Methods ---
 
-    def proxy_call(self, cb, errback=None):
+    def proxy_call(self, cb, errback):
         if self.suspended or self.target is None:
             logger.info("Rejecting call while fingerprint service is suspended/offline")
-            if errback is not None:
-                errback(ClaimDevice())
+            errback(ClaimDevice())
         else:
             cb()
-
-    def call_cbs(self):
-        for cb in self.callbacks:
-            try: cb()
-            except Exception as e: logging.debug('callback error: %s' % repr(e))
-        self.suspended = False
-        self.callbacks = []
 
     def set_target(self, target_name, sender):
         self.target = self.bus.get_object(sender, target_name, introspect=False)
@@ -92,11 +82,6 @@ class Device(dbus.service.Object):
                 watcher.cancel()
         watcher = self.connection.watch_name_owner(sender, watch_cb)
 
-        def process_offline():
-            if not self.suspended:
-                self.call_cbs()
-        GLib.idle_add(process_offline)
-
     def unset_target(self):
         self.target = None
 
@@ -108,13 +93,12 @@ class Device(dbus.service.Object):
                 logger.warning("Target resume failed: %s", e)
                 self.suspended = True
                 return
-        self.call_cbs()
+        self.suspended = False
 
     def _mark_suspended(self):
         if self.owner_watcher is not None or self.busy:
             logger.info("Preserving active fingerprint claim for suspend")
         self.suspended = True
-        self.callbacks = []
 
     def Suspend(self):
         self._mark_suspended()

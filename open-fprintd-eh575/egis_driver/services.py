@@ -39,20 +39,14 @@ class EgisService:
         self._suspended_scan_args = None
         self._enroll_scans = []
         self._enroll_touch_count = 0
-        self._last_prepare_reason = None
         self._resume_lock = threading.Lock()
         self._resume_ready = threading.Event()
         self._resume_ready.set()
         self._resume_recovery_thread = None
         self._resume_recovery_running = False
         self._resume_generation = 0
-        self._last_suspend_at = None
-        self._last_resume_at = None
-        self._last_resume_result = None
         self._verify_session_id = 0
         self._active_verify_terminal = False
-        self._last_no_touch_timeout_at = None
-        self._last_no_touch_timeout_session = None
         self._verify_baseline_contrast = None
 
         self.on_enroll_status = on_enroll_status
@@ -70,8 +64,6 @@ class EgisService:
                 ok = self._driver.force_reconnect(reset=reason.startswith("resume"))
                 if ok:
                     self._warm_sensor(reason)
-                if ok:
-                    self._last_prepare_reason = reason
                 return ok
 
             resume_ready = self._wait_for_resume_recovery(reason)
@@ -81,8 +73,6 @@ class EgisService:
             ok = self._driver.refresh_after_idle()
             if ok:
                 self._warm_sensor(reason)
-            if ok:
-                self._last_prepare_reason = reason
             return ok
         except Exception as e:
             logger.error("Sensor prepare failed (%s): %s", reason, e)
@@ -154,26 +144,14 @@ class EgisService:
     def start_verify(self, username, finger_name):
         self._verify_session_id += 1
         session_id = self._verify_session_id
-        now = time.time()
-        seconds_since_resume = self._seconds_since(self._last_resume_at, now)
-        seconds_since_suspend = self._seconds_since(self._last_suspend_at, now)
-        resume_result = self._last_resume_result or {}
         logger.info(
             "Verify session %d requested: user=%s raw_finger=%s "
-            "seconds_since_resume=%s seconds_since_suspend=%s "
-            "resume_generation=%s resume_ok=%s resume_elapsed_ms=%s "
-            "resume_ready=%s recovery_running=%s last_no_touch_session=%s",
+            "resume_ready=%s recovery_running=%s",
             session_id,
             username,
             finger_name or "none",
-            self._format_seconds(seconds_since_resume),
-            self._format_seconds(seconds_since_suspend),
-            resume_result.get("generation", "none"),
-            resume_result.get("ok", "none"),
-            self._format_ms(resume_result.get("elapsed_ms")),
             self._resume_ready.is_set(),
             self._resume_recovery_running,
-            self._last_no_touch_timeout_session or "none",
         )
 
         self._active_verify_terminal = False
@@ -209,7 +187,6 @@ class EgisService:
             self._emit_enroll("enroll-failed", True)
 
     def suspend(self):
-        self._last_suspend_at = time.time()
         scan_mode = self._scan_mode
         active_verify_terminal = self._active_verify_terminal
         logger.info("Service suspend: active_mode=%s", scan_mode)
@@ -226,7 +203,6 @@ class EgisService:
         self._driver.release_for_sleep()
 
     def resume(self):
-        self._last_resume_at = time.time()
         logger.info("Service resume: starting recovery")
         self._start_resume_recovery()
         if self._suspended_scan_args:
@@ -295,12 +271,6 @@ class EgisService:
         finally:
             elapsed_ms = (time.time() - start) * 1000.0
             with self._resume_lock:
-                self._last_resume_result = {
-                    "ok": ok,
-                    "generation": generation,
-                    "elapsed_ms": elapsed_ms,
-                    "completed_at": time.time(),
-                }
                 self._resume_recovery_running = False
                 self._resume_ready.set()
 
@@ -342,21 +312,6 @@ class EgisService:
         self._scan_thread = threading.Thread(target=target_func, args=args)
         self._scan_thread.start()
 
-    def _seconds_since(self, timestamp, now=None):
-        if timestamp is None:
-            return None
-        return (now or time.time()) - timestamp
-
-    def _format_seconds(self, value):
-        if value is None:
-            return "none"
-        return f"{value:.1f}s"
-
-    def _format_ms(self, value):
-        if value is None:
-            return "none"
-        return f"{float(value):.0f}"
-
     def _format_float(self, value):
         if value is None:
             return "none"
@@ -394,16 +349,13 @@ class EgisService:
 
     def _scan_loop(self, mode, username, finger_name, prepare_before_loop=True, session_id=None):
         session_label = session_id if session_id is not None else "none"
-        now = time.time()
         logger.info(
-            "Starting %s loop session=%s user=%s finger=%s "
-            "prepare_before_loop=%s seconds_since_resume=%s",
+            "Starting %s loop session=%s user=%s finger=%s prepare_before_loop=%s",
             mode,
             session_label,
             username,
             finger_name,
             prepare_before_loop,
-            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
         )
         if prepare_before_loop:
             self.prepare_sensor(f"{mode}-loop")
@@ -428,14 +380,13 @@ class EgisService:
                         logger.info(
                             "Verify baseline contrast established: baseline=%.1f "
                             "samples=%d session=%s threshold=%.1f verify_threshold=%.1f "
-                            "delta=%.1f seconds_since_resume=%s",
+                            "delta=%.1f",
                             self._verify_baseline_contrast,
                             len(baseline_samples),
                             session_label,
                             self._driver.touch_threshold,
                             VERIFY_PRESENCE_THRESHOLD,
                             VERIFY_PRESENCE_DELTA,
-                            self._format_seconds(self._seconds_since(self._last_resume_at)),
                         )
                 is_present, touch_reason = self._is_verify_touch(float(contrast))
 
@@ -453,7 +404,7 @@ class EgisService:
                     logger.info(
                         "Touch detected after no-touch window: reason=%s contrast_now=%.1f "
                         "window_avg=%.1f window_max=%.1f samples=%d session=%s "
-                        "baseline=%s seconds_since_resume=%s",
+                        "baseline=%s",
                         touch_reason,
                         contrast,
                         sum(no_touch_contrasts) / len(no_touch_contrasts),
@@ -461,7 +412,6 @@ class EgisService:
                         len(no_touch_contrasts),
                         session_label,
                         self._format_float(self._verify_baseline_contrast),
-                        self._format_seconds(self._seconds_since(self._last_resume_at)),
                     )
                     no_touch_contrasts = []
                 no_touch_since = time.time()
@@ -484,27 +434,22 @@ class EgisService:
                     if no_touch_contrasts:
                         logger.info(
                             "Verify timed out with no touch: avg=%.1f max=%.1f "
-                            "samples=%d threshold=%.1f timeout=%.1fs session=%s "
-                            "seconds_since_resume=%s",
+                            "samples=%d threshold=%.1f timeout=%.1fs session=%s",
                             sum(no_touch_contrasts) / len(no_touch_contrasts),
                             max(no_touch_contrasts),
                             len(no_touch_contrasts),
                             self._driver.touch_threshold,
                             VERIFY_NO_TOUCH_TIMEOUT_SECONDS,
                             session_label,
-                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
                         )
                     else:
                         logger.warning(
                             "Verify timed out with no touch and no valid frames "
-                            "(timeout=%.1fs session=%s seconds_since_resume=%s)",
+                            "(timeout=%.1fs session=%s)",
                             VERIFY_NO_TOUCH_TIMEOUT_SECONDS,
                             session_label,
-                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
                         )
                     self._emit_verify("verify-no-match", True)
-                    self._last_no_touch_timeout_at = time.time()
-                    self._last_no_touch_timeout_session = session_id
                     self._scanning = False
                     self._scan_mode = None
                     break
@@ -513,13 +458,12 @@ class EgisService:
                     if no_touch_contrasts:
                         logger.info(
                             "Verify no-touch contrast window: avg=%.1f max=%.1f "
-                            "samples=%d threshold=%.1f session=%s seconds_since_resume=%s",
+                            "samples=%d threshold=%.1f session=%s",
                             sum(no_touch_contrasts) / len(no_touch_contrasts),
                             max(no_touch_contrasts),
                             len(no_touch_contrasts),
                             self._driver.touch_threshold,
                             session_label,
-                            self._format_seconds(self._seconds_since(self._last_resume_at, now)),
                         )
                     else:
                         logger.warning("Verify no-touch window had no valid frames")
