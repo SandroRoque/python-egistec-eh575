@@ -45,19 +45,30 @@ class Device(dbus.service.Object):
         self.claimed_by = None
         self.claim_sender = None
         self.busy = False
+        self.busy_operation = None
         self.suspended = False
         self.callbacks = []
 
     # --- Helper: Async Auth Wrapper ---
     def _run_with_auth(self, sender, action, success_cb, error_cb, operation_cb):
-        Device._auth.authorize(sender, action, success_cb, error_cb, operation_cb)
+        def guarded_operation():
+            if self.suspended:
+                logger.info(
+                    "Rejecting authorized operation while suspended: %s",
+                    action,
+                )
+                raise ClaimDevice()
+            return operation_cb()
+
+        Device._auth.authorize(sender, action, success_cb, error_cb, guarded_operation)
 
     # --- Standard Methods ---
 
-    def proxy_call(self, cb):
+    def proxy_call(self, cb, errback=None):
         if self.suspended or self.target is None:
-            logging.debug('The service is suspended / offline, delay the call')
-            self.callbacks += [cb]
+            logger.info("Rejecting call while fingerprint service is suspended/offline")
+            if errback is not None:
+                errback(ClaimDevice())
         else:
             cb()
 
@@ -100,20 +111,14 @@ class Device(dbus.service.Object):
                 return
         self.call_cbs()
 
-    def _clear_suspend_state(self):
+    def _mark_suspended(self):
         if self.owner_watcher is not None or self.busy:
-            logger.info("Clearing active fingerprint claim for suspend")
+            logger.info("Preserving active fingerprint claim for suspend")
         self.suspended = True
         self.callbacks = []
-        self.claimed_by = None
-        self.claim_sender = None
-        self.busy = False
-        if self.owner_watcher is not None:
-            self.owner_watcher.cancel()
-            self.owner_watcher = None
 
     def Suspend(self):
-        self._clear_suspend_state()
+        self._mark_suspended()
         if self.target is not None:
             try:
                 self.target.Suspend()
@@ -137,7 +142,7 @@ class Device(dbus.service.Object):
 
         def cb():
             callback(self.target.ListEnrolledFingers(username, signature='s'))
-        self.proxy_call(cb)
+        self.proxy_call(cb, errback)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='s',
@@ -203,6 +208,7 @@ class Device(dbus.service.Object):
         if self.busy:
             self.target.Cancel(signature='')
             self.busy = False
+            self.busy_operation = None
 
     # ------------------ Verify --------------------------
 
@@ -219,6 +225,7 @@ class Device(dbus.service.Object):
             if self.owner_watcher is None or self.claim_sender != sender:
                 raise ClaimDevice()
             self.busy = True
+            self.busy_operation = "verify"
             return self.target.VerifyStart(self.claimed_by, finger_name, signature='ss')
 
         self._run_with_auth(sender, "net.reactivated.fprint.device.verify", success_cb, error_cb, op)
@@ -233,6 +240,7 @@ class Device(dbus.service.Object):
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
         self.busy = False
+        self.busy_operation = None
         self.target.Cancel(signature='')
 
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='s')
@@ -240,7 +248,9 @@ class Device(dbus.service.Object):
 
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='sb')
     def VerifyStatus(self, result, done):
-        if done: self.busy = False
+        if done:
+            self.busy = False
+            self.busy_operation = None
 
     # ------------------ Enroll --------------------------
 
@@ -257,6 +267,7 @@ class Device(dbus.service.Object):
             if self.owner_watcher is None or self.claim_sender != sender:
                 raise ClaimDevice()
             self.busy = True
+            self.busy_operation = "enroll"
             return self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
 
         self._run_with_auth(sender, "net.reactivated.fprint.device.enroll", success_cb, error_cb, op)
@@ -271,11 +282,14 @@ class Device(dbus.service.Object):
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
         self.busy = False
+        self.busy_operation = None
         self.target.Cancel(signature='')
 
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='sb')
     def EnrollStatus(self, result, done):
-        if done: self.busy = False
+        if done:
+            self.busy = False
+            self.busy_operation = None
 
     # ------------------ Debug --------------------------
 

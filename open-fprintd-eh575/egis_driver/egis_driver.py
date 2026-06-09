@@ -1,6 +1,7 @@
 import usb.core
 import usb.util
 import logging
+import os
 import time
 import numpy as np
 import threading
@@ -12,6 +13,7 @@ ENDPOINT_OUT = 0x01
 ENDPOINT_IN = 0x82
 IMG_WIDTH = 103
 IMG_HEIGHT = 52
+USB_SYSFS_ROOT = "/sys/bus/usb/devices"
 
 logger = logging.getLogger("DRIVER")
 
@@ -42,25 +44,74 @@ class EgisDriver:
         try:
             self.dev.write(ENDPOINT_OUT, cmd)
             if read_resp:
-                return self.dev.read(ENDPOINT_IN, 64, timeout=timeout_ms)
+                resp = self.dev.read(ENDPOINT_IN, 64, timeout=timeout_ms)
+                # Validate EGIS/SIGE response magic when response is long enough.
+                # The Windows driver checks for 0x45474953 ("SIGE" little-endian)
+                # at the start of every 7-byte response. We check for the
+                # reversed magic "SIGE" (53 49 47 45) which is what the device
+                # sends back on its IN endpoint.
+                if len(resp) >= 4:
+                    magic = bytes(resp[:4])
+                    if magic != b'SIGE' and magic != b'EGIS':
+                        logger.debug(
+                            "Unexpected response magic: %s (cmd=%s, len=%d)",
+                            magic.hex(), hex_str[:20], len(resp),
+                        )
+                return resp
         except usb.core.USBError:
             pass
         return None
 
-    def _initialize_sensor(self, fast=False):
-        read_timeout = 200 if fast else 500
-        logger.info("Initializing Hardware (fast=%s, timeout=%dms)...", fast, read_timeout)
+    def _send_wake_control_transfer(self):
+        """Mirror the Windows driver's post-init control setup packet.
+
+        Ghidra dump EgisTouchFP0575.c:FUN_18001b078 builds a
+        WDF_USB_CONTROL_SETUP_PACKET from 0x500000014. WDF's setup packet is
+        8 raw bytes, so that decodes to:
+        bmRequestType=0x14, bRequest=0x00, wValue=0x0000,
+        wIndex=0x0005, wLength=0x0000.
+        """
+        try:
+            logger.info("Sending Windows wake control transfer")
+            self.dev.ctrl_transfer(0x14, 0x00, 0x0000, 0x0005, None, timeout=500)
+            logger.info("Windows wake control transfer complete")
+            return True
+        except usb.core.USBError as e:
+            logger.warning("Windows wake control transfer failed: %s", e)
+            return False
+
+    def _initialize_sensor(self):
+        read_timeout = 500
+        logger.info("Initializing Hardware (timeout=%dms)...", read_timeout)
+        self._send_wake_control_transfer()
+        ok_responses = 0
+        null_responses = 0
+        bad_responses = 0
+        total_commands = 0
+
+        def _counted_send(hex_str):
+            nonlocal ok_responses, null_responses, bad_responses, total_commands
+            total_commands += 1
+            resp = self._send_hex(hex_str, timeout_ms=read_timeout)
+            if resp is None:
+                null_responses += 1
+            elif len(resp) >= 4 and bytes(resp[:4]) in (b'SIGE', b'EGIS'):
+                ok_responses += 1
+            else:
+                bad_responses += 1
+            return resp
+
         patches = [
             "45 47 49 53 60 00 06", "45 47 49 53 60 01 06", "45 47 49 53 60 40 06",
             "45 47 49 53 61 0a f4", "45 47 49 53 61 0c 44", "45 47 49 53 61 40 00",
             "45 47 49 53 60 40 00", "45 47 49 53 71 02 02 01 0c", "45 47 49 53 61 0c 22",
             "45 47 49 53 61 0b 03", "45 47 49 53 61 0a fc"
         ]
-        for p in patches: self._send_hex(p, timeout_ms=read_timeout)
+        for p in patches: _counted_send(p)
 
-        self._send_hex("45 47 49 53 60 00 fc", timeout_ms=read_timeout)
-        self._send_hex("45 47 49 53 60 01 fc", timeout_ms=read_timeout)
-        self._send_hex("45 47 49 53 60 41 fc", timeout_ms=read_timeout)
+        _counted_send("45 47 49 53 60 00 fc")
+        _counted_send("45 47 49 53 60 01 fc")
+        _counted_send("45 47 49 53 60 41 fc")
 
         init_cmds = [
             "45 47 49 53 97 00 00",
@@ -73,7 +124,7 @@ class EgisDriver:
             "45 47 49 53 61 0c 44", "45 47 49 53 61 50 03", "45 47 49 53 60 50 03",
         ]
         for c in init_cmds:
-            self._send_hex(c, timeout_ms=read_timeout)
+            _counted_send(c)
             time.sleep(0.002)
 
         final_cmds = [
@@ -84,9 +135,61 @@ class EgisDriver:
             "45 47 49 53 61 24 33", "45 47 49 53 61 20 00", "45 47 49 53 61 21 66",
             "45 47 49 53 60 00 66", "45 47 49 53 60 01 66",
         ]
-        for c in final_cmds: self._send_hex(c, timeout_ms=read_timeout)
+        for c in final_cmds: _counted_send(c)
+
+        logger.info(
+            "Init command stats: total=%d ok=%d null=%d bad=%d",
+            total_commands, ok_responses, null_responses, bad_responses,
+        )
         self._mark_iok()
-        logger.info("Hardware Ready.")
+
+        # Self-test: capture multiple frames to prove the device is producing
+        # image data. Flat empty-frame contrast is still useful diagnostic
+        # signal, but it can be normal when no finger is present.
+        self._self_test()
+
+    def _self_test(self):
+        """Verify the sensor is producing frames after initialization."""
+        contrasts = []
+        for attempt in range(8):
+            try:
+                self._rearm()
+                self.dev.write(ENDPOINT_OUT, bytes.fromhex("45 47 49 53 64 14 ec"))
+                data = self.dev.read(ENDPOINT_IN, 10000, timeout=1500)
+                try:
+                    self.dev.read(ENDPOINT_IN, 512, timeout=20)
+                except Exception:
+                    pass
+            except usb.core.USBError:
+                continue
+
+            if data and len(data) >= 5000:
+                arr = np.array(list(data[:IMG_WIDTH * IMG_HEIGHT]), dtype=np.uint8)
+                contrasts.append(float(np.std(arr)))
+            time.sleep(0.05)
+
+        if len(contrasts) < 3:
+            raise RuntimeError(
+                f"Self-test failed: only {len(contrasts)} valid frames out of 8 attempts"
+            )
+
+        avg = sum(contrasts) / len(contrasts)
+        spread = max(contrasts) - min(contrasts)
+
+        logger.info(
+            "Self-test: frames=%d contrast_avg=%.1f spread=%.1f values=%s",
+            len(contrasts), avg, spread,
+            ", ".join(f"{c:.1f}" for c in contrasts),
+        )
+
+        if spread < 2.0:
+            logger.info(
+                "Self-test contrast is flat; treating as empty sensor diagnostic "
+                "(avg=%.1f, spread=%.1f)",
+                avg, spread,
+            )
+
+        logger.info("Hardware Ready (self-test OK).")
 
     def _rearm(self):
         # The critical sequence from your working test
@@ -105,6 +208,67 @@ class EgisDriver:
         except Exception:
             pass
 
+    def _find_sysfs_device_path(self):
+        try:
+            device_names = os.listdir(USB_SYSFS_ROOT)
+        except OSError as e:
+            logger.warning("USB sysfs unavailable: %s", e)
+            return None
+
+        for name in device_names:
+            if ":" in name:
+                continue
+            path = os.path.join(USB_SYSFS_ROOT, name)
+            try:
+                with open(os.path.join(path, "idVendor"), encoding="ascii") as f:
+                    vendor = f.read().strip().lower()
+                with open(os.path.join(path, "idProduct"), encoding="ascii") as f:
+                    product = f.read().strip().lower()
+            except OSError:
+                continue
+
+            if vendor == f"{VENDOR_ID:04x}" and product == f"{PRODUCT_ID:04x}":
+                return path
+
+        return None
+
+    def _write_sysfs(self, path, value):
+        with open(path, "w", encoding="ascii") as f:
+            f.write(value)
+
+    def _reauthorize_usb_device(self):
+        path = self._find_sysfs_device_path()
+        if path is None:
+            logger.warning("EH575 sysfs device not found for USB reauthorization")
+            return False
+
+        authorized = os.path.join(path, "authorized")
+        name = os.path.basename(path)
+        logger.info("Reauthorizing USB device via sysfs: %s", name)
+
+        try:
+            self._write_sysfs(authorized, "0")
+            time.sleep(0.35)
+            self._write_sysfs(authorized, "1")
+            time.sleep(1.0)
+            logger.info("USB sysfs reauthorization complete: %s", name)
+            return True
+        except OSError as e:
+            logger.warning("USB sysfs reauthorization failed for %s: %s", name, e)
+
+        driver_path = "/sys/bus/usb/drivers/usb"
+        try:
+            logger.info("Falling back to USB driver unbind/bind: %s", name)
+            self._write_sysfs(os.path.join(driver_path, "unbind"), name)
+            time.sleep(0.35)
+            self._write_sysfs(os.path.join(driver_path, "bind"), name)
+            time.sleep(1.0)
+            logger.info("USB driver unbind/bind complete: %s", name)
+            return True
+        except OSError as e:
+            logger.warning("USB driver unbind/bind failed for %s: %s", name, e)
+            return False
+
     def release_for_sleep(self):
         with self._usb_lock:
             logger.info("Releasing USB resources for sleep")
@@ -113,19 +277,23 @@ class EgisDriver:
             self._released_for_sleep = True
 
     def _reconnect(self, reset=False):
-        was_sleeping = self._released_for_sleep
+        was_released_for_sleep = self._released_for_sleep
         self._released_for_sleep = False
         self._dispose_device()
+        reauthorized = False
+        if was_released_for_sleep:
+            reauthorized = self._reauthorize_usb_device()
+
         self.dev = self._find_device()
-        if reset:
+        if reset and not reauthorized:
             try:
                 logger.info("Resetting USB device")
                 self.dev.reset()
-                time.sleep(0.25)
+                time.sleep(0.5)
                 self.dev = self._find_device()
             except Exception as e:
                 logger.warning("USB reset failed: %s", e)
-        self._initialize_sensor(fast=was_sleeping)
+        self._initialize_sensor()
         self._last_iok = time.time()
 
     def _ensure_connected(self, force=False, reset=False):
@@ -167,14 +335,20 @@ class EgisDriver:
         return self._ensure_connected(force=True, reset=reset)
 
     def refresh_after_idle(self, idle_seconds=300):
-        if time.time() - self._last_iok >= idle_seconds:
+        idle_for = time.time() - self._last_iok
+        if self._last_iok <= 0:
+            logger.info(
+                "USB has no successful I/O marker; refreshing with reconnect"
+            )
             return self.force_reconnect()
-        try:
-            self._initialize_sensor()
-            return True
-        except Exception as e:
-            logger.warning("Refresh failed: %s", e)
-            return self.force_reconnect()
+
+        logger.info(
+            "USB refresh skipped; preserving current sensor state "
+            "(idle_for=%.1fs threshold=%ds)",
+            idle_for,
+            idle_seconds,
+        )
+        return True
 
     def _mark_iok(self):
         self._last_iok = time.time()

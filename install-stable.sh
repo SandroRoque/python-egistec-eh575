@@ -44,6 +44,7 @@ sudo systemctl stop open-fprintd egis-bridge egis-sleep-recovery 2>/dev/null
 sudo systemctl disable open-fprintd egis-bridge egis-sleep-recovery 2>/dev/null
 sudo rm -f /usr/bin/open-fprintd /usr/bin/egis-bridge
 sudo rm -f /etc/systemd/system/egis-sleep-recovery.service
+sudo rm -f /usr/lib/systemd/system-sleep/egis-fprint-system-sleep
 
 # 2. Create Directory Structure
 echo "[*] Creating /opt directory structure..."
@@ -133,14 +134,14 @@ ExecStart=/usr/bin/python3 -u ./egis-bridge
 Restart=always
 RestartSec=2
 
-ReadWritePaths=/var/lib/open-fprintd
+ReadWritePaths=/var/lib/open-fprintd /sys/bus/usb/devices /sys/bus/usb/drivers/usb
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 ProtectClock=true
 ProtectKernelModules=true
-ProtectKernelTunables=true
+ProtectKernelTunables=false
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true

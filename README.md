@@ -238,3 +238,6 @@ sudo journalctl -u egis-bridge -n 80 --no-pager
 ls -ld /var/lib/open-fprintd/egis
 ls -ld /var/lib/open-fprintd/egis-calibration
 ```
+
+For the idle-suspend hyprlock fingerprint failure and the session-lifecycle fix, see
+[`docs/hyprlock-suspend-fingerprint.md`](docs/hyprlock-suspend-fingerprint.md).

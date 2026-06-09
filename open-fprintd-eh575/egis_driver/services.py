@@ -9,8 +9,7 @@ logger = logging.getLogger("SERVICE")
 
 ENROLL_STAGES = 10
 VERIFY_FRAME_COUNT = 3
-RESUME_RECOVERY_WAIT_SECONDS = 2.5
-RESUME_RECOVERY_MAX_ATTEMPTS = 3
+RESUME_RECOVERY_WAIT_SECONDS = 3.0
 RESUME_RECOVERY_WARMUP_FRAMES = 4
 VERIFY_NO_TOUCH_TIMEOUT_SECONDS = 15.0
 VERIFY_PRESENCE_THRESHOLD = 24.0
@@ -35,7 +34,9 @@ class EgisService:
 
         self._scanning = False
         self._scan_mode = None
+        self._scan_args = None
         self._scan_thread = None
+        self._suspended_scan_args = None
         self._enroll_scans = []
         self._enroll_touch_count = 0
         self._last_prepare_reason = None
@@ -176,6 +177,7 @@ class EgisService:
         )
 
         self._active_verify_terminal = False
+        self._verify_baseline_contrast = None
         target_finger = str(finger_name).strip() if finger_name else None
         if target_finger == "any":
             target_finger = None
@@ -208,15 +210,47 @@ class EgisService:
 
     def suspend(self):
         self._last_suspend_at = time.time()
-        logger.info("Service suspend: active_mode=%s", self._scan_mode)
+        scan_mode = self._scan_mode
+        active_verify_terminal = self._active_verify_terminal
+        logger.info("Service suspend: active_mode=%s", scan_mode)
         self._resume_ready.clear()
-        self._stop_scan()
+        if scan_mode == "verify" and not active_verify_terminal:
+            self._suspended_scan_args = self._scan_args
+            logger.info("Pausing active verify for suspend")
+        self._stop_scan(clear_args=False)
+        if scan_mode == "verify" and not active_verify_terminal:
+            logger.info("Verify paused for suspend; no terminal status emitted")
+        elif scan_mode == "enroll":
+            logger.info("Enroll interrupted by suspend; emitting terminal failure")
+            self._emit_enroll("enroll-failed", True)
         self._driver.release_for_sleep()
 
     def resume(self):
         self._last_resume_at = time.time()
         logger.info("Service resume: starting recovery")
         self._start_resume_recovery()
+        if self._suspended_scan_args:
+            logger.info("Scheduling suspended verify resume after recovery")
+            threading.Thread(
+                target=self._resume_suspended_scan_after_recovery,
+                args=(self._suspended_scan_args,),
+                name="egis-resume-scan",
+                daemon=True,
+            ).start()
+
+    def _resume_suspended_scan_after_recovery(self, scan_args):
+        if not self._resume_ready.wait(timeout=RESUME_RECOVERY_WAIT_SECONDS + 5.0):
+            logger.warning("Resume recovery did not finish before suspended scan restart")
+
+        if self._suspended_scan_args != scan_args:
+            logger.info("Suspended scan resume superseded")
+            return
+
+        self._suspended_scan_args = None
+        if scan_args and scan_args[0] == "verify":
+            self._verify_baseline_contrast = None
+            logger.info("Resuming suspended verify loop")
+            self._start_scan(self._scan_loop, scan_args)
 
     def _start_resume_recovery(self):
         with self._resume_lock:
@@ -241,20 +275,23 @@ class EgisService:
         start = time.time()
         ok = False
         try:
-            for attempt in range(1, RESUME_RECOVERY_MAX_ATTEMPTS + 1):
-                if generation != self._resume_generation:
-                    logger.info("Superseding stale resume recovery generation %d", generation)
-                    return
+            if generation != self._resume_generation:
+                logger.info("Superseding stale resume recovery generation %d", generation)
+                return
 
-                logger.info(
-                    "Resume recovery attempt %d/%d",
-                    attempt,
-                    RESUME_RECOVERY_MAX_ATTEMPTS,
-                )
-                ok = self.prepare_sensor(f"resume-attempt-{attempt}", force=True)
-                if ok:
-                    break
-                time.sleep(min(0.5 * attempt, 1.5))
+            # Let the USB subsystem stabilize before attempting reconnect.
+            # After a long sleep the bus and device may need a few seconds to
+            # re-enumerate fully.
+            delay = 2.0
+            logger.info("Resume recovery: waiting %.1fs for USB stabilization", delay)
+            time.sleep(delay)
+
+            if generation != self._resume_generation:
+                logger.info("Superseding stale resume recovery generation %d", generation)
+                return
+
+            logger.info("Resume recovery: reconnecting sensor")
+            ok = self.prepare_sensor("resume-recovery", force=True)
         finally:
             elapsed_ms = (time.time() - start) * 1000.0
             with self._resume_lock:
@@ -282,7 +319,7 @@ class EgisService:
     #  Thread management (private)
     # ------------------------------------------------------------------
 
-    def _stop_scan(self):
+    def _stop_scan(self, clear_args=True):
         if self._scanning:
             logger.info("Stopping active scan...")
             self._scanning = False
@@ -294,11 +331,14 @@ class EgisService:
             else:
                 logger.info("Thread stopped.")
         self._scan_mode = None
+        if clear_args:
+            self._scan_args = None
 
     def _start_scan(self, target_func, args):
         self._stop_scan()
         self._scanning = True
         self._scan_mode = args[0] if args else None
+        self._scan_args = args
         self._scan_thread = threading.Thread(target=target_func, args=args)
         self._scan_thread.start()
 

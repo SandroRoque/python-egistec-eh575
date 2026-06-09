@@ -13,14 +13,14 @@ ExecStart=/usr/bin/python3 -u ./egis-bridge
 Restart=always
 RestartSec=2
 
-ReadWritePaths=/var/lib/open-fprintd
+ReadWritePaths=/var/lib/open-fprintd /sys/bus/usb/devices /sys/bus/usb/drivers/usb
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 ProtectClock=true
 ProtectKernelModules=true
-ProtectKernelTunables=true
+ProtectKernelTunables=false
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
