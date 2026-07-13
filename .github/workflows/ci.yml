@@ -14,14 +14,14 @@ jobs:
       matrix:
         python: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dbus libdbus-1-dev libcairo2-dev libgirepository1.0-dev pkg-config
+          sudo apt-get install -y dbus libdbus-1-dev libcairo2-dev libgirepository-2.0-dev libgirepository1.0-dev pkg-config
       - name: Install project
         run: python -m pip install .
       - name: Validate
@@ -33,7 +33,7 @@ jobs:
     steps:
       - name: Install tools
         run: pacman -Syu --noconfirm git python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build deterministic release and package
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -45,7 +45,7 @@ jobs:
   fedora-package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build deterministic release
         run: ./tools/build-release --output dist/release
       - name: Build RPM
