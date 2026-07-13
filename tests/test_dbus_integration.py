@@ -45,6 +45,8 @@ class DbusManagerIntegrationTests(unittest.TestCase):
                 check=True,
             )
         except subprocess.CalledProcessError as error:
+            if os.environ.get("EGIS_REQUIRE_DBUS_TEST") == "1":
+                raise
             raise unittest.SkipTest(
                 f"private D-Bus daemon cannot start: {error.stderr.strip()}"
             ) from error

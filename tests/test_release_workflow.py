@@ -83,7 +83,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             try:
                 first = repo / "first"
                 second = repo / "second"
-                release.build_release("HEAD", first)
+                returned = release.build_release("HEAD", first)
                 release.build_release("HEAD", second)
             finally:
                 release.ROOT = old_root
@@ -95,6 +95,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             )
             self.assertNotIn("@SOURCE_SHA256@", (first / "PKGBUILD").read_text())
             manifest = json.loads((first / "release-manifest.json").read_text())
+            self.assertEqual(returned, manifest)
             self.assertEqual(manifest["version"], "0.4.0")
             with tarfile.open(first / archive_name, "r:gz") as archive:
                 names = archive.getnames()

@@ -35,7 +35,7 @@ install -m 0755 "$project/bin/egis-bridge" %{buildroot}/opt/egis-driver/egis-bri
 install -m 0755 "$project/bin/egis-calibrate" %{buildroot}/opt/egis-driver/egis-calibrate
 install -m 0755 %{_builddir}/%{name}-%{version}/egis-doctor %{buildroot}/opt/egis-driver/egis-doctor
 install -d %{buildroot}%{_bindir}
-ln -s /opt/egis-driver/egis-doctor %{buildroot}%{_bindir}/egis-doctor
+ln -s ../../opt/egis-driver/egis-doctor %{buildroot}%{_bindir}/egis-doctor
 cp -r "$project/openfprintd" "$project/egis_driver" %{buildroot}/opt/egis-driver/
 install -D -m 0644 "$project/open-fprintd.service" %{buildroot}%{_unitdir}/open-fprintd.service
 install -D -m 0644 "$project/egis-bridge.service" %{buildroot}%{_unitdir}/egis-bridge.service
@@ -59,7 +59,7 @@ udevadm control --reload-rules && udevadm trigger || :
 %systemd_postun_with_restart open-fprintd.service egis-bridge.service
 
 %files
-%license LICENSE
+%license LICENSE open-fprintd-eh575/openfprintd/COPYING
 /opt/egis-driver/
 %{_bindir}/egis-doctor
 %{_unitdir}/open-fprintd.service

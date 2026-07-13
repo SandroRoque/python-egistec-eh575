@@ -23,7 +23,7 @@ package() {
   install -m 0755 "$project/bin/egis-calibrate" "$optdir/egis-calibrate"
   install -m 0755 "$root/egis-doctor" "$optdir/egis-doctor"
   install -d "$pkgdir/usr/bin"
-  ln -s /opt/egis-driver/egis-doctor "$pkgdir/usr/bin/egis-doctor"
+  ln -s ../../opt/egis-driver/egis-doctor "$pkgdir/usr/bin/egis-doctor"
   cp -r "$project/openfprintd" "$project/egis_driver" "$optdir/"
 
   install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis"

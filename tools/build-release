@@ -91,7 +91,7 @@ def build_release(ref, output_dir):
         "version": version,
         "source_commit": commit,
         "openfprintd_tree": manager_tree,
-        "files": rendered,
+        "files": dict(rendered),
     }
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

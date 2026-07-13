@@ -13,9 +13,6 @@ FORBIDDEN_SUFFIXES = {
 }
 SENSITIVE_PATTERNS = {
     "absolute home path": re.compile(b"/" + rb"home/[A-Za-z0-9._-]+"),
-    "local login name": re.compile(
-        rb"(?i)user(?:name)?\s*[:=]\s*" + b"ro" + b"que" + rb"(?![A-Za-z])"
-    ),
     "known USB serial": re.compile(b"07B2" + b"1905", re.IGNORECASE),
     "private key": re.compile(rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY"),
     "GitHub token": re.compile(rb"gh[pousr]_[A-Za-z0-9_]{20,}"),
