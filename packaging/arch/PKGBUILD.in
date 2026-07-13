@@ -1,0 +1,44 @@
+# Maintainer: Sandro Roque <SandroRoque@users.noreply.github.com>
+pkgname=open-fprintd-eh575
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Egis EH575 fingerprint driver and open-fprintd manager"
+arch=('any')
+url="https://github.com/SandroRoque/python-egistec-eh575"
+license=('MIT' 'GPL-2.0-only')
+depends=('python' 'python-dbus' 'python-gobject' 'python-numpy' 'python-opencv'
+         'python-scikit-image' 'python-pyusb' 'polkit' 'dbus')
+conflicts=('open-fprintd-eh575-git')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('@SOURCE_SHA256@')
+
+package() {
+  local root="$srcdir/$pkgname-$pkgver"
+  local project="$root/open-fprintd-eh575"
+  local optdir="$pkgdir/opt/egis-driver"
+
+  install -d "$optdir"
+  install -m 0755 "$project/bin/open-fprintd" "$optdir/open-fprintd"
+  install -m 0755 "$project/bin/egis-bridge" "$optdir/egis-bridge"
+  install -m 0755 "$project/bin/egis-calibrate" "$optdir/egis-calibrate"
+  install -m 0755 "$root/egis-doctor" "$optdir/egis-doctor"
+  install -d "$pkgdir/usr/bin"
+  ln -s /opt/egis-driver/egis-doctor "$pkgdir/usr/bin/egis-doctor"
+  cp -r "$project/openfprintd" "$project/egis_driver" "$optdir/"
+
+  install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis"
+  install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis-calibration"
+  install -D -m 0644 "$project/open-fprintd.service" \
+    "$pkgdir/usr/lib/systemd/system/open-fprintd.service"
+  install -D -m 0644 "$project/egis-bridge.service" \
+    "$pkgdir/usr/lib/systemd/system/egis-bridge.service"
+  install -D -m 0644 "$project/net.reactivated.fprint.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/net.reactivated.fprint.policy"
+  install -D -m 0644 "$project/io.github.uunicorn.Fprint.Device.Egis.conf" \
+    "$pkgdir/usr/share/dbus-1/system.d/io.github.uunicorn.Fprint.Device.Egis.conf"
+  install -D -m 0644 "$project/70-egis-eh575.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/70-egis-eh575.rules"
+  install -D -m 0644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -D -m 0644 "$project/openfprintd/COPYING" \
+    "$pkgdir/usr/share/licenses/$pkgname/GPL-2.0-only.txt"
+}

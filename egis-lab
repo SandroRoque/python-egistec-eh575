@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "open-fprintd-eh575"))
 
 from egis_driver.evaluation import evaluate, sha256_file, write_report
 from egis_driver.lab_artifact import build_candidate
+from egis_driver.compatibility import doctor_report, public_compatibility_report
 
 
 LAB_ROOT = ROOT / ".egis-lab"
@@ -219,6 +220,21 @@ def cmd_build(args):
     print(artifact)
 
 
+def cmd_compatibility_report(args):
+    evaluation = _load_report(args.evaluation)
+    lifecycle = _load_report(args.lifecycle)
+    environment = doctor_report(check_services=not args.no_service_check)
+    report = public_compatibility_report(evaluation, lifecycle, environment)
+    output = Path(args.output or f"compatibility-{report['report_id']}.json")
+    output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    output.chmod(0o600)
+    print(output)
+    return 0 if report["passed"] else 2
+
+
 def build_parser():
     parser = argparse.ArgumentParser("egis-lab")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -259,6 +275,16 @@ def build_parser():
     build.add_argument("--candidate", required=True)
     build.add_argument("--output-dir")
     build.set_defaults(func=cmd_build)
+
+    compatibility = sub.add_parser(
+        "compatibility-report",
+        help="Export a sanitized aggregate report for external validation",
+    )
+    compatibility.add_argument("--evaluation", required=True)
+    compatibility.add_argument("--lifecycle", required=True)
+    compatibility.add_argument("--output")
+    compatibility.add_argument("--no-service-check", action="store_true")
+    compatibility.set_defaults(func=cmd_compatibility_report)
     return parser
 
 

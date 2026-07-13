@@ -1,12 +1,15 @@
 import cv2
 import numpy as np
 
+from egis_driver.device_profile import EH575_FRAME
+
 
 class ImageFeatureExtractor:
     """Image preprocessing, local features, and ridge consistency metrics."""
 
-    def __init__(self, upscale_factor=2):
+    def __init__(self, upscale_factor=2, frame_spec=EH575_FRAME):
         self.upscale_factor = upscale_factor
+        self.frame_spec = frame_spec
         self.detector = cv2.SIFT_create(
             nfeatures=0,
             nOctaveLayers=3,
@@ -17,7 +20,9 @@ class ImageFeatureExtractor:
         self.descriptor_norm = cv2.NORM_L2
 
     def raw_frame_to_image(self, raw):
-        return np.array(list(raw), dtype=np.uint8).reshape((52, 103))
+        return np.array(list(raw), dtype=np.uint8).reshape(
+            (self.frame_spec.height, self.frame_spec.width)
+        )
 
     def preprocess(self, img_array):
         img = cv2.normalize(img_array, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")

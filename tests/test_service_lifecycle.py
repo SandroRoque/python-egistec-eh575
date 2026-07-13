@@ -15,7 +15,15 @@ class FakeDriver:
         self.release_first_capture = threading.Event()
         self.release_count = 0
         self.capture_count = 0
+        self.ensure_count = 0
         self._capture_lock = threading.Lock()
+
+    def ensure_connected(self, force=False, reset=False):
+        self.ensure_count += 1
+        return True
+
+    def refresh_after_idle(self, idle_seconds=300):
+        return True
 
     def capture_presence_frame(self, read_timeout=1500):
         with self._capture_lock:

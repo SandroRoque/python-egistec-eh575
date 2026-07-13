@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+import argparse
+import ast
+import gzip
+import hashlib
+import io
+import json
+import subprocess
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_NAME = "open-fprintd-eh575"
+VERSION_FILE = "open-fprintd-eh575/egis_driver/version.py"
+ARCH_TEMPLATE = "packaging/arch/PKGBUILD.in"
+FEDORA_SPEC = "packaging/fedora/open-fprintd-eh575.spec"
+
+
+def git_output(*args, text=False):
+    return subprocess.check_output(
+        ["git", *args],
+        cwd=ROOT,
+        text=text,
+    )
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_at_ref(ref, path):
+    return git_output("show", f"{ref}:{path}", text=True)
+
+
+def version_at_ref(ref):
+    tree = ast.parse(file_at_ref(ref, VERSION_FILE), filename=VERSION_FILE)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__version__":
+                    return ast.literal_eval(node.value)
+    raise RuntimeError(f"__version__ is missing from {VERSION_FILE}")
+
+
+def deterministic_archive(ref, prefix):
+    tar_data = git_output("archive", "--format=tar", f"--prefix={prefix}/", ref)
+    output = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as stream:
+        stream.write(tar_data)
+    return output.getvalue()
+
+
+def build_release(ref, output_dir):
+    version = version_at_ref(ref)
+    commit = git_output("rev-parse", f"{ref}^{{commit}}", text=True).strip()
+    manager_tree = git_output(
+        "rev-parse",
+        f"{ref}:open-fprintd-eh575/openfprintd",
+        text=True,
+    ).strip()
+    prefix = f"{PACKAGE_NAME}-{version}"
+    archive_data = deterministic_archive(ref, prefix)
+    archive_sha256 = sha256_bytes(archive_data)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = output_dir / f"{prefix}.tar.gz"
+    pkgbuild_path = output_dir / "PKGBUILD"
+    spec_path = output_dir / f"{PACKAGE_NAME}.spec"
+    manifest_path = output_dir / "release-manifest.json"
+    checksums_path = output_dir / "SHA256SUMS"
+
+    archive_path.write_bytes(archive_data)
+    pkgbuild = file_at_ref(ref, ARCH_TEMPLATE).replace(
+        "@SOURCE_SHA256@",
+        archive_sha256,
+    )
+    if "@SOURCE_SHA256@" in pkgbuild:
+        raise RuntimeError("Arch package checksum placeholder was not rendered")
+    pkgbuild_path.write_text(pkgbuild, encoding="utf-8")
+    spec_path.write_text(file_at_ref(ref, FEDORA_SPEC), encoding="utf-8")
+
+    rendered = {
+        archive_path.name: archive_sha256,
+        pkgbuild_path.name: sha256_bytes(pkgbuild_path.read_bytes()),
+        spec_path.name: sha256_bytes(spec_path.read_bytes()),
+    }
+    manifest = {
+        "schema_version": 1,
+        "name": PACKAGE_NAME,
+        "version": version,
+        "source_commit": commit,
+        "openfprintd_tree": manager_tree,
+        "files": rendered,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    rendered[manifest_path.name] = sha256_bytes(manifest_path.read_bytes())
+    checksums_path.write_text(
+        "".join(f"{digest}  {name}\n" for name, digest in sorted(rendered.items())),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser("build-release")
+    parser.add_argument("--ref", default="HEAD")
+    parser.add_argument("--output", default=ROOT / "dist" / "release")
+    parser.add_argument("--allow-dirty", action="store_true")
+    args = parser.parse_args()
+
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if dirty and not args.allow_dirty:
+        raise SystemExit("Tracked files are dirty; commit the exact release source first")
+
+    manifest = build_release(args.ref, args.output)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

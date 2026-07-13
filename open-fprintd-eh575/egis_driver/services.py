@@ -4,6 +4,7 @@ import time
 
 from egis_driver import egis_driver, fingerprint_matcher
 from egis_driver.persistence import Persistence
+from egis_driver.runtime_config import RuntimePaths
 
 logger = logging.getLogger("SERVICE")
 
@@ -38,9 +39,10 @@ class EgisService:
 
     def __init__(self, driver=None, matcher=None, persistence=None,
                  on_enroll_status=None, on_verify_status=None,
-                 on_verify_finger_selected=None):
+                 on_verify_finger_selected=None, runtime_paths=None):
+        runtime_paths = runtime_paths or RuntimePaths.from_environment()
         self._driver = driver or egis_driver.EgisDriver()
-        self._persistence = persistence or Persistence("/var/lib/open-fprintd")
+        self._persistence = persistence or Persistence(str(runtime_paths.data_root))
         self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
             persistence=self._persistence)
 
@@ -78,7 +80,7 @@ class EgisService:
 
             resume_ready = self._wait_for_resume_recovery(reason)
             logger.info("Preparing sensor (%s)", reason)
-            if not self._driver._ensure_connected(force=not resume_ready):
+            if not self._driver.ensure_connected(force=not resume_ready):
                 return False
             ok = self._driver.refresh_after_idle()
             if ok:

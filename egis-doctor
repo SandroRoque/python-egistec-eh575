@@ -1,0 +1,52 @@
+#!/usr/bin/python3
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).resolve()
+if (SCRIPT.parent / "egis_driver").is_dir():
+    sys.path.insert(0, str(SCRIPT.parent))
+else:
+    sys.path.insert(0, str(SCRIPT.parent / "open-fprintd-eh575"))
+
+from egis_driver.compatibility import doctor_report
+
+
+def main():
+    parser = argparse.ArgumentParser("egis-doctor")
+    parser.add_argument("--json", action="store_true", help="Print the sanitized JSON report")
+    parser.add_argument("--output", help="Write the sanitized JSON report")
+    parser.add_argument(
+        "--no-service-check",
+        action="store_true",
+        help="Check source and USB compatibility without requiring installed services",
+    )
+    args = parser.parse_args()
+
+    report = doctor_report(check_services=not args.no_service_check)
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        path = Path(args.output)
+        path.write_text(encoded, encoding="utf-8")
+        path.chmod(0o600)
+    if args.json:
+        print(encoded, end="")
+    else:
+        print(f"EH575 compatibility: {'PASS' if report['compatible'] else 'FAIL'}")
+        print(f"USB: {report['hardware']['status']}")
+        service_ready = report["services"]["ready"]
+        service_status = (
+            "not checked" if service_ready is None else
+            "ready" if service_ready else
+            "not ready"
+        )
+        print(f"Services: {service_status}")
+        for warning in report["hardware"]["warnings"]:
+            print(f"Warning: {warning}")
+    return 0 if report["compatible"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+import argparse
+import re
+import subprocess
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FORBIDDEN_PARTS = {".egis-lab", "dist", "__pycache__", ".egistec"}
+FORBIDDEN_SUFFIXES = {
+    ".bin", ".key", ".npy", ".npz", ".p12", ".pcap", ".pcapng",
+    ".pem", ".pyc", ".raw", ".tar", ".tar.gz", ".tar.xz", ".zip",
+}
+SENSITIVE_PATTERNS = {
+    "absolute home path": re.compile(b"/" + rb"home/[A-Za-z0-9._-]+"),
+    "local login name": re.compile(
+        rb"(?i)user(?:name)?\s*[:=]\s*" + b"ro" + b"que" + rb"(?![A-Za-z])"
+    ),
+    "known USB serial": re.compile(b"07B2" + b"1905", re.IGNORECASE),
+    "private key": re.compile(rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY"),
+    "GitHub token": re.compile(rb"gh[pousr]_[A-Za-z0-9_]{20,}"),
+}
+
+
+def tracked_files(root=ROOT):
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    )
+    return [Path(value.decode("utf-8")) for value in result.stdout.split(b"\0") if value]
+
+
+def forbidden_suffix(path):
+    name = path.name.lower()
+    return next((suffix for suffix in FORBIDDEN_SUFFIXES if name.endswith(suffix)), None)
+
+
+def inspect_files(paths, root=ROOT):
+    errors = []
+    for relative in paths:
+        if any(part in FORBIDDEN_PARTS for part in relative.parts):
+            errors.append(f"generated/private path is tracked: {relative}")
+            continue
+        suffix = forbidden_suffix(relative)
+        if suffix:
+            errors.append(f"forbidden capture/archive type {suffix}: {relative}")
+            continue
+        path = root / relative
+        if not path.exists():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            errors.append(f"cannot inspect {relative}: {error}")
+            continue
+        if b"\0" in data:
+            errors.append(f"unexpected binary file is tracked: {relative}")
+            continue
+        for label, pattern in SENSITIVE_PATTERNS.items():
+            if pattern.search(data):
+                errors.append(f"{label} found in tracked file: {relative}")
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser("repository-guard")
+    parser.parse_args()
+    errors = inspect_files(tracked_files())
+    if errors:
+        print("\n".join(errors))
+        return 1
+    print("Tracked-file privacy guard passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,8 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
-setup(
-    name="open-fprintd-eh575",
-    version="0.3.0",
-    packages=find_packages(),
-    install_requires=[]
-)
+# Compatibility shim for tooling that still invokes setup.py directly.
+setup()

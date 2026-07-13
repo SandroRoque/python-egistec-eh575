@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE"' EXIT
+
+cd "$ROOT"
+export PYTHONPATH="$ROOT/open-fprintd-eh575"
+export PYTHONPYCACHEPREFIX="$CACHE"
+
+python -m compileall -q open-fprintd-eh575 tests \
+  egis-doctor egis-lab promote-candidate stage-development tools
+bash -n install-stable.sh
+./install-stable.sh --check
+./tools/repository-guard
+python -m unittest discover -s tests -v

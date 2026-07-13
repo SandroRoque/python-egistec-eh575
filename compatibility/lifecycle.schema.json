@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SandroRoque/python-egistec-eh575/compatibility/lifecycle.schema.json",
+  "title": "EH575 lifecycle validation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "service_restarts",
+    "suspend_resume",
+    "locked_idle",
+    "password_fallback",
+    "fprintd_clients"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "service_restarts": {"$ref": "#/$defs/attempts"},
+    "suspend_resume": {"$ref": "#/$defs/attempts"},
+    "locked_idle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minutes", "false_failures"],
+      "properties": {
+        "minutes": {"type": "integer", "minimum": 0},
+        "false_failures": {"type": "integer", "minimum": 0}
+      }
+    },
+    "password_fallback": {"enum": ["pass", "fail"]},
+    "fprintd_clients": {"enum": ["pass", "fail"]}
+  },
+  "$defs": {
+    "attempts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "passed"],
+      "properties": {
+        "attempts": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "service_restarts": {
+    "attempts": 3,
+    "passed": 0
+  },
+  "suspend_resume": {
+    "attempts": 5,
+    "passed": 0
+  },
+  "locked_idle": {
+    "minutes": 0,
+    "false_failures": 0
+  },
+  "password_fallback": "fail",
+  "fprintd_clients": "fail"
+}

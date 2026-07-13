@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-fprintd-eh575"
+dynamic = ["version"]
+description = "EgisTec EH575 fingerprint driver and open-fprintd backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = {file = "LICENSE"}
+authors = [{name = "Sandro Roque"}]
+dependencies = [
+  "dbus-python>=1.3,<2",
+  "numpy>=2,<3",
+  "opencv-python-headless>=4.10,<5",
+  "PyGObject>=3.48,<4",
+  "pyusb>=1.2,<2",
+  "scikit-image>=0.24,<0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/SandroRoque/python-egistec-eh575"
+Repository = "https://github.com/SandroRoque/python-egistec-eh575"
+
+[project.optional-dependencies]
+test = []
+
+[tool.setuptools]
+package-dir = {"" = "open-fprintd-eh575"}
+
+[tool.setuptools.dynamic]
+version = {attr = "egis_driver.version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["open-fprintd-eh575"]
+include = ["egis_driver*", "openfprintd*"]

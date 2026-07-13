@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SandroRoque/python-egistec-eh575/compatibility/doctor.schema.json",
+  "title": "EH575 diagnostic report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project",
+    "platform",
+    "hardware",
+    "services",
+    "state",
+    "compatible"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "source_commit",
+        "source_dirty",
+        "matcher_version",
+        "template_schema_version"
+      ],
+      "properties": {
+        "name": {"const": "open-fprintd-eh575"},
+        "version": {"type": "string"},
+        "source_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+        "source_dirty": {"type": ["boolean", "null"]},
+        "matcher_version": {"type": "integer", "minimum": 1},
+        "template_schema_version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "platform": {"$ref": "report.schema.json#/$defs/platform"},
+    "hardware": {"$ref": "report.schema.json#/$defs/hardware"},
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready"],
+      "properties": {
+        "open_fprintd": {"enum": ["ready", "failed", "unavailable"]},
+        "egis_bridge": {"enum": ["ready", "failed", "unavailable"]},
+        "dbus_device": {"enum": ["ready", "failed", "unavailable"]},
+        "ready": {"type": ["boolean", "null"]}
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enrollment", "calibration", "thresholds"],
+      "properties": {
+        "enrollment": {"$ref": "#/$defs/state_entry"},
+        "calibration": {"$ref": "#/$defs/state_entry"},
+        "thresholds": {"enum": ["validated", "invalid", "unavailable"]}
+      }
+    },
+    "compatible": {"type": "boolean"}
+  },
+  "$defs": {
+    "state_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["present", "unavailable"]},
+        "mode": {"type": "string", "pattern": "^[0-7]{4}$"},
+        "uid": {"type": "integer", "minimum": 0},
+        "gid": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

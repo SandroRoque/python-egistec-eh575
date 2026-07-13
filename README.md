@@ -7,6 +7,11 @@ This is a fork of the original [python-egistec-eh575](https://github.com/abbhina
 It keeps the upstream reverse-engineering lineage intact while extending the driver,
 matcher, calibration flow, and lock-screen integration.
 
+**Support status:** experimental. Revision `1072` has a local known-good
+baseline. Support is not yet established across multiple independent laptops;
+see [Compatibility Validation](docs/compatibility.md) before relying on it as the
+only authentication path.
+
 ## Supported Devices
 
 Found in some ASUS and Lenovo laptops with onboard fingerprint readers using this sensor.
@@ -19,11 +24,15 @@ lsusb | grep -i '1c7a:0575'
 ## Architecture
 
 ```
-Hardware (USB)  →  egis_driver.py  →  fingerprint_matcher.py  →  egis-bridge  →  D-Bus
-                  (USB comm,           (SIFT candidate search,    (D-Bus service,  (open-fprintd
-                   frame capture)       per-frame alignment,       scan loop,       integration,
-                                        ridge/image checks)        state machine)   PolicyKit)
+DeviceProfile → USB backend → frame features → matcher → service state machine
+                                                    ↓
+fprint client ← D-Bus device ← vendored manager ← egis-bridge
 ```
+
+The repository stays a monorepo because these layers are released and acceptance
+tested together, but their interfaces are explicit. The manager is vendored with
+recorded provenance and remains isolated from the EH575 protocol. See
+[Architecture and Repository Boundaries](docs/architecture.md).
 
 ## Repository Layout
 
@@ -34,20 +43,27 @@ open-fprintd-eh575/
 │   ├── egis-calibrate       # Calibration and audit collection tool
 │   └── open-fprintd         # Manager daemon
 ├── egis_driver/
-│   ├── egis_driver.py       # USB hardware driver
+│   ├── device_profile.py    # Immutable EH575 protocol and geometry
+│   ├── egis_driver.py       # Validated USB backend
+│   ├── interfaces.py        # Backend contract consumed by services
+│   ├── services.py          # Scan and suspend/resume state machine
 │   └── fingerprint_matcher.py  # Fingerprint matching engine
 ├── openfprintd/
 │   ├── device.py            # D-Bus device proxy
 │   ├── manager.py           # D-Bus manager
 │   └── polkit.py            # Authorization helper
-├── setup.py                 # Python packaging
+├── setup.py                 # Compatibility shim for Python packaging
 ├── 70-egis-eh575.rules      # udev rule for USB access
 ├── *.service                # systemd units
 ├── *.conf                   # D-Bus policy
 └── *.policy                 # PolKit permissions
 
-debug_sensor.py              # Debug tool for capturing raw frames
-install-stable.sh            # One-shot deployment script
+compatibility/               # Public schemas and sanitized known-good evidence
+packaging/                   # Arch and Fedora release recipes
+tools/check                  # Canonical local/CI validation command
+tools/build-release          # Deterministic release archive builder
+egis-doctor                  # Sanitized compatibility diagnostic
+install-stable.sh            # Transactional source deployment with rollback
 ```
 
 Enrolled fingerprint templates are stored in `/var/lib/open-fprintd/egis`.
@@ -74,39 +90,31 @@ Verification fails closed until validated calibrated thresholds exist. Matcher v
 
 ## Installation
 
-### Option 1: Install from source
+### Install from source
 
 ```bash
 git clone https://github.com/SandroRoque/python-egistec-eh575.git
 cd python-egistec-eh575
-sudo bash install-stable.sh
+./install-stable.sh --check
+sudo ./install-stable.sh
 ```
 
-The installer copies the driver to `/opt/egis-driver`, installs systemd/D-Bus/PolKit/udev configuration, creates `/var/lib/open-fprintd/egis`, and restarts the services.
+The nonprivileged preflight checks dependencies and the exact installation
+inputs. The single privileged invocation stages the payload, backs up the
+previous code and configuration, installs checked-in systemd/D-Bus/PolKit/udev
+files, and rolls back automatically if the D-Bus device does not become ready.
+It preserves enrollment and calibration state.
 
 After installation:
 
 ```bash
 systemctl status open-fprintd egis-bridge --no-pager
+egis-doctor
 ```
 
-### Option 2: AUR helper
-
-```bash
-yay -S open-fprintd-eh575
-# or
-paru -S open-fprintd-eh575
-```
-
-Use this only after the AUR package has been published and updated to this fork.
-
-### Option 3: Build from AUR manually
-
-```bash
-git clone https://aur.archlinux.org/open-fprintd-eh575.git
-cd open-fprintd-eh575
-makepkg -si
-```
+Do not install an unverified AUR package under this project name. Release archives
+contain checksum-pinned Arch and Fedora recipes generated from the same Git tree;
+see [Release Procedure](docs/releasing.md).
 
 ## Dependencies
 
@@ -127,16 +135,12 @@ sudo pacman -S python-opencv python-numpy python-scikit-image python-pyusb pytho
 
 ## Updating
 
-Via AUR helper:
-```bash
-yay -Syu open-fprintd-eh575
-```
-
-From source:
+From a source installation:
 ```bash
 cd python-egistec-eh575
 git pull
-sudo bash install-stable.sh
+./tools/check
+sudo ./install-stable.sh
 ```
 
 Re-enrollment is required when the template schema changes. Matcher v5 can reuse schema-v4 enrollments, but requires calibration analysis to be rerun so validated matcher-v5 thresholds are written.
@@ -235,6 +239,20 @@ session collects the untouched physical acceptance matrix. Only a passing holdou
 report can produce an artifact for the final manual promotion command. See
 [`docs/offline-development.md`](docs/offline-development.md) for the complete
 workflow and rollback behavior.
+
+## Reproducibility and Compatibility
+
+Run the complete nonprivileged repository check with:
+
+```bash
+./tools/check
+```
+
+CI exercises Python 3.12-3.14, the D-Bus contract, privacy guards, deterministic
+source archives, and Arch/Fedora package builds. Hardware and desktop lifecycle
+behavior cannot be proven in CI. Use `egis-doctor` and the sanitized compatibility
+workflow in [Compatibility Validation](docs/compatibility.md) to contribute
+evidence without publishing biometric data.
 
 ## Debugging
 

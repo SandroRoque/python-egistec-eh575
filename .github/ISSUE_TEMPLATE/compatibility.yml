@@ -1,0 +1,31 @@
+name: Hardware compatibility report
+description: Report sanitized EH575 hardware and lifecycle results
+title: "Compatibility: "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Attach only a generated `compatibility-report.json`. Never attach raw captures, templates, `.egis-lab`, calibration samples, USB serials, or logs containing usernames.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I reviewed the report and it contains no biometric data, username, hostname, USB serial, or local path.
+          required: true
+        - label: Password authentication remained available during testing.
+          required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Sanitized report
+      description: Attach the JSON file or paste its contents here.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Non-private observations
+      description: Describe desktop, display manager, and behavior without names or machine identifiers.

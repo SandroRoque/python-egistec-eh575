@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SandroRoque/python-egistec-eh575/compatibility/report.schema.json",
+  "title": "Public EH575 compatibility report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project",
+    "platform",
+    "hardware",
+    "evaluation",
+    "lifecycle",
+    "passed",
+    "report_id"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "source_commit",
+        "source_dirty",
+        "matcher_version",
+        "template_schema_version"
+      ],
+      "properties": {
+        "name": {"const": "open-fprintd-eh575"},
+        "version": {"type": "string"},
+        "source_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+        "source_dirty": {"type": ["boolean", "null"]},
+        "matcher_version": {"type": "integer", "minimum": 1},
+        "template_schema_version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "platform": {"$ref": "#/$defs/platform"},
+    "hardware": {"$ref": "#/$defs/hardware"},
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "repeats", "deterministic", "targets", "latency", "gates"],
+      "properties": {
+        "role": {"type": ["string", "null"]},
+        "repeats": {"type": "integer", "minimum": 1},
+        "deterministic": {"type": "boolean"},
+        "targets": {
+          "type": "object",
+          "minProperties": 1,
+          "patternProperties": {
+            "^target_[1-9][0-9]*$": {"$ref": "#/$defs/target"}
+          },
+          "additionalProperties": false
+        },
+        "latency": {"$ref": "#/$defs/latency"},
+        "gates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["deterministic", "latency", "passed", "targets"],
+          "properties": {
+            "deterministic": {"type": "boolean"},
+            "latency": {"type": "boolean"},
+            "passed": {"type": "boolean"},
+            "targets": {
+              "type": "object",
+              "patternProperties": {"^target_[1-9][0-9]*$": {"type": "boolean"}},
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    "lifecycle": {"$ref": "lifecycle.schema.json"},
+    "passed": {"type": "boolean"},
+    "report_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"}
+  },
+  "$defs": {
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["distribution", "kernel", "architecture", "python", "dependencies"],
+      "properties": {
+        "distribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "version_id"],
+          "properties": {
+            "id": {"type": "string"},
+            "version_id": {"type": "string"}
+          }
+        },
+        "kernel": {"type": "string"},
+        "architecture": {"type": "string"},
+        "python": {"type": "string"},
+        "dependencies": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["opencv", "numpy", "scikit_image", "pyusb"],
+          "properties": {
+            "opencv": {"type": "string"},
+            "numpy": {"type": "string"},
+            "scikit_image": {"type": "string"},
+            "pyusb": {"type": "string"}
+          }
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "compatible", "warnings", "devices"],
+      "properties": {
+        "status": {"enum": ["compatible", "incompatible", "unavailable"]},
+        "compatible": {"type": "boolean"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "devices": {"type": "array", "items": {"$ref": "#/$defs/usb_device"}}
+      }
+    },
+    "usb_device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "usb_id",
+        "bcd_device",
+        "usb_version",
+        "speed_mbps",
+        "interfaces"
+      ],
+      "properties": {
+        "usb_id": {"const": "1c7a:0575"},
+        "bcd_device": {"type": "string", "pattern": "^[0-9a-f]{4}$"},
+        "usb_version": {"type": "string"},
+        "speed_mbps": {"type": ["number", "null"]},
+        "interfaces": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/usb_interface"}
+        }
+      }
+    },
+    "usb_interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "class", "subclass", "protocol", "endpoints"],
+      "properties": {
+        "number": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "class": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "subclass": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "protocol": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "endpoints": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/usb_endpoint"}
+        }
+      }
+    },
+    "usb_endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "attributes", "max_packet_size"],
+      "properties": {
+        "address": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "attributes": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+        "max_packet_size": {"type": "integer", "minimum": 0}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "genuine_total",
+        "genuine_pass",
+        "genuine_pass_required",
+        "impostor_total",
+        "impostor_accept"
+      ],
+      "properties": {
+        "genuine_total": {"type": "integer", "minimum": 0},
+        "genuine_pass": {"type": "integer", "minimum": 0},
+        "genuine_pass_required": {"type": "integer", "minimum": 0},
+        "impostor_total": {"type": "integer", "minimum": 0},
+        "impostor_accept": {"type": "integer", "minimum": 0}
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "minimum": 0}
+    }
+  }
+}
