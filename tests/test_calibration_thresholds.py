@@ -124,7 +124,7 @@ class CalibrationThresholdTests(unittest.TestCase):
                     "inlier_ratio": 0.5,
                     "inlier_frames": 1,
                     "max_frame_inliers": 5,
-                    "margin": 1.0,
+                    "margin": 0.5,
                     "ncc": 0.50,
                     "orientation": 0.70,
                     "ridge_score": 0.50,
@@ -164,6 +164,44 @@ class CalibrationThresholdTests(unittest.TestCase):
         self.assertTrue(validation["per_target"]["testuser/right-index-finger"]["uses_global_thresholds"])
         self.assertTrue(validation["per_target"]["testuser/right-thumb"]["uses_global_thresholds"])
         self.assertEqual(validation["per_target"]["testuser/right-thumb"]["thresholds"], thresholds)
+
+    def test_unscored_genuine_samples_count_as_failed_validation_attempts(self):
+        calibrate = load_calibrate_module()
+        passing = {
+            "inliers": 8,
+            "inlier_ratio": 0.8,
+            "inlier_frames": 1,
+            "max_frame_inliers": 8,
+            "margin": 4.0,
+            "ncc": 0.70,
+            "orientation": 0.80,
+            "ridge_score": 0.70,
+        }
+        records = []
+        for index in range(8):
+            records.append({
+                "username": "testuser",
+                "target_finger": "right-index-finger",
+                "label": "genuine",
+                "best": dict(passing) if index < 3 else {},
+            })
+        for _ in range(8):
+            records.append({
+                "username": "testuser",
+                "target_finger": "right-index-finger",
+                "label": "impostor",
+                "best": {},
+            })
+
+        _, _, warnings, validation = calibrate.recommend_thresholds(records)
+
+        self.assertTrue(any("3/8 collected genuine samples" in item for item in warnings))
+        self.assertEqual(validation["genuine_pass"], 3)
+        self.assertEqual(validation["genuine_scored"], 3)
+        self.assertEqual(
+            validation["per_target"]["testuser/right-index-finger"]["genuine_pass_required"],
+            6,
+        )
 
 
 if __name__ == "__main__":

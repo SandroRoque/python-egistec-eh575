@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+import json
+import os
+import shutil
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+SOURCE = ROOT / "open-fprintd-eh575"
+INSTALL = Path("/opt/egis-driver")
+ENROLLMENT = Path("/var/lib/open-fprintd/egis")
+THRESHOLDS = Path("/var/lib/open-fprintd/egis-calibration/thresholds.json")
+EXECUTABLES = ("open-fprintd", "egis-bridge", "egis-calibrate")
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, check=True, text=True, **kwargs)
+
+
+def install_payload(stage):
+    stage.mkdir()
+    for name in EXECUTABLES:
+        shutil.copy2(SOURCE / "bin" / name, stage / name)
+        (stage / name).chmod(0o755)
+    ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
+    shutil.copytree(SOURCE / "egis_driver", stage / "egis_driver", ignore=ignored)
+    shutil.copytree(SOURCE / "openfprintd", stage / "openfprintd", ignore=ignored)
+
+
+def wait_for_services():
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        status = subprocess.run(
+            ["systemctl", "is-active", "open-fprintd", "egis-bridge"],
+            capture_output=True,
+            text=True,
+        )
+        if status.returncode == 0:
+            device = subprocess.run(
+                [
+                    "busctl", "--system", "call",
+                    "net.reactivated.Fprint",
+                    "/net/reactivated/Fprint/Manager",
+                    "net.reactivated.Fprint.Manager",
+                    "GetDefaultDevice",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if device.returncode == 0 and "/net/reactivated/Fprint/Device/" in device.stdout:
+                return
+        time.sleep(0.5)
+    raise RuntimeError("fingerprint D-Bus manager and device did not become ready")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run once with: sudo ./stage-development")
+    username = os.environ.get("SUDO_USER")
+    if not username or username == "root":
+        raise SystemExit("SUDO_USER is unavailable; invoke through sudo as your normal user")
+    if not INSTALL.is_dir() or not ENROLLMENT.is_dir():
+        raise SystemExit("the existing driver installation or enrollment directory is missing")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stage = INSTALL.with_name(f"egis-driver.stage.{os.getpid()}")
+    install_backup = INSTALL.with_name(f"egis-driver.dev-backup.{stamp}")
+    enrollment_backup = ENROLLMENT.with_name(f"egis.dev-backup.{stamp}")
+    threshold_backup = THRESHOLDS.with_name(f"thresholds.json.dev-backup.{stamp}")
+    installed = False
+
+    install_payload(stage)
+    shutil.copytree(ENROLLMENT, enrollment_backup)
+    if THRESHOLDS.is_file():
+        shutil.copy2(THRESHOLDS, threshold_backup)
+
+    try:
+        run(["systemctl", "stop", "egis-bridge", "open-fprintd"])
+        os.replace(INSTALL, install_backup)
+        os.replace(stage, INSTALL)
+        installed = True
+        THRESHOLDS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        THRESHOLDS.write_text(json.dumps({
+            "matcher_version": 5,
+            "generated_at": int(time.time()),
+            "validated": False,
+            "warnings": ["development payload staged; calibration required"],
+        }, indent=2, sort_keys=True) + "\n")
+        THRESHOLDS.chmod(0o600)
+
+        run(["systemctl", "start", "open-fprintd", "egis-bridge"])
+        wait_for_services()
+        for finger in ("right-index-finger", "right-thumb"):
+            print(f"\nEnroll {username} {finger}", flush=True)
+            run(["fprintd-enroll", "-f", finger, username])
+
+        run([str(ROOT / "egis-lab"), "snapshot", "--role", "development"])
+        print("\nDevelopment payload and touch-balanced enrollments staged.")
+        print(f"Code backup: {install_backup}")
+        print(f"Enrollment backup: {enrollment_backup}")
+        if threshold_backup.exists():
+            print(f"Threshold backup: {threshold_backup}")
+        print("Fingerprint authentication remains fail-closed until validation passes.")
+        return 0
+    except BaseException:
+        subprocess.run(["systemctl", "stop", "egis-bridge", "open-fprintd"])
+        if installed:
+            failed = INSTALL.with_name(f"egis-driver.dev-failed.{stamp}")
+            if INSTALL.exists():
+                os.replace(INSTALL, failed)
+            os.replace(install_backup, INSTALL)
+        if ENROLLMENT.exists():
+            failed_enrollment = ENROLLMENT.with_name(f"egis.dev-failed.{stamp}")
+            os.replace(ENROLLMENT, failed_enrollment)
+        shutil.copytree(enrollment_backup, ENROLLMENT)
+        if threshold_backup.exists():
+            shutil.copy2(threshold_backup, THRESHOLDS)
+        else:
+            THRESHOLDS.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "start", "open-fprintd", "egis-bridge"])
+        raise
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

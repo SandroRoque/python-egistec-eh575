@@ -59,7 +59,7 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 1. 10 touches, each captures continuously at ~29 FPS while finger is on sensor
 2. Quality-gated frame selection (contrast, sharpness, foreground, ridge clarity)
 3. SSIM-based near-duplicate removal
-4. Top ~40 diverse v3 templates stored with SIFT descriptors, normalized image patches, and ridge-orientation descriptors
+4. Top ~40 diverse schema-v4 templates stored with SIFT descriptors, normalized image patches, and ridge-orientation descriptors
 
 ### Verification
 1. 3-frame ensemble capture per attempt
@@ -70,7 +70,7 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
-Verification fails closed until validated calibrated thresholds exist. Matcher v3 ignores older template files because they do not contain the image/ridge data needed for hardened verification; re-enroll after installing this version.
+Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Existing schema-v4 enrollments remain compatible, but calibration thresholds from earlier matcher versions are rejected and must be regenerated. Older template schemas are ignored because they do not contain the image/ridge data needed for hardened verification.
 
 ## Installation
 
@@ -139,7 +139,7 @@ git pull
 sudo bash install-stable.sh
 ```
 
-Re-enrollment is required when the matching algorithm changes. Matcher v3 requires new enrollments and validated calibration.
+Re-enrollment is required when the template schema changes. Matcher v5 can reuse schema-v4 enrollments, but requires calibration analysis to be rerun so validated matcher-v5 thresholds are written.
 
 ## Usage
 
@@ -217,6 +217,24 @@ sudo systemctl start egis-bridge
 The analyzer writes `/var/lib/open-fprintd/egis-calibration/report.json`. If an audit wrong-finger sample passes the fixed identity policy, it refuses to write validated thresholds and authentication remains disabled. Do not loosen thresholds to fit negative samples; improve enrollment quality or the matcher itself.
 
 The current identity policy is intentionally global, not per-finger. `thresholds_by_target` is expected to be empty unless a future matcher version explicitly introduces a stricter per-target policy.
+
+## Offline Matcher Development
+
+Matcher experiments should not be deployed to the live lock-screen stack. The
+private lab workflow creates a single privileged snapshot and then performs all
+replay, benchmarking, comparison, and candidate construction without root:
+
+```bash
+sudo ./egis-lab snapshot --role development
+./egis-lab evaluate --config lab-configs/baseline.json
+./egis-lab evaluate --config lab-configs/username-index.json
+```
+
+After a candidate passes the development dataset, one `sudo ./egis-lab holdout`
+session collects the untouched physical acceptance matrix. Only a passing holdout
+report can produce an artifact for the final manual promotion command. See
+[`docs/offline-development.md`](docs/offline-development.md) for the complete
+workflow and rollback behavior.
 
 ## Debugging
 

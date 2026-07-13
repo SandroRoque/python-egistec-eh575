@@ -18,7 +18,7 @@ The failing sequence was:
 The key observation was that after wake there was often no new bridge log like:
 
 ```text
-[BRIDGE] Verify requested for user: roque
+[BRIDGE] Verify requested for user: <username>
 ```
 
 That meant the sensor was not necessarily failing to detect a finger. In the failing path, the lock screen was not starting a fresh verification request after wake.
@@ -78,6 +78,18 @@ For idle suspend, hyprlock started one fingerprint verification before suspend. 
 After resume, hyprlock did not issue another `VerifyStart`. The lock screen still existed, but our service had ended the fingerprint transaction that hyprlock expected to keep using.
 
 The core bug was therefore session lifecycle, not matching and not simple USB readiness.
+
+## Idle Failure Counter
+
+An armed verification with no finger present must remain silent. A previous
+15-second no-touch timeout emitted terminal `verify-no-match` even though no
+authentication had been attempted. Hyprlock could start another verification
+after each terminal result, causing the lock screen to show several failed
+attempts when the display was turned back on.
+
+No-touch periods now keep the verification transaction armed indefinitely.
+Periodic contrast logging and USB health recovery continue, but only an actual
+finger scan may produce an authentication result.
 
 ## Fix
 

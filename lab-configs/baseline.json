@@ -1,0 +1,34 @@
+{
+  "name": "baseline",
+  "frames_per_attempt": 3,
+  "min_confirmed_attempts": 1,
+  "matcher": {
+    "index_scope": "global",
+    "index_backend": "flann",
+    "random_seed": null,
+    "proposal_scope": "global",
+    "sift_ratio": 0.75,
+    "max_candidates": 5,
+    "ransac_reproj_threshold": 8.0,
+    "min_scale": 0.45,
+    "max_scale": 2.2,
+    "max_angle": 55.0,
+    "max_perspective_warp": 0.03
+  },
+  "thresholds": {
+    "min_inliers": 5,
+    "min_inlier_ratio": 0.35,
+    "min_inlier_frames": 1,
+    "min_frame_inliers": 5,
+    "min_margin": 1.0,
+    "min_ncc": 0.35,
+    "min_orientation": 0.75,
+    "min_ridge_score": 0.55
+  },
+  "acceptance": {
+    "min_genuine_pass_rate": 0.75,
+    "max_impostor_accepts": 0,
+    "max_p95_ms": 250.0,
+    "max_latency_regression": 0.20
+  }
+}

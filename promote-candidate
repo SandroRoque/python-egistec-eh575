@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "open-fprintd-eh575"))
+
+from egis_driver.lab_artifact import PAYLOAD_EXECUTABLES, extract_and_validate
+
+
+INSTALL_DIR = Path("/opt/egis-driver")
+THRESHOLD_FILE = Path("/var/lib/open-fprintd/egis-calibration/thresholds.json")
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, check=True, text=True, **kwargs)
+
+
+def validate_only(artifact):
+    with tempfile.TemporaryDirectory(prefix="egis-promote-check-") as temp:
+        _, manifest = extract_and_validate(artifact, temp)
+    print(f"Validated {manifest['name']}")
+
+
+def validate_generated_thresholds():
+    try:
+        calibration = json.loads(THRESHOLD_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read generated calibration thresholds: {error}") from error
+
+    if calibration.get("validated") is not True:
+        raise RuntimeError("generated calibration thresholds are not validated")
+    if calibration.get("warnings"):
+        raise RuntimeError("generated calibration thresholds contain warnings")
+    if calibration.get("validation", {}).get("impostor_pass") != 0:
+        raise RuntimeError("generated calibration accepted an impostor sample")
+
+
+def promote(artifact):
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo: sudo ./promote-candidate <artifact>")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = INSTALL_DIR.with_name(f"egis-driver.backup.{stamp}")
+    stage_dir = INSTALL_DIR.with_name(f"egis-driver.stage.{os.getpid()}")
+    threshold_backup = Path(f"{THRESHOLD_FILE}.backup.{stamp}")
+    had_thresholds = THRESHOLD_FILE.exists()
+    installed = False
+
+    with tempfile.TemporaryDirectory(prefix="egis-promote-") as temp:
+        artifact_root, manifest = extract_and_validate(artifact, temp)
+        shutil.copytree(artifact_root / "payload", stage_dir)
+        for executable in PAYLOAD_EXECUTABLES:
+            (stage_dir / executable).chmod(0o755)
+
+        try:
+            run(["systemctl", "stop", "egis-bridge", "open-fprintd"])
+            if had_thresholds:
+                shutil.copy2(THRESHOLD_FILE, threshold_backup)
+            os.replace(INSTALL_DIR, backup_dir)
+            os.replace(stage_dir, INSTALL_DIR)
+            installed = True
+
+            env = {**os.environ, "PYTHONPATH": str(INSTALL_DIR)}
+            calibration = subprocess.run(
+                [
+                    str(INSTALL_DIR / "egis-calibrate"),
+                    "analyze",
+                    "--write-thresholds",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if calibration.returncode != 0:
+                details = "\n".join(
+                    output.strip()
+                    for output in (calibration.stdout, calibration.stderr)
+                    if output.strip()
+                )
+                raise RuntimeError(f"candidate calibration failed:\n{details[-6000:]}")
+            validate_generated_thresholds()
+            run(["systemctl", "start", "open-fprintd", "egis-bridge"])
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                status = subprocess.run(
+                    ["systemctl", "is-active", "open-fprintd", "egis-bridge"],
+                    capture_output=True,
+                    text=True,
+                )
+                if status.returncode == 0:
+                    device = subprocess.run(
+                        [
+                            "busctl", "--system", "call",
+                            "net.reactivated.Fprint",
+                            "/net/reactivated/Fprint/Manager",
+                            "net.reactivated.Fprint.Manager",
+                            "GetDefaultDevice",
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if (
+                            device.returncode == 0 and
+                            "/net/reactivated/Fprint/Device/" in device.stdout):
+                        break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError("fingerprint D-Bus manager and device did not become ready")
+            print(f"Promoted {manifest['name']}")
+            print(f"Backup: {backup_dir}")
+        except Exception:
+            subprocess.run(["systemctl", "stop", "egis-bridge", "open-fprintd"])
+            if installed:
+                failed_dir = INSTALL_DIR.with_name(f"egis-driver.failed.{stamp}")
+                if INSTALL_DIR.exists():
+                    os.replace(INSTALL_DIR, failed_dir)
+                os.replace(backup_dir, INSTALL_DIR)
+            if threshold_backup.exists():
+                shutil.copy2(threshold_backup, THRESHOLD_FILE)
+            elif not had_thresholds:
+                THRESHOLD_FILE.unlink(missing_ok=True)
+            subprocess.run(["systemctl", "start", "open-fprintd", "egis-bridge"])
+            raise
+        finally:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser("promote-candidate")
+    parser.add_argument("artifact")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.dry_run:
+        validate_only(args.artifact)
+    else:
+        promote(args.artifact)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

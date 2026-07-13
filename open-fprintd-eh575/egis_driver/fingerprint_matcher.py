@@ -5,12 +5,13 @@ import time
 
 from egis_driver.image_features import ImageFeatureExtractor
 from egis_driver.identity_matcher import IdentityMatcher
+from egis_driver.matcher_config import MatcherConfig
 from egis_driver.persistence import Persistence
 from egis_driver.template_builder import TemplateBuilder
 
 logger = logging.getLogger("MATCHER")
 
-MATCHER_VERSION = 3
+MATCHER_VERSION = 5
 TEMPLATE_SCHEMA_VERSION = 4
 THRESHOLD_KEYS = (
     "min_inliers",
@@ -24,23 +25,26 @@ THRESHOLD_KEYS = (
 )
 
 class FingerprintMatcher:
-    def __init__(self, persistence=None):
+    def __init__(self, persistence=None, matcher_config=None):
         self.persistence = persistence or Persistence("/var/lib/open-fprintd")
+        self.matcher_config = matcher_config or MatcherConfig()
 
         self.persistence.ensure_dirs()
 
         self.features = ImageFeatureExtractor()
         self.template_builder = TemplateBuilder(features=self.features)
-        self.identity_matcher = IdentityMatcher(features=self.features)
+        self.identity_matcher = IdentityMatcher(
+            features=self.features,
+            config=self.matcher_config,
+        )
 
-        index_params = dict(algorithm=1, trees=5)
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        self.flann = self._new_descriptor_matcher()
 
         self.descriptor_map = []
         self.descriptor_lookup = {}
         self.cached_templates = {}
         self.train_descriptors = None
+        self._scoped_indexes = {}
         self.last_verify_stats = {}
         self.min_verify_inliers = 40
         self.min_verify_inlier_ratio = 0.72
@@ -140,6 +144,15 @@ class FingerprintMatcher:
     def analyze_touch(self, raw_frames):
         return self.template_builder.analyze_touch(raw_frames)
 
+    def _new_descriptor_matcher(self):
+        if self.matcher_config.random_seed is not None:
+            cv2.setRNGSeed(self.matcher_config.random_seed)
+        if self.matcher_config.index_backend == "bf":
+            return cv2.BFMatcher(self.features.descriptor_norm, crossCheck=False)
+        index_params = dict(algorithm=1, trees=5)
+        search_params = dict(checks=50)
+        return cv2.FlannBasedMatcher(index_params, search_params)
+
     def rebuild_index(self):
         logger.info("Rebuilding global FLANN Index...")
         start_t = time.time()
@@ -149,6 +162,7 @@ class FingerprintMatcher:
         self.descriptor_lookup = {}
         self.cached_templates = {}
         self.legacy_templates = []
+        self._scoped_indexes = {}
 
         current_idx_offset = 0
 
@@ -256,6 +270,51 @@ class FingerprintMatcher:
                             len(self.legacy_templates))
             self.train_descriptors = None
 
+    def _verification_index(self, username):
+        if (
+                self.matcher_config.index_scope != "username" or
+                not username or
+                self.train_descriptors is None):
+            return (
+                self.train_descriptors,
+                self.descriptor_lookup,
+                self.flann,
+                "global",
+            )
+
+        cached = self._scoped_indexes.get(username)
+        if cached is not None:
+            return (*cached, "username")
+
+        prefix = f"{username}_"
+        selected = []
+        for global_idx, owner in self.descriptor_lookup.items():
+            filename = owner[0]
+            if not filename.startswith(prefix):
+                continue
+            finger = filename[len(prefix):].rsplit(".", 1)[0]
+            if "_" in finger:
+                continue
+            selected.append((global_idx, owner))
+
+        if len(selected) < 2:
+            scoped = (None, {}, None)
+        else:
+            descriptors = self.train_descriptors[
+                np.asarray([global_idx for global_idx, _ in selected])
+            ]
+            lookup = {
+                local_idx: owner
+                for local_idx, (_, owner) in enumerate(selected)
+            }
+            flann = self._new_descriptor_matcher()
+            flann.add([descriptors])
+            flann.train()
+            scoped = (descriptors, lookup, flann)
+
+        self._scoped_indexes[username] = scoped
+        return (*scoped, "username")
+
     def enroll_finger(self, name, raw_frames):
         logger.info("Enrolling %s (%d frames)...", name, len(raw_frames))
 
@@ -278,7 +337,13 @@ class FingerprintMatcher:
         """Single-frame verification (legacy)."""
         return self.verify_finger_multiframe([raw_frame])
 
-    def verify_finger_multiframe(self, raw_frames, username=None, finger_name=None, apply_thresholds=True):
+    def verify_finger_multiframe(
+            self,
+            raw_frames,
+            username=None,
+            finger_name=None,
+            apply_thresholds=True,
+            thresholds_override=None):
         """
         Multi-frame verification.
         SIFT/FLANN proposes candidate alignments. Authentication then requires
@@ -293,20 +358,24 @@ class FingerprintMatcher:
             (username, score) tuple or (None, 0) if no match
         """
         finger_name = self._normalize_verify_finger(finger_name)
-        thresholds = self._active_thresholds(username, finger_name)
+        thresholds = thresholds_override or self._active_thresholds(username, finger_name)
+        train_descriptors, descriptor_lookup, flann, index_scope = (
+            self._verification_index(username)
+        )
         result, stats = self.identity_matcher.verify_multiframe(
             raw_frames,
             username=username,
             finger_name=finger_name,
-            train_descriptors=self.train_descriptors,
-            descriptor_lookup=self.descriptor_lookup,
+            train_descriptors=train_descriptors,
+            descriptor_lookup=descriptor_lookup,
             cached_templates=self.cached_templates,
-            flann=self.flann,
+            flann=flann,
             thresholds=thresholds,
             calibrated=self.calibrated,
             legacy_templates=self.legacy_templates,
             apply_thresholds=apply_thresholds,
         )
+        stats["index_scope"] = index_scope
         self.last_verify_stats = stats
         return result
 

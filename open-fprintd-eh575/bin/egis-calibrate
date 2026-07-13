@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 import argparse
 import json
+import math
+import os
 import sys
 import time
 
@@ -19,10 +21,13 @@ IDENTITY_POLICY = {
     "min_inlier_frames": 1,
     "min_frame_inliers": 5,
     "min_margin": 1.0,
-    "min_ncc": 0.35,
-    "min_orientation": 0.75,
-    "min_ridge_score": 0.55,
+    "min_ncc": 0.28,
+    "min_orientation": 0.45,
+    "min_ridge_score": 0.45,
 }
+MIN_GENUINE_PASS_RATE = 0.75
+ATTEMPT_FRAME_COUNT = 3
+MIN_CONFIRMED_ATTEMPTS = 2
 
 _persistence = None
 
@@ -30,7 +35,8 @@ _persistence = None
 def get_persistence():
     global _persistence
     if _persistence is None:
-        _persistence = Persistence("/var/lib/open-fprintd")
+        root_dir = os.environ.get("EGIS_DATA_ROOT", "/var/lib/open-fprintd")
+        _persistence = Persistence(root_dir)
     return _persistence
 
 
@@ -174,6 +180,10 @@ def passes_thresholds(metrics, thresholds):
     )
 
 
+def record_passes(record, thresholds):
+    return record.get("confirmed", True) and passes_thresholds(record["best"], thresholds)
+
+
 def target_key(record):
     return f"{record['username']}/{record['target_finger']}"
 
@@ -215,14 +225,21 @@ def recommend_thresholds(records, min_genuine_samples=8, min_impostor_samples=8)
             )
 
         target_records = [r for r in records if target_key(r) == key]
+        genuine_records = [r for r in target_records if r["label"] == "genuine"]
         genuine = [r["best"] for r in target_records if r["label"] == "genuine" and r["best"]]
         impostor = [r["best"] for r in target_records if r["label"] == "impostor" and r["best"]]
         target_thresholds = thresholds
 
-        genuine_pass = sum(1 for m in genuine if passes_thresholds(m, target_thresholds))
-        impostor_pass = sum(1 for m in impostor if passes_thresholds(m, target_thresholds))
+        genuine_pass = sum(1 for r in genuine_records if record_passes(r, target_thresholds))
+        impostor_records = [r for r in target_records if r["label"] == "impostor"]
+        impostor_pass = sum(1 for r in impostor_records if record_passes(r, target_thresholds))
+        minimum_pass = max(
+            1,
+            math.ceil(len(genuine_records) * MIN_GENUINE_PASS_RATE),
+        )
         validation_targets[key] = {
             "genuine_pass": genuine_pass,
+            "genuine_pass_required": minimum_pass,
             "genuine_scored": len(genuine),
             "impostor_pass": impostor_pass,
             "impostor_scored": len(impostor),
@@ -230,10 +247,10 @@ def recommend_thresholds(records, min_genuine_samples=8, min_impostor_samples=8)
             "thresholds": target_thresholds,
         }
 
-        minimum_pass = max(1, len(genuine) // 2)
         if genuine_pass < minimum_pass:
             warnings.append(
-                f"{key} thresholds accept {genuine_pass}/{len(genuine)} scored genuine samples; "
+                f"{key} thresholds accept {genuine_pass}/{len(genuine_records)} collected genuine samples "
+                f"({len(genuine)} produced alignment metrics); "
                 "re-enroll or collect stronger genuine samples"
             )
         if impostor_pass > 0:
@@ -242,8 +259,9 @@ def recommend_thresholds(records, min_genuine_samples=8, min_impostor_samples=8)
                 "do not enable authentication until the matcher or enrollment quality improves"
             )
 
-    genuine_pass = sum(1 for m in all_genuine if passes_thresholds(m, thresholds))
-    impostor_pass = sum(1 for m in all_impostor if passes_thresholds(m, thresholds))
+    genuine_records = [r for r in records if r["label"] == "genuine"]
+    genuine_pass = sum(1 for r in genuine_records if record_passes(r, thresholds))
+    impostor_pass = sum(1 for r in all_impostor_records if record_passes(r, thresholds))
     if genuine_pass == 0:
         warnings.append("recommended thresholds accept zero genuine samples; re-enroll or collect stronger genuine samples")
     if impostor_pass > 0:
@@ -272,17 +290,39 @@ def analyze(args):
 
     persistence = get_persistence()
     matcher = FingerprintMatcher(persistence=persistence)
+    matcher._set_default_thresholds(IDENTITY_POLICY)
     records = []
 
     for sample in samples:
         frames = sample["frames"]
-        matcher.verify_finger_multiframe(
-            frames,
-            username=sample["username"],
-            finger_name=sample["target_finger"],
-            apply_thresholds=False,
+        attempts = []
+        consecutive_passes = 0
+        confirmed = False
+        confirmed_best = None
+        for offset in range(0, len(frames), ATTEMPT_FRAME_COUNT):
+            attempt_frames = frames[offset:offset + ATTEMPT_FRAME_COUNT]
+            if len(attempt_frames) < ATTEMPT_FRAME_COUNT:
+                continue
+            matcher.verify_finger_multiframe(
+                attempt_frames,
+                username=sample["username"],
+                finger_name=sample["target_finger"],
+                apply_thresholds=False,
+                thresholds_override=IDENTITY_POLICY,
+            )
+            attempts.append(matcher.last_verify_stats.get("best", {}))
+            if passes_thresholds(attempts[-1], IDENTITY_POLICY):
+                consecutive_passes += 1
+                if consecutive_passes >= MIN_CONFIRMED_ATTEMPTS:
+                    confirmed = True
+                    confirmed_best = attempts[-1]
+                    break
+            else:
+                consecutive_passes = 0
+        best = confirmed_best or max(
+            attempts or [{}],
+            key=lambda metrics: metrics.get("score", 0.0),
         )
-        best = matcher.last_verify_stats.get("best", {})
         records.append({
             "path": sample["_path"],
             "label": sample["label"],
@@ -290,6 +330,7 @@ def analyze(args):
             "target_finger": sample["target_finger"],
             "actual_finger": sample["actual_finger"],
             "best": best,
+            "confirmed": confirmed,
         })
 
     thresholds, thresholds_by_target, warnings, validation = recommend_thresholds(
@@ -316,8 +357,17 @@ def analyze(args):
 
     if args.write_thresholds:
         if warnings:
+            persistence.save_thresholds({
+                "matcher_version": MATCHER_VERSION,
+                "generated_at": report["generated_at"],
+                "validated": False,
+                "validation": validation,
+                "warnings": warnings,
+                "thresholds": thresholds,
+                "thresholds_by_target": thresholds_by_target,
+            })
             raise RuntimeError(
-                "Refusing to write thresholds because calibration has warnings. "
+                "Calibration has warnings; thresholds were invalidated. "
                 "Collect stronger genuine samples and representative impostor samples, then analyze again."
             )
         persistence.save_thresholds({

@@ -6,6 +6,8 @@ __pycache__/
 *.pkg.tar.zst
 .vscode/
 .egistec/
+.egis-lab/
+dist/
 tmp-egis-inspect/
 ghidra_dumps/
 src/

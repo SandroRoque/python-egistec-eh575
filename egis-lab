@@ -1,0 +1,275 @@
+#!/usr/bin/python3
+import argparse
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "open-fprintd-eh575"))
+
+from egis_driver.evaluation import evaluate, sha256_file, write_report
+from egis_driver.lab_artifact import build_candidate
+
+
+LAB_ROOT = ROOT / ".egis-lab"
+
+
+def _manifest_for(root, role):
+    files = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.name != "dataset-manifest.json":
+            files[str(path.relative_to(root))] = {
+                "sha256": sha256_file(path),
+                "size": path.stat().st_size,
+            }
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source": "/var/lib/open-fprintd",
+        "role": role,
+        "files": files,
+    }
+
+
+def _chown_tree(root, uid, gid):
+    for path in [root, *root.rglob("*")]:
+        os.chown(path, uid, gid, follow_symlinks=False)
+
+
+def _make_read_only(root):
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o500)
+        elif path.is_file():
+            path.chmod(0o400)
+    root.chmod(0o500)
+
+
+def cmd_snapshot(args):
+    if os.geteuid() != 0:
+        raise SystemExit("Run once with: sudo ./egis-lab snapshot")
+    target_user = os.environ.get("SUDO_USER")
+    if not target_user or target_user == "root":
+        raise SystemExit("SUDO_USER is unavailable; invoke through sudo as your normal user")
+    account = pwd.getpwnam(target_user)
+    source = Path("/var/lib/open-fprintd")
+    for required in (source / "egis", source / "egis-calibration"):
+        if not required.is_dir():
+            raise SystemExit(f"required dataset directory is missing: {required}")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snapshot = LAB_ROOT / "snapshots" / stamp
+    suffix = 0
+    while snapshot.exists():
+        suffix += 1
+        snapshot = LAB_ROOT / "snapshots" / f"{stamp}-{suffix}"
+    snapshot.mkdir(parents=True)
+    shutil.copytree(source / "egis", snapshot / "egis")
+    calibration_snapshot = snapshot / "egis-calibration"
+    calibration_snapshot.mkdir()
+    shutil.copytree(
+        source / "egis-calibration" / "samples",
+        calibration_snapshot / "samples",
+    )
+    for filename in ("report.json", "thresholds.json"):
+        path = source / "egis-calibration" / filename
+        if path.is_file():
+            shutil.copy2(path, calibration_snapshot / filename)
+    manifest = _manifest_for(snapshot, args.role)
+    (snapshot / "dataset-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    current = LAB_ROOT / "current"
+    if current.is_symlink() or current.exists():
+        current.unlink()
+    current.symlink_to(snapshot.relative_to(LAB_ROOT))
+    _chown_tree(LAB_ROOT, account.pw_uid, account.pw_gid)
+    _make_read_only(snapshot)
+    LAB_ROOT.chmod(0o700)
+    (LAB_ROOT / "snapshots").chmod(0o700)
+    print(snapshot)
+
+
+def cmd_holdout(args):
+    if os.geteuid() != 0:
+        raise SystemExit("Run once with: sudo ./egis-lab holdout")
+    username = args.username or os.environ.get("SUDO_USER")
+    if not username or username == "root":
+        raise SystemExit("A non-root username is required")
+
+    calibration_root = Path("/var/lib/open-fprintd/egis-calibration")
+    sample_dir = calibration_root / "samples"
+    archive_root = calibration_root / "archive"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if sample_dir.exists():
+        os.replace(sample_dir, archive_root / stamp)
+    sample_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    calibrate = ROOT / "open-fprintd-eh575" / "bin" / "egis-calibrate"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "open-fprintd-eh575")}
+    matrix = (
+        (args.index_finger, args.index_finger, "genuine"),
+        (args.index_finger, args.thumb_finger, "impostor"),
+        (args.thumb_finger, args.thumb_finger, "genuine"),
+        (args.thumb_finger, args.index_finger, "impostor"),
+    )
+    subprocess.run(["systemctl", "stop", "egis-bridge"], check=True)
+    try:
+        for target, actual, label in matrix:
+            subprocess.run(
+                [
+                    str(calibrate), "collect",
+                    "--username", username,
+                    "--target-finger", target,
+                    "--actual-finger", actual,
+                    "--label", label,
+                    "--samples", str(args.samples),
+                    "--frames", str(args.frames),
+                ],
+                check=True,
+                env=env,
+            )
+    finally:
+        subprocess.run(["systemctl", "start", "egis-bridge"], check=False)
+
+    args.role = "holdout"
+    cmd_snapshot(args)
+
+
+def _resolve_dataset(value):
+    path = Path(value) if value else LAB_ROOT / "current"
+    path = path.resolve()
+    if not (path / "dataset-manifest.json").is_file():
+        raise SystemExit(f"dataset manifest not found under {path}")
+    return path
+
+
+def cmd_evaluate(args):
+    dataset = _resolve_dataset(args.dataset)
+    report = evaluate(
+        dataset,
+        args.config,
+        ROOT,
+        repeats=args.repeats,
+    )
+    output_dir = Path(args.output_dir or LAB_ROOT / "results")
+    json_path, markdown_path = write_report(report, output_dir)
+    print(markdown_path.read_text(encoding="utf-8"), end="")
+    print(f"JSON: {json_path}")
+    print(f"Markdown: {markdown_path}")
+    return 0 if report["gates"]["passed"] else 2
+
+
+def _load_report(path):
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def cmd_compare(args):
+    baseline = _load_report(args.baseline)
+    candidate = _load_report(args.candidate)
+    baseline_p95 = float(baseline["latency"]["p95_ms"])
+    candidate_p95 = float(candidate["latency"]["p95_ms"])
+    regression = (
+        (candidate_p95 / baseline_p95) - 1.0
+        if baseline_p95 > 0 else 0.0
+    )
+    limit = float(candidate["config"]["acceptance"]["max_latency_regression"])
+    baseline_eligible = bool(baseline.get("gates", {}).get("passed"))
+    relative_latency_ok = not baseline_eligible or regression <= limit
+    result = {
+        "baseline": args.baseline,
+        "candidate": args.candidate,
+        "baseline_p95_ms": baseline_p95,
+        "candidate_p95_ms": candidate_p95,
+        "latency_regression": regression,
+        "latency_regression_limit": limit,
+        "baseline_eligible": baseline_eligible,
+        "relative_latency_ok": relative_latency_ok,
+        "candidate_passed": bool(candidate["gates"]["passed"]),
+        "passed": bool(candidate["gates"]["passed"] and relative_latency_ok),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["passed"] else 2
+
+
+def cmd_build(args):
+    test = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "open-fprintd-eh575")},
+    )
+    if test.returncode != 0:
+        raise SystemExit("tests failed; candidate artifact was not built")
+    artifact = build_candidate(
+        ROOT,
+        args.candidate,
+        args.baseline,
+        args.output_dir or ROOT / "dist",
+    )
+    print(artifact)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser("egis-lab")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    snapshot = sub.add_parser("snapshot", help="Create a private immutable live-data snapshot")
+    snapshot.add_argument(
+        "--role",
+        choices=("development", "holdout"),
+        default="development",
+    )
+    snapshot.set_defaults(func=cmd_snapshot)
+
+    holdout = sub.add_parser(
+        "holdout",
+        help="Collect the fixed physical holdout matrix and snapshot it",
+    )
+    holdout.add_argument("--username")
+    holdout.add_argument("--index-finger", default="right-index-finger")
+    holdout.add_argument("--thumb-finger", default="right-thumb")
+    holdout.add_argument("--samples", type=int, default=8)
+    holdout.add_argument("--frames", type=int, default=9)
+    holdout.set_defaults(func=cmd_holdout)
+
+    evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
+    evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")
+    evaluate_p.add_argument("--config", default=str(ROOT / "lab-configs/baseline.json"))
+    evaluate_p.add_argument("--output-dir")
+    evaluate_p.add_argument("--repeats", type=int, default=2)
+    evaluate_p.set_defaults(func=cmd_evaluate)
+
+    compare = sub.add_parser("compare", help="Compare candidate and baseline reports")
+    compare.add_argument("baseline")
+    compare.add_argument("candidate")
+    compare.set_defaults(func=cmd_compare)
+
+    build = sub.add_parser("build", help="Build a checksummed passing candidate artifact")
+    build.add_argument("--baseline", required=True)
+    build.add_argument("--candidate", required=True)
+    build.add_argument("--output-dir")
+    build.set_defaults(func=cmd_build)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args) or 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

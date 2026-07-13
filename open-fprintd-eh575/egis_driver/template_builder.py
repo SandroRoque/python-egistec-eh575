@@ -67,26 +67,44 @@ class TemplateBuilder:
         return stats
 
     def build_payload(self, name, raw_frames, schema_version, matcher_version):
-        logger.info("Building enrollment template for %s (%d frames)...", name, len(raw_frames))
+        touch_groups = self._normalize_touch_groups(raw_frames)
+        frame_count = sum(len(group) for group in touch_groups)
+        logger.info(
+            "Building enrollment template for %s (%d touches, %d frames)...",
+            name,
+            len(touch_groups),
+            frame_count,
+        )
 
-        scored_frames = []
-        for raw in raw_frames:
-            img_arr = self.features.raw_frame_to_image(raw)
-            quality = self.features.frame_quality(img_arr)
-            img = self.features.preprocess(img_arr)
-            scored_frames.append((img, quality))
+        scored_groups = []
+        for group in touch_groups:
+            scored_frames = []
+            for raw in group:
+                img_arr = self.features.raw_frame_to_image(raw)
+                quality = self.features.frame_quality(img_arr)
+                img = self.features.preprocess(img_arr)
+                scored_frames.append((img, quality))
+            if scored_frames:
+                scored_frames.sort(key=lambda item: item[1], reverse=True)
+                cutoff = max(1, len(scored_frames) // 2)
+                scored_groups.append(scored_frames[:cutoff])
 
-        if not scored_frames:
+        if not scored_groups:
             return None, None, 0
 
-        scored_frames.sort(key=lambda x: x[1], reverse=True)
-        cutoff = max(1, len(scored_frames) // 2)
-        good_frames = scored_frames[:cutoff]
+        good_frame_count = sum(len(group) for group in scored_groups)
+        diverse_frames = self._remove_duplicates_by_touch(
+            scored_groups,
+            max_frames=40,
+            ssim_threshold=0.95,
+        )
 
-        diverse_frames = self._remove_duplicates(good_frames, max_frames=40, ssim_threshold=0.95)
-
-        logger.info("Quality filter: kept %d/%d", len(good_frames), len(scored_frames))
-        logger.info("Dedup filter: kept %d templates", len(diverse_frames))
+        logger.info("Quality filter: kept %d/%d", good_frame_count, frame_count)
+        logger.info(
+            "Touch-balanced dedup filter: kept %d templates from %d touches",
+            len(diverse_frames),
+            len(scored_groups),
+        )
 
         new_templates = []
         for img, quality in diverse_frames:
@@ -124,25 +142,76 @@ class TemplateBuilder:
             "matcher_version": matcher_version,
             "name": name,
             "created_at": int(time.time()),
+            "enrollment_touches": len(touch_groups),
         }
 
         return save_data, meta, len(new_templates)
+
+    def _normalize_touch_groups(self, raw_frames):
+        if not raw_frames:
+            return []
+
+        first = raw_frames[0]
+        flat_frames = isinstance(first, (bytes, bytearray, memoryview, np.ndarray))
+        if (
+                isinstance(first, (list, tuple)) and
+                first and
+                isinstance(first[0], (int, float, np.integer, np.floating))):
+            flat_frames = True
+
+        if flat_frames:
+            return [list(raw_frames)]
+        return [list(group) for group in raw_frames if group]
+
+    def _remove_duplicates_by_touch(
+            self,
+            groups_with_quality,
+            max_frames=40,
+            ssim_threshold=0.95):
+        groups = [
+            sorted(group, key=lambda item: item[1], reverse=True)
+            for group in groups_with_quality
+            if group
+        ]
+        positions = [0] * len(groups)
+        unique = []
+
+        while len(unique) < max_frames:
+            made_progress = False
+            for group_index, group in enumerate(groups):
+                while positions[group_index] < len(group):
+                    frame, quality = group[positions[group_index]]
+                    positions[group_index] += 1
+                    if self._is_duplicate(
+                            frame,
+                            unique,
+                            ssim_threshold=ssim_threshold):
+                        continue
+                    unique.append((frame, quality))
+                    made_progress = True
+                    break
+                if len(unique) >= max_frames:
+                    break
+            if not made_progress:
+                break
+        return unique
+
+    def _is_duplicate(self, frame, selected, ssim_threshold):
+        for existing, _ in selected:
+            try:
+                score = ssim(frame, existing, data_range=255)
+            except Exception:
+                score = 0.0
+            if score > ssim_threshold:
+                return True
+        return False
 
     def _remove_duplicates(self, frames_with_quality, max_frames=40, ssim_threshold=0.95):
         frames_with_quality.sort(key=lambda x: x[1], reverse=True)
 
         unique = []
         for frame, quality in frames_with_quality:
-            is_duplicate = False
-            for existing, _ in unique:
-                try:
-                    score = ssim(frame, existing, data_range=255)
-                except Exception:
-                    score = 0.0
-                if score > ssim_threshold:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
+            if not self._is_duplicate(frame, unique, ssim_threshold):
                 unique.append((frame, quality))
             if len(unique) >= max_frames:
                 break

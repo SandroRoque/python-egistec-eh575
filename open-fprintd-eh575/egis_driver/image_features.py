@@ -7,13 +7,14 @@ class ImageFeatureExtractor:
 
     def __init__(self, upscale_factor=2):
         self.upscale_factor = upscale_factor
-        self.sift = cv2.SIFT_create(
+        self.detector = cv2.SIFT_create(
             nfeatures=0,
             nOctaveLayers=3,
             contrastThreshold=0.04,
             edgeThreshold=10,
             sigma=1.2,
         )
+        self.descriptor_norm = cv2.NORM_L2
 
     def raw_frame_to_image(self, raw):
         return np.array(list(raw), dtype=np.uint8).reshape((52, 103))
@@ -31,7 +32,7 @@ class ImageFeatureExtractor:
             (w * self.upscale_factor, h * self.upscale_factor),
             interpolation=cv2.INTER_CUBIC,
         )
-        kp, des = self.sift.detectAndCompute(upscaled, None)
+        kp, des = self.detector.detectAndCompute(upscaled, None)
         if kp is not None:
             scale = 1.0 / self.upscale_factor
             for k in kp:
