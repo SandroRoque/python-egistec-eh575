@@ -78,13 +78,14 @@ class EvaluationSummaryTests(unittest.TestCase):
             "max_p95_ms": 250.0,
         }
 
-        targets, gates, latency = _summarize(records, acceptance)
+        targets, gates, latency, outcomes = _summarize(records, acceptance)
 
         target = targets["testuser/right-index-finger"]
         self.assertEqual(target["genuine_pass_required"], 6)
         self.assertEqual(target["genuine_pass"], 5)
         self.assertFalse(gates["testuser/right-index-finger"])
         self.assertEqual(latency["p95_ms"], 10.0)
+        self.assertEqual(outcomes, {})
 
     def test_decision_digest_excludes_latency(self):
         first = [self._record("sample", "genuine", True, elapsed=10.0)]
@@ -141,7 +142,13 @@ class CandidateArtifactTests(unittest.TestCase):
             "decision_sha256": "decision",
             "latency": {"p95_ms": p95},
             "gates": {"passed": True},
-            "config": {"acceptance": {"max_latency_regression": 0.20}},
+            "config": {
+                "acceptance": {"max_latency_regression": 0.20},
+                "confirmation_policy": {
+                    "frames_per_attempt": 3,
+                    "required_consecutive_accepts": 2,
+                },
+            },
         }
 
     def test_build_and_validate_candidate(self):
@@ -159,6 +166,7 @@ class CandidateArtifactTests(unittest.TestCase):
 
             self.assertTrue(manifest["acceptance"]["passed"])
             self.assertIn("payload/egis-bridge", manifest["files"])
+            self.assertIn("payload/egis_matcher/core.py", manifest["files"])
             self.assertFalse(any("__pycache__" in name for name in manifest["files"]))
             dry_run = subprocess.run(
                 [sys.executable, str(ROOT / "promote-candidate"), "--dry-run", str(artifact)],
@@ -177,6 +185,20 @@ class CandidateArtifactTests(unittest.TestCase):
             candidate.write_text(json.dumps(self._report(100.0, digest, role="development")))
 
             with self.assertRaisesRegex(ValueError, "holdout"):
+                build_candidate(ROOT, candidate, baseline, tmp / "dist")
+
+    def test_non_production_confirmation_policy_cannot_be_packaged(self):
+        digest = tree_digest(ROOT / "open-fprintd-eh575")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            baseline = tmp / "baseline.json"
+            candidate = tmp / "candidate.json"
+            report = self._report(100.0, digest)
+            report["config"]["confirmation_policy"]["required_consecutive_accepts"] = 1
+            baseline.write_text(json.dumps(report))
+            candidate.write_text(json.dumps(report))
+
+            with self.assertRaisesRegex(ValueError, "production confirmation"):
                 build_candidate(ROOT, candidate, baseline, tmp / "dist")
 
     def test_failed_baseline_is_not_a_relative_latency_reference(self):

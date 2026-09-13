@@ -48,6 +48,7 @@ open-fprintd-eh575/
 │   ├── interfaces.py        # Backend contract consumed by services
 │   ├── services.py          # Scan and suspend/resume state machine
 │   └── fingerprint_matcher.py  # Fingerprint matching engine
+├── egis_matcher/            # Linux-independent matching library
 ├── openfprintd/
 │   ├── device.py            # D-Bus device proxy
 │   ├── manager.py           # D-Bus manager
@@ -232,6 +233,7 @@ replay, benchmarking, comparison, and candidate construction without root:
 sudo ./egis-lab snapshot --role development
 ./egis-lab evaluate --config lab-configs/baseline.json
 ./egis-lab evaluate --config lab-configs/username-index.json
+./egis-lab evaluate --config lab-configs/production-parity.json
 ```
 
 After a candidate passes the development dataset, one `sudo ./egis-lab holdout`

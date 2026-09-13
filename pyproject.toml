@@ -35,4 +35,4 @@ version = {attr = "egis_driver.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["open-fprintd-eh575"]
-include = ["egis_driver*", "openfprintd*"]
+include = ["egis_driver*", "egis_matcher*", "openfprintd*"]

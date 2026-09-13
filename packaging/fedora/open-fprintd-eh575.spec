@@ -36,7 +36,8 @@ install -m 0755 "$project/bin/egis-calibrate" %{buildroot}/opt/egis-driver/egis-
 install -m 0755 %{_builddir}/%{name}-%{version}/egis-doctor %{buildroot}/opt/egis-driver/egis-doctor
 install -d %{buildroot}%{_bindir}
 ln -s ../../opt/egis-driver/egis-doctor %{buildroot}%{_bindir}/egis-doctor
-cp -r "$project/openfprintd" "$project/egis_driver" %{buildroot}/opt/egis-driver/
+cp -r "$project/openfprintd" "$project/egis_driver" "$project/egis_matcher" \
+  %{buildroot}/opt/egis-driver/
 install -D -m 0644 "$project/open-fprintd.service" %{buildroot}%{_unitdir}/open-fprintd.service
 install -D -m 0644 "$project/egis-bridge.service" %{buildroot}%{_unitdir}/egis-bridge.service
 install -D -m 0644 "$project/net.reactivated.fprint.policy" \

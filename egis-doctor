@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ else:
     sys.path.insert(0, str(SCRIPT.parent / "open-fprintd-eh575"))
 
 from egis_driver.compatibility import doctor_report
+from egis_driver.observability import summarize_metric_lines
 
 
 def main():
@@ -23,7 +25,36 @@ def main():
         action="store_true",
         help="Check source and USB compatibility without requiring installed services",
     )
+    parser.add_argument(
+        "--journal-summary",
+        action="store_true",
+        help="Summarize privacy-safe capture and matcher events from egis-bridge",
+    )
+    parser.add_argument(
+        "--since",
+        default="today",
+        help="journalctl --since value used with --journal-summary (default: today)",
+    )
     args = parser.parse_args()
+
+    if args.journal_summary:
+        result = subprocess.run(
+            [
+                "journalctl", "-u", "egis-bridge", "--since", args.since,
+                "--no-pager", "-o", "cat",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr.strip() or "Unable to read egis-bridge journal", file=sys.stderr)
+            return result.returncode
+        print(json.dumps(
+            summarize_metric_lines(result.stdout.splitlines()),
+            indent=2,
+            sort_keys=True,
+        ))
+        return 0
 
     report = doctor_report(check_services=not args.no_service_check)
     encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"

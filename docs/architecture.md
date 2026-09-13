@@ -15,9 +15,10 @@ independently released device backend.
 |------|----------------|--------------|
 | `egis_driver/device_profile.py` | Immutable USB identity, descriptors, endpoints, frame geometry, and EH575 commands | USB I/O, matching, D-Bus |
 | `egis_driver/egis_driver.py` | Sensor discovery, descriptor validation, USB lifecycle, capture | Template storage, authentication policy |
-| `egis_driver/image_features.py` | Frame-to-feature conversion using injected frame geometry | USB discovery, D-Bus |
-| `egis_driver/fingerprint_matcher.py` | Template indexing, matching metrics, calibrated decision | Sensor commands, service lifecycle |
-| `egis_driver/services.py` | Capture state machine and suspend/resume behavior | PolicyKit and manager ownership |
+| `egis_matcher/` | Frame features, template construction, identity metrics, decisions, and confirmation policy | Filesystem paths, USB, D-Bus, service lifecycle |
+| `egis_driver/fingerprint_matcher.py` | Persistence-backed matcher adapter and template indexing | Sensor commands, service lifecycle |
+| `egis_driver/capture.py` | Touch detection and complete frame-window acquisition with measurable outcomes | Identity decisions and D-Bus status |
+| `egis_driver/services.py` | Authentication-session state and suspend/resume behavior | Matching calculations and USB commands |
 | `openfprintd/` | Standard fprint D-Bus surface, client ownership, authorization | EH575 protocol and image processing |
 | `egis_driver/evaluation.py` | Offline replay and acceptance gates | Live installation |
 | `egis_driver/compatibility.py` | Sanitized environment and compatibility reports | Raw biometric export |
@@ -26,6 +27,16 @@ independently released device backend.
 `SensorBackend` is the boundary consumed by the service layer. `DeviceProfile`
 and `FrameSpec` are immutable hardware inputs. `RuntimePaths` isolates persistent
 state paths so tests and offline evaluation never need the live `/var/lib` tree.
+
+`MatcherCore` is the independent algorithm boundary. Callers supply frame
+geometry, frames, templates, indexes, and thresholds; importing it does not load
+PyUSB, D-Bus, GLib, systemd integration, or runtime paths. `MatchDecision`
+distinguishes accepted, rejected, unscorable, and uncalibrated attempts.
+
+`CaptureCoordinator` turns sensor reads into `captured`, `incomplete`,
+`io_error`, `device_unavailable`, or `canceled` outcomes. Capture outcomes and
+matcher decisions have separate aggregate counters, available through
+`EgisService.diagnostics_snapshot()`.
 
 ## Security Boundaries
 
@@ -50,3 +61,8 @@ Template and matcher schemas are separate compatibility contracts. A matcher
 change does not require a template migration unless `TEMPLATE_SCHEMA_VERSION`
 changes. Thresholds are tied to `MATCHER_VERSION` and must be regenerated when
 that version changes.
+
+Production verification uses three frames per attempt and requires two
+consecutive accepted attempts. Calibration, live verification, and promotable
+offline reports use the same confirmation state machine. Experimental reports
+may use another policy, but cannot be packaged for promotion.

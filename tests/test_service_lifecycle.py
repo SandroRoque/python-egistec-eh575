@@ -254,6 +254,9 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(matcher.calls, 2)
         self.assertEqual(statuses, [("verify-match", True)])
         self.assertIsNone(service._active_operation)
+        diagnostics = service.diagnostics_snapshot()
+        self.assertEqual(diagnostics["capture"]["captured"], 2)
+        self.assertEqual(diagnostics["matching"]["accept"], 2)
 
 
 if __name__ == "__main__":

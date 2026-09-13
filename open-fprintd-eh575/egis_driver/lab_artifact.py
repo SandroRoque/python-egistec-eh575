@@ -11,6 +11,10 @@ from egis_driver.evaluation import sha256_file, tree_digest
 
 
 PAYLOAD_EXECUTABLES = ("open-fprintd", "egis-bridge", "egis-calibrate")
+PRODUCTION_CONFIRMATION_POLICY = {
+    "frames_per_attempt": 3,
+    "required_consecutive_accepts": 2,
+}
 
 
 def _load_json(path):
@@ -46,6 +50,7 @@ def _copy_payload(source_root, payload):
         (payload / executable).chmod(0o755)
     ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copytree(project / "egis_driver", payload / "egis_driver", ignore=ignored)
+    shutil.copytree(project / "egis_matcher", payload / "egis_matcher", ignore=ignored)
     shutil.copytree(project / "openfprintd", payload / "openfprintd", ignore=ignored)
 
 
@@ -69,6 +74,9 @@ def build_candidate(source_root, candidate_report_path, baseline_report_path, ou
         raise ValueError("candidate does not pass acceptance and latency gates")
     if candidate["dataset"].get("role") != "holdout":
         raise ValueError("candidate report must use a holdout dataset")
+    policy = candidate.get("config", {}).get("confirmation_policy")
+    if policy != PRODUCTION_CONFIRMATION_POLICY:
+        raise ValueError("candidate report does not use the production confirmation policy")
     source_digest = tree_digest(source_root / "open-fprintd-eh575")
     if candidate["source"]["python_tree_sha256"] != source_digest:
         raise ValueError("source changed after the candidate evaluation")
@@ -95,6 +103,7 @@ def build_candidate(source_root, candidate_report_path, baseline_report_path, ou
             "dataset_manifest_sha256": candidate["dataset"]["manifest_sha256"],
             "decision_sha256": candidate["decision_sha256"],
             "acceptance": comparison,
+            "confirmation_policy": policy,
             "files": _file_manifest(root),
         }
         (root / "manifest.json").write_text(

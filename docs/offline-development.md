@@ -20,6 +20,7 @@ Run the restored baseline twice and write JSON/Markdown reports:
 ```bash
 ./egis-lab evaluate --config lab-configs/baseline.json
 ./egis-lab evaluate --config lab-configs/username-index.json
+./egis-lab evaluate --config lab-configs/production-parity.json
 ```
 
 A non-zero exit is expected when a matcher fails an acceptance gate. Candidate
@@ -33,6 +34,27 @@ Compare reports with:
 Development gates are zero impostor accepts, at least 75% genuine success for
 every target, deterministic repeated decisions, and p95 matching latency no
 greater than 250 ms.
+
+`baseline.json` and `username-index.json` remain historical experiments. Use
+`production-parity.json` for a candidate intended for promotion. It matches the
+live policy of three frames per attempt and two consecutive accepted attempts.
+Reports record this policy, and candidate construction rejects reports that do
+not match it.
+
+Offline evaluation calls the independent `egis_matcher` library through a
+persistence adapter. Matcher rejection reasons describe completed frame
+windows. Live incomplete windows, I/O failures, unavailable devices, and
+cancellations are capture outcomes and are measured separately.
+
+On an installed system, summarize privacy-safe runtime outcomes with:
+
+```bash
+egis-doctor --journal-summary --since today
+```
+
+The summary counts readiness, enrollment capture, verification capture, and
+matching outcomes independently. Metric events contain counts, durations, and
+reasons; they do not contain frames, templates, usernames, or finger names.
 
 When progress depends on a new enrollment format, stage it fail-closed with one
 privileged command:

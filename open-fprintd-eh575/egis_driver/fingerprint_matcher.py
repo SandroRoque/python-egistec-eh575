@@ -3,40 +3,27 @@ import logging
 import numpy as np
 import time
 
-from egis_driver.image_features import ImageFeatureExtractor
-from egis_driver.identity_matcher import IdentityMatcher
-from egis_driver.matcher_config import MatcherConfig
+from egis_matcher.core import MatcherCore
+from egis_matcher.matcher_config import MatcherConfig
+from egis_matcher.policy import THRESHOLD_KEYS
 from egis_driver.persistence import Persistence
-from egis_driver.template_builder import TemplateBuilder
+from egis_matcher.template_builder import TemplateBuilder
 
 logger = logging.getLogger("MATCHER")
 
 MATCHER_VERSION = 5
 TEMPLATE_SCHEMA_VERSION = 4
-THRESHOLD_KEYS = (
-    "min_inliers",
-    "min_inlier_ratio",
-    "min_inlier_frames",
-    "min_frame_inliers",
-    "min_margin",
-    "min_ncc",
-    "min_orientation",
-    "min_ridge_score",
-)
-
 class FingerprintMatcher:
-    def __init__(self, persistence=None, matcher_config=None):
+    def __init__(self, persistence=None, matcher_config=None, frame_spec=None):
         self.persistence = persistence or Persistence("/var/lib/open-fprintd")
         self.matcher_config = matcher_config or MatcherConfig()
 
         self.persistence.ensure_dirs()
 
-        self.features = ImageFeatureExtractor()
+        self.core = MatcherCore(frame_spec=frame_spec, config=self.matcher_config)
+        self.features = self.core.features
         self.template_builder = TemplateBuilder(features=self.features)
-        self.identity_matcher = IdentityMatcher(
-            features=self.features,
-            config=self.matcher_config,
-        )
+        self.identity_matcher = self.core.identity_matcher
 
         self.flann = self._new_descriptor_matcher()
 
@@ -357,12 +344,28 @@ class FingerprintMatcher:
         Returns:
             (username, score) tuple or (None, 0) if no match
         """
+        return self.evaluate_multiframe(
+            raw_frames,
+            username=username,
+            finger_name=finger_name,
+            apply_thresholds=apply_thresholds,
+            thresholds_override=thresholds_override,
+        ).as_legacy_result()
+
+    def evaluate_multiframe(
+            self,
+            raw_frames,
+            username=None,
+            finger_name=None,
+            apply_thresholds=True,
+            thresholds_override=None):
+        """Return a structured decision for one completed frame window."""
         finger_name = self._normalize_verify_finger(finger_name)
         thresholds = thresholds_override or self._active_thresholds(username, finger_name)
         train_descriptors, descriptor_lookup, flann, index_scope = (
             self._verification_index(username)
         )
-        result, stats = self.identity_matcher.verify_multiframe(
+        decision = self.core.evaluate(
             raw_frames,
             username=username,
             finger_name=finger_name,
@@ -375,9 +378,16 @@ class FingerprintMatcher:
             legacy_templates=self.legacy_templates,
             apply_thresholds=apply_thresholds,
         )
+        stats = dict(decision.metrics)
         stats["index_scope"] = index_scope
         self.last_verify_stats = stats
-        return result
+        return type(decision)(
+            decision.outcome,
+            decision.identity,
+            decision.score,
+            decision.reason,
+            stats,
+        )
 
     def get_enrolled_fingers(self, username):
         """Returns list of fingers for fprintd"""

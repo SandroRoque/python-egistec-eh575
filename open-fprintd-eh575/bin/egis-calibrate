@@ -14,6 +14,7 @@ from egis_driver.fingerprint_matcher import (
     FingerprintMatcher,
 )
 from egis_driver.persistence import Persistence
+from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker, passes_thresholds
 
 IDENTITY_POLICY = {
     "min_inliers": 5,
@@ -165,21 +166,6 @@ def summarize_scores(records):
     }
 
 
-def passes_thresholds(metrics, thresholds):
-    if not metrics:
-        return False
-    return (
-        metrics.get("inliers", 0) >= thresholds["min_inliers"] and
-        metrics.get("inlier_ratio", 0.0) >= thresholds["min_inlier_ratio"] and
-        metrics.get("inlier_frames", 0) >= thresholds["min_inlier_frames"] and
-        metrics.get("max_frame_inliers", 0) >= thresholds["min_frame_inliers"] and
-        metrics.get("margin", 0.0) >= thresholds["min_margin"] and
-        metrics.get("ncc", 0.0) >= thresholds["min_ncc"] and
-        metrics.get("orientation", 0.0) >= thresholds["min_orientation"] and
-        metrics.get("ridge_score", 0.0) >= thresholds["min_ridge_score"]
-    )
-
-
 def record_passes(record, thresholds):
     return record.get("confirmed", True) and passes_thresholds(record["best"], thresholds)
 
@@ -296,29 +282,31 @@ def analyze(args):
     for sample in samples:
         frames = sample["frames"]
         attempts = []
-        consecutive_passes = 0
+        confirmation = ConfirmationTracker(ConfirmationPolicy(
+            frames_per_attempt=ATTEMPT_FRAME_COUNT,
+            required_consecutive_accepts=MIN_CONFIRMED_ATTEMPTS,
+        ))
         confirmed = False
         confirmed_best = None
         for offset in range(0, len(frames), ATTEMPT_FRAME_COUNT):
             attempt_frames = frames[offset:offset + ATTEMPT_FRAME_COUNT]
             if len(attempt_frames) < ATTEMPT_FRAME_COUNT:
                 continue
-            matcher.verify_finger_multiframe(
+            decision = matcher.evaluate_multiframe(
                 attempt_frames,
                 username=sample["username"],
                 finger_name=sample["target_finger"],
                 apply_thresholds=False,
                 thresholds_override=IDENTITY_POLICY,
             )
-            attempts.append(matcher.last_verify_stats.get("best", {}))
+            attempts.append(decision.metrics.get("best", {}))
             if passes_thresholds(attempts[-1], IDENTITY_POLICY):
-                consecutive_passes += 1
-                if consecutive_passes >= MIN_CONFIRMED_ATTEMPTS:
+                if confirmation.record(True):
                     confirmed = True
                     confirmed_best = attempts[-1]
                     break
             else:
-                consecutive_passes = 0
+                confirmation.record(False)
         best = confirmed_best or max(
             attempts or [{}],
             key=lambda metrics: metrics.get("score", 0.0),

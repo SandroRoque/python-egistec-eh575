@@ -1,16 +1,24 @@
 import logging
 import threading
 import time
+from collections import Counter
 
 from egis_driver import egis_driver, fingerprint_matcher
+from egis_driver.capture import CaptureCoordinator, CaptureOutcome
 from egis_driver.persistence import Persistence
 from egis_driver.runtime_config import RuntimePaths
+from egis_matcher.decision import MatchDecision, MatchOutcome
+from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 
 logger = logging.getLogger("SERVICE")
 
 ENROLL_STAGES = 10
 VERIFY_FRAME_COUNT = 3
 VERIFY_CONFIRMATION_ATTEMPTS = 2
+PRODUCTION_CONFIRMATION_POLICY = ConfirmationPolicy(
+    frames_per_attempt=VERIFY_FRAME_COUNT,
+    required_consecutive_accepts=VERIFY_CONFIRMATION_ATTEMPTS,
+)
 RESUME_RECOVERY_WAIT_SECONDS = 3.0
 RESUME_RECOVERY_WARMUP_FRAMES = 4
 VERIFY_IDLE_LOG_INTERVAL_SECONDS = 10.0
@@ -39,12 +47,17 @@ class EgisService:
 
     def __init__(self, driver=None, matcher=None, persistence=None,
                  on_enroll_status=None, on_verify_status=None,
-                 on_verify_finger_selected=None, runtime_paths=None):
+                 on_verify_finger_selected=None, runtime_paths=None,
+                 capture_coordinator=None, confirmation_policy=None):
         runtime_paths = runtime_paths or RuntimePaths.from_environment()
         self._driver = driver or egis_driver.EgisDriver()
         self._persistence = persistence or Persistence(str(runtime_paths.data_root))
         self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
-            persistence=self._persistence)
+            persistence=self._persistence,
+            frame_spec=self._driver.frame_spec)
+        self._capture = capture_coordinator or CaptureCoordinator(self._driver)
+        self._confirmation_policy = (
+            confirmation_policy or PRODUCTION_CONFIRMATION_POLICY)
 
         self._operation_lock = threading.RLock()
         self._operation_generation = 0
@@ -56,10 +69,13 @@ class EgisService:
         self._resume_lock = threading.Lock()
         self._resume_ready = threading.Event()
         self._resume_ready.set()
+        self._sensor_ready = threading.Event()
+        self._sensor_ready.set()
         self._resume_recovery_thread = None
         self._resume_recovery_running = False
         self._resume_generation = 0
         self._verify_session_id = 0
+        self._match_outcomes = Counter()
 
         self.on_enroll_status = on_enroll_status
         self.on_verify_status = on_verify_status
@@ -75,18 +91,32 @@ class EgisService:
                 logger.info("Preparing sensor (%s): forced reconnect", reason)
                 ok = self._driver.force_reconnect(reset=reason.startswith("resume"))
                 if ok:
-                    self._warm_sensor(reason)
-                return ok
+                    ready = self._warm_sensor(reason)
+                    if ready:
+                        self._sensor_ready.set()
+                    else:
+                        self._sensor_ready.clear()
+                    return ready
+                self._sensor_ready.clear()
+                return False
 
             resume_ready = self._wait_for_resume_recovery(reason)
             logger.info("Preparing sensor (%s)", reason)
             if not self._driver.ensure_connected(force=not resume_ready):
+                self._sensor_ready.clear()
                 return False
             ok = self._driver.refresh_after_idle()
             if ok:
-                self._warm_sensor(reason)
-            return ok
+                ready = self._warm_sensor(reason)
+                if ready:
+                    self._sensor_ready.set()
+                else:
+                    self._sensor_ready.clear()
+                return ready
+            self._sensor_ready.clear()
+            return False
         except Exception as e:
+            self._sensor_ready.clear()
             logger.error("Sensor prepare failed (%s): %s", reason, e)
             return False
 
@@ -107,15 +137,15 @@ class EgisService:
         return False
 
     def _warm_sensor(self, reason):
-        valid_frames = 0
-        contrasts = []
-        start = time.time()
-        for _ in range(RESUME_RECOVERY_WARMUP_FRAMES):
-            img, contrast, _ = self._driver.capture_presence_frame(read_timeout=250)
-            if img is not None:
-                valid_frames += 1
-                contrasts.append(float(contrast))
-            time.sleep(0.03)
+        result = self._capture.warm(RESUME_RECOVERY_WARMUP_FRAMES, read_timeout=250)
+        logger.info(
+            "[METRIC] component=readiness outcome=%s elapsed_ms=%.0f read_failures=%d",
+            result.outcome.value,
+            result.elapsed_ms,
+            result.read_failures,
+        )
+        contrasts = result.details["contrasts"]
+        valid_frames = result.details["valid_frames"]
 
         if contrasts:
             logger.info(
@@ -126,13 +156,13 @@ class EgisService:
                 min(contrasts),
                 sum(contrasts) / len(contrasts),
                 max(contrasts),
-                (time.time() - start) * 1000.0,
+                result.elapsed_ms,
             )
         else:
             logger.warning(
                 "Sensor warmup (%s): no valid frames in %.0fms",
                 reason,
-                (time.time() - start) * 1000.0,
+                result.elapsed_ms,
             )
         return valid_frames > 0
 
@@ -204,6 +234,7 @@ class EgisService:
         scan_mode = operation.mode if operation else None
         logger.info("Service suspend: active_mode=%s", scan_mode)
         self._resume_ready.clear()
+        self._sensor_ready.clear()
         if operation and scan_mode == "verify" and not operation.terminal:
             with self._operation_lock:
                 self._suspended_operation = operation
@@ -300,6 +331,15 @@ class EgisService:
     def delete_enrolled_fingers(self, username):
         self._matcher.delete_user_fingers(username)
 
+    def diagnostics_snapshot(self):
+        """Return aggregate reliability counters without biometric content."""
+        return {
+            "capture": self._capture.metrics_snapshot(),
+            "matching": dict(self._match_outcomes),
+            "sensor_ready": self._sensor_ready.is_set(),
+            "resume_recovery_complete": self._resume_ready.is_set(),
+        }
+
     # ------------------------------------------------------------------
     #  Thread management (private)
     # ------------------------------------------------------------------
@@ -375,15 +415,12 @@ class EgisService:
         return f"{float(value):.1f}"
 
     def _is_verify_touch(self, contrast, baseline_contrast):
-        if contrast >= self._driver.touch_threshold:
-            return True, "driver-threshold"
-        if contrast >= VERIFY_PRESENCE_THRESHOLD:
-            return True, "verify-threshold"
-        if (
-                baseline_contrast is not None and
-                contrast >= baseline_contrast + VERIFY_PRESENCE_DELTA):
-            return True, "baseline-delta"
-        return False, "none"
+        return self._capture.is_verify_touch(
+            contrast,
+            baseline_contrast,
+            VERIFY_PRESENCE_THRESHOLD,
+            VERIFY_PRESENCE_DELTA,
+        )
 
     # ------------------------------------------------------------------
     #  Scan loop
@@ -526,21 +563,20 @@ class EgisService:
 
     def _handle_enroll(self, operation, img, username, finger_name):
         time.sleep(0.05)
-
-        touch_frames = [img]
-        start = time.time()
-        capture_start = start
-        max_duration = 3.0
-
-        while (
-                time.time() - start < max_duration and
-                self._is_operation_active(operation)):
-            extra_img, contrast = self._driver.get_live_frame()
-            if extra_img is None or contrast < 15:
-                break
-            touch_frames.append(extra_img)
-
-        capture_ms = (time.time() - capture_start) * 1000.0
+        capture = self._capture.collect_touch(
+            lambda: self._is_operation_active(operation), img)
+        logger.info(
+            "[METRIC] component=enrollment_capture outcome=%s frames=%d "
+            "elapsed_ms=%.0f read_failures=%d",
+            capture.outcome.value,
+            len(capture.frames),
+            capture.elapsed_ms,
+            capture.read_failures,
+        )
+        if capture.outcome is CaptureOutcome.CANCELED:
+            return
+        touch_frames = list(capture.frames)
+        capture_ms = capture.elapsed_ms
         analysis = self._matcher.analyze_touch(touch_frames)
         logger.info(
             "Enroll touch summary: frames=%d usable=%d contrast=%.1f/%.1f/%.1f "
@@ -609,30 +645,41 @@ class EgisService:
                                    initial_img=None, initial_contrast=0.0):
         logger.info("Continuous verify - trying while finger is on sensor...")
         attempt = 0
-        consecutive_matches = 0
+        confirmation = ConfirmationTracker(self._confirmation_policy)
         low_contrast_streak = 0
         pending_img = initial_img
         pending_contrast = initial_contrast
 
         while self._is_operation_active(operation):
-            capture_start = time.time()
-            frames = []
-            if pending_img is not None and pending_contrast >= 15:
-                frames.append(pending_img)
+            capture = self._capture.collect_window(
+                self._confirmation_policy.frames_per_attempt,
+                lambda: self._is_operation_active(operation),
+                pending_img,
+                pending_contrast,
+            )
+            frames = list(capture.frames)
+            logger.info(
+                "[METRIC] component=verification_capture outcome=%s frames=%d "
+                "elapsed_ms=%.0f read_failures=%d",
+                capture.outcome.value,
+                len(capture.frames),
+                capture.elapsed_ms,
+                capture.read_failures,
+            )
             pending_img = None
             pending_contrast = 0.0
 
-            while (
-                    len(frames) < VERIFY_FRAME_COUNT and
-                    self._is_operation_active(operation)):
-                extra_img, contrast = self._driver.get_live_frame()
-                if extra_img is None or contrast < 15:
-                    break
-                frames.append(extra_img)
-                time.sleep(0.01)
-
-            if len(frames) < VERIFY_FRAME_COUNT:
+            if capture.outcome is CaptureOutcome.CANCELED:
+                break
+            if capture.outcome is not CaptureOutcome.CAPTURED:
                 low_contrast_streak += 1
+                logger.info(
+                    "Capture outcome=%s frames=%d read_failures=%d elapsed_ms=%.0f",
+                    capture.outcome.value,
+                    len(frames),
+                    capture.read_failures,
+                    capture.elapsed_ms,
+                )
                 if low_contrast_streak >= 10:
                     logger.info("Finger lifted")
                     break
@@ -643,14 +690,32 @@ class EgisService:
             attempt += 1
 
             match_start = time.time()
-            match_name, score = self._matcher.verify_finger_multiframe(
-                frames,
-                username=username,
-                finger_name=finger_name,
-            )
+            if hasattr(self._matcher, "evaluate_multiframe"):
+                decision = self._matcher.evaluate_multiframe(
+                    frames, username=username, finger_name=finger_name)
+            else:
+                match_name, score = self._matcher.verify_finger_multiframe(
+                    frames, username=username, finger_name=finger_name)
+                stats = getattr(self._matcher, "last_verify_stats", {})
+                decision = MatchDecision(
+                    MatchOutcome.ACCEPT if match_name else MatchOutcome.REJECT,
+                    match_name,
+                    score,
+                    stats.get("reject_reason"),
+                    stats,
+                )
             match_ms = (time.time() - match_start) * 1000.0
-            total_ms = (time.time() - capture_start) * 1000.0
-            stats = getattr(self._matcher, "last_verify_stats", {})
+            match_name, score = decision.as_legacy_result()
+            stats = decision.metrics
+            self._match_outcomes[decision.outcome.value] += 1
+            if decision.reason:
+                self._match_outcomes[f"reason:{decision.reason}"] += 1
+            logger.info(
+                "[METRIC] component=matching outcome=%s reason=%s elapsed_ms=%.0f",
+                decision.outcome.value,
+                decision.reason or "none",
+                match_ms,
+            )
             best = stats.get("best", {})
             logger.info(
                 "Verify attempt summary: attempt=%d frames=%d keypoints=%d "
@@ -668,7 +733,7 @@ class EgisService:
                 stats.get("calibrated", False),
                 match_name if match_name else "none",
                 stats.get("reject_reason", "none"),
-                total_ms - match_ms,
+                capture.elapsed_ms,
                 match_ms,
             )
 
@@ -678,13 +743,13 @@ class EgisService:
                 if match_name.startswith(username + "_"):
                     name_rest = match_name[len(username) + 1:]
                     if "_" not in name_rest:
-                        consecutive_matches += 1
+                        confirmed = confirmation.record(True)
                         logger.info(
                             "Verification confirmation %d/%d",
-                            consecutive_matches,
-                            VERIFY_CONFIRMATION_ATTEMPTS,
+                            confirmation.consecutive_accepts,
+                            self._confirmation_policy.required_consecutive_accepts,
                         )
-                        if consecutive_matches >= VERIFY_CONFIRMATION_ATTEMPTS:
+                        if confirmed:
                             logger.info("AUTHENTICATED!")
                             self._emit_verify("verify-match", True, operation)
                             self._finish_operation(operation)
@@ -692,12 +757,12 @@ class EgisService:
                     else:
                         logger.info("Username collision: %s is not %s",
                                     match_name, username)
-                        consecutive_matches = 0
+                        confirmation.reset()
                 else:
                     logger.info("Wrong user! (%s)", match_name)
-                    consecutive_matches = 0
+                    confirmation.reset()
             else:
-                consecutive_matches = 0
+                confirmation.record(False)
 
             time.sleep(0.05)
 

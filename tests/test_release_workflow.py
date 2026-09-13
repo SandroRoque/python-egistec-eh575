@@ -118,6 +118,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         ):
             self.assertIn(source, arch)
             self.assertIn(source, fedora)
+        self.assertIn("egis_matcher", arch)
+        self.assertIn("egis_matcher", fedora)
 
 
 class RepositoryGuardTests(unittest.TestCase):

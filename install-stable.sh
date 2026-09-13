@@ -64,6 +64,7 @@ preflight() {
   done
   [ -d "$PROJECT_DIR/openfprintd" ]
   [ -d "$PROJECT_DIR/egis_driver" ]
+  [ -d "$PROJECT_DIR/egis_matcher" ]
   [ -f "$SCRIPT_DIR/egis-doctor" ]
 }
 
@@ -119,7 +120,8 @@ for executable in "${PAYLOAD[@]}"; do
   install -m 0755 "$PROJECT_DIR/bin/$executable" "$STAGE_DIR/$executable"
 done
 install -m 0755 "$SCRIPT_DIR/egis-doctor" "$STAGE_DIR/egis-doctor"
-cp -a "$PROJECT_DIR/openfprintd" "$PROJECT_DIR/egis_driver" "$STAGE_DIR/"
+cp -a "$PROJECT_DIR/openfprintd" "$PROJECT_DIR/egis_driver" \
+  "$PROJECT_DIR/egis_matcher" "$STAGE_DIR/"
 find "$STAGE_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$STAGE_DIR" -type f -name '*.pyc' -delete
 

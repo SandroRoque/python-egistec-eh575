@@ -3,12 +3,19 @@ import json
 import math
 import os
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from egis_driver.fingerprint_matcher import FingerprintMatcher, THRESHOLD_KEYS
-from egis_driver.matcher_config import MatcherConfig
+from egis_driver.fingerprint_matcher import FingerprintMatcher
 from egis_driver.persistence import Persistence
+from egis_matcher.matcher_config import MatcherConfig
+from egis_matcher.policy import (
+    THRESHOLD_KEYS,
+    ConfirmationPolicy,
+    ConfirmationTracker,
+    passes_thresholds,
+)
 
 
 def sha256_file(path):
@@ -54,6 +61,10 @@ def load_lab_config(path):
     min_confirmed_attempts = int(data.get("min_confirmed_attempts", 1))
     if min_confirmed_attempts < 1:
         raise ValueError("min_confirmed_attempts must be positive")
+    policy = ConfirmationPolicy(
+        frames_per_attempt=frames_per_attempt,
+        required_consecutive_accepts=min_confirmed_attempts,
+    )
     return {
         "name": str(data.get("name") or Path(path).stem),
         "matcher": matcher,
@@ -61,22 +72,8 @@ def load_lab_config(path):
         "acceptance": normalized_acceptance,
         "frames_per_attempt": frames_per_attempt,
         "min_confirmed_attempts": min_confirmed_attempts,
+        "confirmation_policy": policy,
     }
-
-
-def passes_thresholds(metrics, thresholds):
-    if not metrics:
-        return False
-    return all((
-        metrics.get("inliers", 0) >= thresholds["min_inliers"],
-        metrics.get("inlier_ratio", 0.0) >= thresholds["min_inlier_ratio"],
-        metrics.get("inlier_frames", 0) >= thresholds["min_inlier_frames"],
-        metrics.get("max_frame_inliers", 0) >= thresholds["min_frame_inliers"],
-        metrics.get("margin", 0.0) >= thresholds["min_margin"],
-        metrics.get("ncc", 0.0) >= thresholds["min_ncc"],
-        metrics.get("orientation", 0.0) >= thresholds["min_orientation"],
-        metrics.get("ridge_score", 0.0) >= thresholds["min_ridge_score"],
-    ))
 
 
 def percentile(values, fraction):
@@ -98,7 +95,8 @@ def _run_once(dataset_root, config):
         started = time.perf_counter()
         attempt_stats = []
         attempt_elapsed_ms = []
-        consecutive_accepts = 0
+        attempt_outcomes = []
+        confirmation = ConfirmationTracker(config["confirmation_policy"])
         confirmed_stats = None
         window = config["frames_per_attempt"]
         for offset in range(0, len(frames), window):
@@ -106,25 +104,25 @@ def _run_once(dataset_root, config):
             if len(attempt_frames) < window:
                 continue
             attempt_started = time.perf_counter()
-            matcher.verify_finger_multiframe(
+            decision = matcher.evaluate_multiframe(
                 attempt_frames,
                 username=meta["username"],
                 finger_name=meta["target_finger"],
                 apply_thresholds=False,
                 thresholds_override=config["thresholds"],
             )
-            stats = dict(matcher.last_verify_stats)
+            stats = dict(decision.metrics)
             attempt_stats.append(stats)
+            attempt_outcomes.append(decision.outcome.value)
             attempt_elapsed_ms.append(
                 (time.perf_counter() - attempt_started) * 1000.0
             )
             if passes_thresholds(stats.get("best", {}), config["thresholds"]):
-                consecutive_accepts += 1
-                if consecutive_accepts >= config["min_confirmed_attempts"]:
+                if confirmation.record(True):
                     confirmed_stats = stats
                     break
             else:
-                consecutive_accepts = 0
+                confirmation.record(False)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if not attempt_stats:
             attempt_stats = [{"best": {}, "reject_reason": "incomplete_attempt"}]
@@ -144,6 +142,7 @@ def _run_once(dataset_root, config):
             "reject_reason": None if accepted else stats.get("reject_reason"),
             "elapsed_ms": elapsed_ms,
             "attempt_elapsed_ms": attempt_elapsed_ms,
+            "attempt_outcomes": attempt_outcomes,
             "attempts": len(attempt_stats),
             "accepted_attempt": (
                 attempt_stats.index(stats) + 1 if accepted else None
@@ -213,7 +212,12 @@ def _summarize(records, acceptance):
         "p95_ms": percentile(latencies, 0.95),
         "max_ms": max(latencies, default=0.0),
     }
-    return by_target, target_gates, latency
+    outcomes = Counter(
+        outcome
+        for record in records
+        for outcome in record.get("attempt_outcomes", [])
+    )
+    return by_target, target_gates, latency, dict(sorted(outcomes.items()))
 
 
 def evaluate(dataset_root, config_path, source_root, repeats=2):
@@ -223,7 +227,8 @@ def evaluate(dataset_root, config_path, source_root, repeats=2):
     signatures = [_decision_signature(records) for records in runs]
     deterministic = len(set(signatures)) == 1
     records = runs[0]
-    by_target, target_gates, latency = _summarize(records, config["acceptance"])
+    by_target, target_gates, latency, outcomes = _summarize(
+        records, config["acceptance"])
 
     manifest_path = dataset_root / "dataset-manifest.json"
     manifest_hash = sha256_file(manifest_path) if manifest_path.exists() else None
@@ -239,6 +244,7 @@ def evaluate(dataset_root, config_path, source_root, repeats=2):
         "config": {
             "name": config["name"],
             "matcher": config["matcher"].to_dict(),
+            "confirmation_policy": config["confirmation_policy"].to_dict(),
             "thresholds": config["thresholds"],
             "acceptance": config["acceptance"],
         },
@@ -258,6 +264,7 @@ def evaluate(dataset_root, config_path, source_root, repeats=2):
         "deterministic": deterministic,
         "targets": by_target,
         "latency": latency,
+        "match_outcomes": outcomes,
         "gates": {
             "targets": target_gates,
             "latency": latency_ok,
