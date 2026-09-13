@@ -46,6 +46,40 @@ persistence adapter. Matcher rejection reasons describe completed frame
 windows. Live incomplete windows, I/O failures, unavailable devices, and
 cancellations are capture outcomes and are measured separately.
 
+## Ordered Touch Research
+
+Record a complete contact, including low-contrast observations and its explicit
+end marker:
+
+```bash
+sudo ./egis-lab record-sequence --label right-index-sweep --role development
+```
+
+The bridge is stopped only while this command owns the sensor and is restarted in
+all exit paths. Data is written asynchronously under `.egis-lab/sequences` with
+owner-only permissions. A full writer queue or capture timeout marks the manifest
+incomplete. Recordings contain biometric data and must never be copied into the
+repository, issues, logs, or compatibility reports.
+
+Analyze the sequence without hardware access:
+
+```bash
+./egis-lab analyze-sequence .egis-lab/sequences/TIMESTAMP-LABEL
+```
+
+This writes a private JSON report plus one image per connected registration
+component under the sequence's `analysis` directory. The report retains per-frame
+transforms, references, inliers, spatial support, ridge agreement, quality, and
+confidence. Discontinuities force a new component rather than inventing an
+alignment. Use these reports to tune registration and compare coverage before
+introducing an atlas enrollment format or streaming identity evidence into live
+authentication.
+
+Promotion order is: validate registration on development sequences, freeze the
+implementation and thresholds, test unseen holdout sequences, then integrate the
+new representation behind the existing matcher interface. Any representation
+change may deliberately require fresh enrollment; there is no migration gate.
+
 On an installed system, summarize privacy-safe runtime outcomes with:
 
 ```bash

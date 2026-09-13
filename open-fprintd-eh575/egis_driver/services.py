@@ -1,4 +1,5 @@
 import logging
+import queue
 import threading
 import time
 from collections import Counter
@@ -7,7 +8,13 @@ from egis_driver import egis_driver, fingerprint_matcher
 from egis_driver.capture import CaptureCoordinator, CaptureOutcome
 from egis_driver.persistence import Persistence
 from egis_driver.runtime_config import RuntimePaths
-from egis_matcher.decision import MatchDecision, MatchOutcome
+from egis_driver.streaming import (
+    CapturePump,
+    DirectMatcherWorker,
+    FrameStatus,
+    MatcherWorker,
+)
+from egis_matcher.frame import FrameSpec
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 
 logger = logging.getLogger("SERVICE")
@@ -48,13 +55,24 @@ class EgisService:
     def __init__(self, driver=None, matcher=None, persistence=None,
                  on_enroll_status=None, on_verify_status=None,
                  on_verify_finger_selected=None, runtime_paths=None,
-                 capture_coordinator=None, confirmation_policy=None):
+                 capture_coordinator=None, confirmation_policy=None,
+                 matcher_worker=None):
         runtime_paths = runtime_paths or RuntimePaths.from_environment()
         self._driver = driver or egis_driver.EgisDriver()
         self._persistence = persistence or Persistence(str(runtime_paths.data_root))
         self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
             persistence=self._persistence,
             frame_spec=self._driver.frame_spec)
+        if matcher_worker is not None:
+            self._matcher_worker = matcher_worker
+        elif matcher is not None:
+            self._matcher_worker = DirectMatcherWorker(self._matcher)
+        else:
+            self._matcher_worker = MatcherWorker(
+                self._persistence.root_dir,
+                self._driver.frame_spec,
+                self._matcher.matcher_config,
+            )
         self._capture = capture_coordinator or CaptureCoordinator(self._driver)
         self._confirmation_policy = (
             confirmation_policy or PRODUCTION_CONFIRMATION_POLICY)
@@ -75,7 +93,9 @@ class EgisService:
         self._resume_recovery_running = False
         self._resume_generation = 0
         self._verify_session_id = 0
+        self._capture_epoch = 0
         self._match_outcomes = Counter()
+        self._stream_capture_outcomes = Counter()
 
         self.on_enroll_status = on_enroll_status
         self.on_verify_status = on_verify_status
@@ -229,6 +249,12 @@ class EgisService:
             logger.info("Enroll canceled; emitting terminal failure")
             self._emit_enroll("enroll-failed", True, operation, allow_inactive=True)
 
+    def close(self):
+        """Stop active work and release the out-of-process matcher."""
+        self._discard_suspended_operation()
+        self._stop_scan("service-close")
+        self._matcher_worker.close()
+
     def suspend(self):
         operation = self._stop_scan("suspend")
         scan_mode = operation.mode if operation else None
@@ -333,8 +359,10 @@ class EgisService:
 
     def diagnostics_snapshot(self):
         """Return aggregate reliability counters without biometric content."""
+        capture = Counter(self._capture.metrics_snapshot())
+        capture.update(self._stream_capture_outcomes)
         return {
-            "capture": self._capture.metrics_snapshot(),
+            "capture": dict(capture),
             "matching": dict(self._match_outcomes),
             "sensor_ready": self._sensor_ready.is_set(),
             "resume_recovery_complete": self._resume_ready.is_set(),
@@ -625,6 +653,7 @@ class EgisService:
             success = self._matcher.enroll_finger(unique_name, self._enroll_scans)
 
             if success:
+                self._matcher_worker.reload()
                 logger.info("Enrollment Successful!")
                 self._emit_enroll("enroll-completed", True, operation)
             else:
@@ -646,125 +675,89 @@ class EgisService:
         logger.info("Continuous verify - trying while finger is on sensor...")
         attempt = 0
         confirmation = ConfirmationTracker(self._confirmation_policy)
-        low_contrast_streak = 0
-        pending_img = initial_img
-        pending_contrast = initial_contrast
-
-        while self._is_operation_active(operation):
-            capture = self._capture.collect_window(
-                self._confirmation_policy.frames_per_attempt,
-                lambda: self._is_operation_active(operation),
-                pending_img,
-                pending_contrast,
-            )
-            frames = list(capture.frames)
-            logger.info(
-                "[METRIC] component=verification_capture outcome=%s frames=%d "
-                "elapsed_ms=%.0f read_failures=%d",
-                capture.outcome.value,
-                len(capture.frames),
-                capture.elapsed_ms,
-                capture.read_failures,
-            )
-            pending_img = None
-            pending_contrast = 0.0
-
-            if capture.outcome is CaptureOutcome.CANCELED:
-                break
-            if capture.outcome is not CaptureOutcome.CAPTURED:
-                low_contrast_streak += 1
-                logger.info(
-                    "Capture outcome=%s frames=%d read_failures=%d elapsed_ms=%.0f",
-                    capture.outcome.value,
-                    len(frames),
-                    capture.read_failures,
-                    capture.elapsed_ms,
-                )
-                if low_contrast_streak >= 10:
-                    logger.info("Finger lifted")
-                    break
-                time.sleep(0.05)
-                continue
-
-            low_contrast_streak = 0
-            attempt += 1
-
-            match_start = time.time()
-            if hasattr(self._matcher, "evaluate_multiframe"):
-                decision = self._matcher.evaluate_multiframe(
-                    frames, username=username, finger_name=finger_name)
-            else:
-                match_name, score = self._matcher.verify_finger_multiframe(
-                    frames, username=username, finger_name=finger_name)
-                stats = getattr(self._matcher, "last_verify_stats", {})
-                decision = MatchDecision(
-                    MatchOutcome.ACCEPT if match_name else MatchOutcome.REJECT,
-                    match_name,
-                    score,
-                    stats.get("reject_reason"),
-                    stats,
-                )
-            match_ms = (time.time() - match_start) * 1000.0
-            match_name, score = decision.as_legacy_result()
-            stats = decision.metrics
-            self._match_outcomes[decision.outcome.value] += 1
-            if decision.reason:
-                self._match_outcomes[f"reason:{decision.reason}"] += 1
-            logger.info(
-                "[METRIC] component=matching outcome=%s reason=%s elapsed_ms=%.0f",
-                decision.outcome.value,
-                decision.reason or "none",
-                match_ms,
-            )
-            best = stats.get("best", {})
-            logger.info(
-                "Verify attempt summary: attempt=%d frames=%d keypoints=%d "
-                "good=%d candidates=%d best_inliers=%d ridge=%.2f ncc=%.2f orient=%.2f "
-                "calibrated=%s match=%s reject=%s capture_match_ms=%.0f/%.0f",
-                attempt,
-                len(frames),
-                stats.get("keypoints", 0),
-                stats.get("good_matches", 0),
-                stats.get("candidates", 0),
-                stats.get("best_inliers", 0),
-                best.get("ridge_score", 0.0),
-                best.get("ncc", 0.0),
-                best.get("orientation", 0.0),
-                stats.get("calibrated", False),
-                match_name if match_name else "none",
-                stats.get("reject_reason", "none"),
-                capture.elapsed_ms,
-                match_ms,
-            )
-
-            if match_name:
-                logger.info("Match: %s (Inliers: %s, Frames: %d)",
-                             match_name, score, len(frames))
-                if match_name.startswith(username + "_"):
-                    name_rest = match_name[len(username) + 1:]
-                    if "_" not in name_rest:
-                        confirmed = confirmation.record(True)
-                        logger.info(
-                            "Verification confirmation %d/%d",
-                            confirmation.consecutive_accepts,
-                            self._confirmation_policy.required_consecutive_accepts,
-                        )
-                        if confirmed:
-                            logger.info("AUTHENTICATED!")
-                            self._emit_verify("verify-match", True, operation)
-                            self._finish_operation(operation)
-                            return
-                    else:
-                        logger.info("Username collision: %s is not %s",
-                                    match_name, username)
-                        confirmation.reset()
-                else:
-                    logger.info("Wrong user! (%s)", match_name)
+        self._capture_epoch += 1
+        capture_epoch = self._capture_epoch
+        frame_spec = getattr(self._driver, "frame_spec", FrameSpec(103, 52))
+        pump = CapturePump(
+            self._driver,
+            frame_spec,
+            operation.generation,
+            capture_epoch,
+            initial_img,
+            initial_contrast,
+        ).start()
+        frames = []
+        window_started = None
+        contact_deadline = time.monotonic() + 3.0
+        try:
+            while (
+                    self._is_operation_active(operation) and
+                    time.monotonic() < contact_deadline):
+                try:
+                    message = pump.stream.receive(timeout=0.1)
+                except queue.Empty:
+                    if not pump.alive:
+                        break
+                    continue
+                if (
+                        message.generation != operation.generation or
+                        message.capture_epoch != capture_epoch):
+                    continue
+                if message.dropped_before:
+                    logger.warning(
+                        "Capture queue dropped %d frame(s); resetting evidence",
+                        message.dropped_before,
+                    )
+                    frames = []
+                    window_started = None
                     confirmation.reset()
-            else:
-                confirmation.record(False)
+                if message.status is FrameStatus.CONTACT_END:
+                    break
+                if message.status is FrameStatus.IO_ERROR:
+                    self._stream_capture_outcomes["io_error"] += 1
+                    logger.info(
+                        "[METRIC] component=verification_capture outcome=io_error "
+                        "frames=0 observed_bytes=%d",
+                        message.observed_bytes,
+                    )
+                    continue
+                if message.status is not FrameStatus.VALID:
+                    continue
+                if not frames:
+                    window_started = message.captured_started
+                frames.append(message.pixels)
+                if len(frames) < self._confirmation_policy.frames_per_attempt:
+                    continue
 
-            time.sleep(0.05)
+                attempt += 1
+                match_start = time.monotonic()
+                decision = self._matcher_worker.evaluate(
+                    frames,
+                    username,
+                    finger_name,
+                    operation.generation,
+                )
+                match_ms = (time.monotonic() - match_start) * 1000.0
+                capture_ms = (
+                    message.captured_finished - window_started) * 1000.0
+                logger.info(
+                    "[METRIC] component=verification_capture outcome=captured "
+                    "frames=%d elapsed_ms=%.0f dropped_before=%d",
+                    len(frames),
+                    capture_ms,
+                    message.dropped_before,
+                )
+                self._stream_capture_outcomes["captured"] += 1
+                frames = []
+                window_started = None
+                if not self._is_operation_active(operation):
+                    break
+                if self._apply_match_decision(
+                        operation, username, decision, confirmation,
+                        attempt, capture_ms, match_ms):
+                    return
+        finally:
+            pump.stop()
 
         logger.info("No match after %d attempts", attempt)
         if self._is_operation_active(operation):
@@ -772,6 +765,62 @@ class EgisService:
             logger.info("Ready for another verification touch.")
         else:
             logger.info("Verification loop stopped before retry emission.")
+
+    def _apply_match_decision(self, operation, username, decision, confirmation,
+                              attempt, capture_ms, match_ms):
+        match_name, score = decision.as_legacy_result()
+        stats = decision.metrics
+        self._match_outcomes[decision.outcome.value] += 1
+        if decision.reason:
+            self._match_outcomes[f"reason:{decision.reason}"] += 1
+        logger.info(
+            "[METRIC] component=matching outcome=%s reason=%s elapsed_ms=%.0f",
+            decision.outcome.value,
+            decision.reason or "none",
+            match_ms,
+        )
+        best = stats.get("best", {})
+        logger.info(
+            "Verify attempt summary: attempt=%d frames=%d keypoints=%d good=%d "
+            "candidates=%d best_inliers=%d ridge=%.2f ncc=%.2f orient=%.2f "
+            "calibrated=%s match=%s reject=%s capture_match_ms=%.0f/%.0f",
+            attempt,
+            self._confirmation_policy.frames_per_attempt,
+            stats.get("keypoints", 0),
+            stats.get("good_matches", 0),
+            stats.get("candidates", 0),
+            stats.get("best_inliers", 0),
+            best.get("ridge_score", 0.0),
+            best.get("ncc", 0.0),
+            best.get("orientation", 0.0),
+            stats.get("calibrated", False),
+            match_name if match_name else "none",
+            stats.get("reject_reason", "none"),
+            capture_ms,
+            match_ms,
+        )
+        if not match_name:
+            confirmation.record(False)
+            return False
+        if not match_name.startswith(username + "_"):
+            confirmation.reset()
+            return False
+        name_rest = match_name[len(username) + 1:]
+        if "_" in name_rest:
+            confirmation.reset()
+            return False
+        confirmed = confirmation.record(True)
+        logger.info(
+            "Verification confirmation %d/%d",
+            confirmation.consecutive_accepts,
+            self._confirmation_policy.required_consecutive_accepts,
+        )
+        if not confirmed:
+            return False
+        logger.info("AUTHENTICATED!")
+        self._emit_verify("verify-match", True, operation)
+        self._finish_operation(operation)
+        return True
 
     # ------------------------------------------------------------------
     #  Callback emission (private)

@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import argparse
+import cv2
 import hashlib
 import json
 import os
@@ -16,6 +17,10 @@ sys.path.insert(0, str(ROOT / "open-fprintd-eh575"))
 from egis_driver.evaluation import evaluate, sha256_file, write_report
 from egis_driver.lab_artifact import build_candidate
 from egis_driver.compatibility import doctor_report, public_compatibility_report
+from egis_driver.egis_driver import EgisDriver
+from egis_driver.sequence_recording import SequenceRecorder, load_sequence
+from egis_driver.streaming import CapturePump
+from egis_matcher.sequence import TouchTracker
 
 
 LAB_ROOT = ROOT / ".egis-lab"
@@ -146,6 +151,132 @@ def cmd_holdout(args):
     cmd_snapshot(args)
 
 
+def cmd_record_sequence(args):
+    if os.geteuid() != 0:
+        raise SystemExit("Run with: sudo ./egis-lab record-sequence --label LABEL")
+    target_user = os.environ.get("SUDO_USER")
+    if not target_user or target_user == "root":
+        raise SystemExit("SUDO_USER is unavailable; invoke through sudo as your normal user")
+    account = pwd.getpwnam(target_user)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_label = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in args.label
+    ).strip("_") or "unlabeled"
+    destination = LAB_ROOT / "sequences" / f"{stamp}-{safe_label}"
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    subprocess.run(["systemctl", "stop", "egis-bridge"], check=True)
+    recorder = None
+    pump = None
+    try:
+        driver = EgisDriver()
+        recorder = SequenceRecorder(destination, metadata={
+            "role": args.role,
+            "label": args.label,
+            "source_commit": commit,
+            "sensor_profile": driver.profile.name,
+        }).start()
+        print("Touch and move the requested finger across the sensor.")
+        initial = None
+        while initial is None:
+            frame, contrast, present = driver.capture_presence_frame()
+            if present:
+                initial = frame, contrast
+        pump = CapturePump(
+            driver,
+            driver.frame_spec,
+            generation=1,
+            capture_epoch=1,
+            initial_frame=initial[0],
+            initial_contrast=initial[1],
+            on_message=recorder.observe,
+        ).start()
+        complete = pump.wait(timeout=args.max_seconds)
+        pump.stop()
+        recorder.close(complete=complete)
+        recorder = None
+        _chown_tree(destination, account.pw_uid, account.pw_gid)
+        print(destination)
+        return 0 if complete else 2
+    finally:
+        if pump is not None:
+            pump.stop()
+        if recorder is not None:
+            recorder.abort()
+            _chown_tree(destination, account.pw_uid, account.pw_gid)
+        subprocess.run(["systemctl", "start", "egis-bridge"], check=False)
+
+
+def cmd_analyze_sequence(args):
+    source = Path(args.sequence).resolve()
+    manifest, messages = load_sequence(source)
+    valid = [message for message in messages if message.status.value == "valid"]
+    if not valid:
+        raise SystemExit("sequence contains no valid frames")
+    spec = valid[0].frame_spec
+    if any(message.frame_spec != spec for message in messages):
+        raise SystemExit("sequence changes frame geometry")
+    tracker = TouchTracker(spec)
+    observations = []
+    previous_sequence = None
+    for message in messages:
+        discontinuity = (
+            message.dropped_before > 0 or
+            (previous_sequence is not None and
+             message.sequence != previous_sequence + 1)
+        )
+        previous_sequence = message.sequence
+        if discontinuity:
+            tracker.discontinuity()
+        if message.status.value != "valid":
+            continue
+        tracked = tracker.observe(message.pixels, sequence=message.sequence)
+        registration = tracked.registration
+        observations.append({
+            "sequence": tracked.sequence,
+            "quality": tracked.quality,
+            "component": registration.component,
+            "reference": registration.reference,
+            "matches": registration.matches,
+            "inliers": registration.inliers,
+            "inlier_ratio": registration.inlier_ratio,
+            "ridge_score": registration.ridge_score,
+            "spatial_cells": registration.spatial_cells,
+            "confidence": registration.confidence,
+            "reason": registration.reason,
+            "transform": registration.transform.tolist(),
+        })
+
+    output = Path(args.output or source / "analysis")
+    output.mkdir(parents=True, mode=0o700, exist_ok=True)
+    output.chmod(0o700)
+    mosaics = {}
+    for component, image in tracker.render_components().items():
+        path = output / f"component-{component}.png"
+        if not cv2.imwrite(str(path), image):
+            raise SystemExit(f"failed to write {path}")
+        path.chmod(0o600)
+        mosaics[str(component)] = path.name
+    report = {
+        "schema_version": 1,
+        "source": str(source),
+        "source_complete": bool(manifest.get("complete")),
+        "source_recorder_dropped": int(manifest.get("recorder_dropped", 0)),
+        "frame_spec": {"width": spec.width, "height": spec.height,
+                       "dtype": spec.dtype},
+        "summary": tracker.summary(),
+        "observations": observations,
+        "mosaics": mosaics,
+    }
+    report_path = output / "report.json"
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.chmod(0o600)
+    print(report_path)
+    return 0
+
+
 def _resolve_dataset(value):
     path = Path(value) if value else LAB_ROOT / "current"
     path = path.resolve()
@@ -257,6 +388,27 @@ def build_parser():
     holdout.add_argument("--samples", type=int, default=8)
     holdout.add_argument("--frames", type=int, default=9)
     holdout.set_defaults(func=cmd_holdout)
+
+    record = sub.add_parser(
+        "record-sequence",
+        help="Privately record one ordered touch sequence",
+    )
+    record.add_argument("--label", required=True)
+    record.add_argument(
+        "--role",
+        choices=("enrollment", "development", "holdout"),
+        default="development",
+    )
+    record.add_argument("--max-seconds", type=float, default=8.0)
+    record.set_defaults(func=cmd_record_sequence)
+
+    analyze = sub.add_parser(
+        "analyze-sequence",
+        help="Register and mosaic a private recorded sequence",
+    )
+    analyze.add_argument("sequence")
+    analyze.add_argument("--output")
+    analyze.set_defaults(func=cmd_analyze_sequence)
 
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")

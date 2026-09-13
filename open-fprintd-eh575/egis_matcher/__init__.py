@@ -8,6 +8,7 @@ _EXPORTS = {
     "MatchOutcome": ("egis_matcher.decision", "MatchOutcome"),
     "MatcherCore": ("egis_matcher.core", "MatcherCore"),
     "MatcherConfig": ("egis_matcher.matcher_config", "MatcherConfig"),
+    "TouchTracker": ("egis_matcher.sequence", "TouchTracker"),
     "passes_thresholds": ("egis_matcher.policy", "passes_thresholds"),
 }
 
@@ -19,6 +20,7 @@ __all__ = (
     "MatchOutcome",
     "MatcherCore",
     "MatcherConfig",
+    "TouchTracker",
     "passes_thresholds",
 )
 

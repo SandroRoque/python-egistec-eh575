@@ -18,6 +18,9 @@ independently released device backend.
 | `egis_matcher/` | Frame features, template construction, identity metrics, decisions, and confirmation policy | Filesystem paths, USB, D-Bus, service lifecycle |
 | `egis_driver/fingerprint_matcher.py` | Persistence-backed matcher adapter and template indexing | Sensor commands, service lifecycle |
 | `egis_driver/capture.py` | Touch detection and complete frame-window acquisition with measurable outcomes | Identity decisions and D-Bus status |
+| `egis_driver/streaming.py` | Ordered continuous capture stream and isolated matcher worker process | Fingerprint features, enrollment policy, D-Bus |
+| `egis_driver/sequence_recording.py` | Private loss-detecting sequence recording and replay | Matching decisions and public artifacts |
+| `egis_matcher/sequence.py` | Frame registration, disconnected-component tracking, and experimental mosaics | Sensor access and persistent paths |
 | `egis_driver/services.py` | Authentication-session state and suspend/resume behavior | Matching calculations and USB commands |
 | `openfprintd/` | Standard fprint D-Bus surface, client ownership, authorization | EH575 protocol and image processing |
 | `egis_driver/evaluation.py` | Offline replay and acceptance gates | Live installation |
@@ -38,6 +41,23 @@ distinguishes accepted, rejected, unscorable, and uncalibrated attempts.
 matcher decisions have separate aggregate counters, available through
 `EgisService.diagnostics_snapshot()`.
 
+Live verification no longer alternates sensor reads with matching. A dedicated
+`CapturePump` keeps reading for the duration of a contact and publishes immutable,
+ordered messages into a bounded queue. If matching is slower than capture, the
+oldest queued frames are discarded and the next message carries the exact drop
+count; confirmation evidence is then reset. Matching runs in a persistent spawned
+process, has a readiness handshake and request timeout, and is restarted on a
+crash or timeout. Generation and capture-epoch fields prevent late work from a
+canceled session from becoming an authentication result.
+
+Ordered sequences retain every sensor observation and its timing. The independent
+`TouchTracker` estimates validated frame relationships, keeps disconnected regions
+as separate components, and can render experimental mosaics without changing the
+production matcher. This is intentionally an evaluation seam: a new atlas or
+streaming-evidence matcher must clear private replay and holdout gates before it
+replaces the production representation. Enrollment schema migration is not a
+design constraint; a new matcher may require re-enrollment.
+
 ## Security Boundaries
 
 - The manager authorizes registration before accepting a backend.
@@ -48,6 +68,9 @@ matcher decisions have separate aggregate counters, available through
 - Suspend and idle transitions do not emit terminal authentication failures.
 - Raw frames, templates, calibration samples, usernames, USB serials, and local
   paths are private data and cannot enter a public report or tracked file.
+- Sequence directories and analysis images are created below `.egis-lab` with
+  owner-only permissions. Queue loss marks a recording incomplete rather than
+  silently producing misleading research evidence.
 
 ## Compatibility Policy
 
@@ -57,10 +80,11 @@ packets. Revision `1072` is known. A new revision with matching descriptors is
 allowed with a warning so it can be tested; descriptor or endpoint mismatches
 fail closed.
 
-Template and matcher schemas are separate compatibility contracts. A matcher
-change does not require a template migration unless `TEMPLATE_SCHEMA_VERSION`
-changes. Thresholds are tied to `MATCHER_VERSION` and must be regenerated when
-that version changes.
+Template and matcher schemas are separate compatibility contracts, but backward
+template migration is explicitly not required. A representation change may bump
+`TEMPLATE_SCHEMA_VERSION`, invalidate old enrollments, and require re-enrollment.
+Thresholds are tied to `MATCHER_VERSION` and must be regenerated whenever matcher
+behavior changes.
 
 Production verification uses three frames per attempt and requires two
 consecutive accepted attempts. Calibration, live verification, and promotable

@@ -231,6 +231,8 @@ replay, benchmarking, comparison, and candidate construction without root:
 
 ```bash
 sudo ./egis-lab snapshot --role development
+sudo ./egis-lab record-sequence --label right-index-sweep
+./egis-lab analyze-sequence .egis-lab/sequences/TIMESTAMP-LABEL
 ./egis-lab evaluate --config lab-configs/baseline.json
 ./egis-lab evaluate --config lab-configs/username-index.json
 ./egis-lab evaluate --config lab-configs/production-parity.json

@@ -1,0 +1,46 @@
+import unittest
+
+import cv2
+import numpy as np
+
+from egis_matcher.frame import FrameSpec
+from egis_matcher.sequence import TouchTracker
+
+
+class SequenceTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.spec = FrameSpec(103, 52)
+        rng = np.random.default_rng(42)
+        image = rng.integers(0, 256, (52, 103), dtype=np.uint8)
+        cv2.line(image, (8, 8), (90, 40), 255, 2)
+        cv2.circle(image, (50, 25), 12, 0, 2)
+        self.image = image
+
+    def test_related_frames_share_component_and_render_mosaic(self):
+        tracker = TouchTracker(
+            self.spec, min_inliers=4, min_spatial_cells=2,
+            min_ridge_score=-1.0,
+        )
+        first = tracker.observe(self.image.tobytes(), 1)
+        shifted = cv2.warpAffine(
+            self.image, np.float32([[1, 0, 4], [0, 1, 2]]), (103, 52))
+        second = tracker.observe(shifted.tobytes(), 2)
+        self.assertEqual(first.registration.component,
+                         second.registration.component)
+        self.assertIsNotNone(second.registration.reference)
+        mosaic = tracker.render_components()[0]
+        self.assertGreaterEqual(mosaic.shape[0], self.spec.height)
+        self.assertGreaterEqual(mosaic.shape[1], self.spec.width)
+
+    def test_discontinuity_forces_a_new_component(self):
+        tracker = TouchTracker(self.spec)
+        first = tracker.observe(self.image.tobytes(), 1)
+        tracker.discontinuity()
+        second = tracker.observe(self.image.tobytes(), 3)
+        self.assertNotEqual(first.registration.component,
+                            second.registration.component)
+        self.assertEqual(tracker.summary()["discontinuities"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
