@@ -300,8 +300,9 @@ def analyze(args):
                 thresholds_override=IDENTITY_POLICY,
             )
             attempts.append(decision.metrics.get("best", {}))
+            identity, _ = decision.as_legacy_result()
             if passes_thresholds(attempts[-1], IDENTITY_POLICY):
-                if confirmation.record(True):
+                if confirmation.record(True, identity=identity):
                     confirmed = True
                     confirmed_best = attempts[-1]
                     break

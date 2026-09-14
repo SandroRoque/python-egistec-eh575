@@ -258,7 +258,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual([len(group) for group in touch_groups], [1] * 10)
         self.assertEqual([group[0][0] for group in touch_groups], list(range(10)))
 
-    def test_verification_requires_two_consecutive_matches(self):
+    def test_verification_requires_three_consecutive_matches(self):
         matcher = AlwaysMatchMatcher()
         statuses = []
         service = EgisService(
@@ -282,12 +282,12 @@ class ServiceLifecycleTests(unittest.TestCase):
                 30.0,
             )
 
-        self.assertEqual(matcher.calls, 2)
+        self.assertEqual(matcher.calls, 3)
         self.assertEqual(statuses, [("verify-match", True)])
         self.assertIsNone(service._active_operation)
         diagnostics = service.diagnostics_snapshot()
-        self.assertEqual(diagnostics["capture"]["captured"], 2)
-        self.assertEqual(diagnostics["matching"]["accept"], 2)
+        self.assertEqual(diagnostics["capture"]["captured"], 3)
+        self.assertEqual(diagnostics["matching"]["accept"], 3)
 
     def test_resuspend_cancels_recovery_and_preserves_paused_verification(self):
         driver = FakeDriver()

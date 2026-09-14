@@ -69,6 +69,23 @@ class MatcherLibraryBoundaryTests(unittest.TestCase):
         self.assertFalse(tracker.record(True))
         self.assertTrue(tracker.record(True))
 
+    def test_confirmation_requires_same_identity(self):
+        tracker = ConfirmationTracker(ConfirmationPolicy(3, 2))
+
+        self.assertFalse(tracker.record(True, "roque_right-thumb"))
+        self.assertFalse(tracker.record(True, "roque_right-index-finger"))
+        self.assertEqual(tracker.last_reset_reason, "identity_switch")
+        self.assertTrue(tracker.record(True, "roque_right-index-finger"))
+
+    def test_confirmation_reset_clears_identity(self):
+        tracker = ConfirmationTracker(ConfirmationPolicy(3, 2))
+
+        tracker.record(True, "roque_right-thumb")
+        tracker.reset("contact_end")
+
+        self.assertIsNone(tracker.identity)
+        self.assertEqual(tracker.last_reset_reason, "contact_end")
+
 
 class CaptureCoordinatorTests(unittest.TestCase):
     def test_complete_window_is_separate_from_matching(self):

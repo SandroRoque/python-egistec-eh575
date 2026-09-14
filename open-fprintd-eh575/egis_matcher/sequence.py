@@ -43,6 +43,11 @@ class TouchTracker:
         if max_references < 1 or max_frames < 1:
             raise ValueError("tracking limits must be positive")
         self.features = features or ImageFeatureExtractor(frame_spec=frame_spec)
+        # BFMatcher is stateless for these one-shot knn queries. Reuse the
+        # configured matcher across candidate registrations instead of
+        # constructing one for every live-frame/reference pair.
+        self._descriptor_matcher = cv2.BFMatcher(
+            self.features.descriptor_norm, crossCheck=False)
         self.frame_spec = frame_spec
         self.max_references = max_references
         self.ratio = ratio
@@ -136,8 +141,8 @@ class TouchTracker:
                               observation.descriptors, reference, reference_index)
 
     def _register(self, image, keypoints, descriptors, reference, reference_index):
-        matcher = cv2.BFMatcher(self.features.descriptor_norm, crossCheck=False)
-        pairs = matcher.knnMatch(descriptors, reference.descriptors, k=2)
+        pairs = self._descriptor_matcher.knnMatch(
+            descriptors, reference.descriptors, k=2)
         good = [pair[0] for pair in pairs if len(pair) == 2 and pair[0].distance < self.ratio * pair[1].distance]
         # Multiple live descriptors must not inflate support for one reference
         # feature. Keep only the best correspondence for each target.

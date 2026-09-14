@@ -12,6 +12,10 @@ _EXPORTS = {
     "FeatureAtlas": ("egis_matcher.atlas", "FeatureAtlas"),
     "StreamingAtlasMatcher": ("egis_matcher.atlas", "StreamingAtlasMatcher"),
     "passes_thresholds": ("egis_matcher.policy", "passes_thresholds"),
+    "FingerprintFeatureExtractor": ("egis_matcher.fingerprint_features", "FingerprintFeatureExtractor"),
+    "FingerprintMatcher": ("egis_matcher.fingerprint_matcher", "FingerprintMatcher"),
+    "FingerprintTemplate": ("egis_matcher.fingerprint_matcher", "FingerprintTemplate"),
+    "Minutia": ("egis_matcher.fingerprint_features", "Minutia"),
 }
 
 __all__ = (
@@ -26,6 +30,10 @@ __all__ = (
     "FeatureAtlas",
     "StreamingAtlasMatcher",
     "passes_thresholds",
+    "FingerprintFeatureExtractor",
+    "FingerprintMatcher",
+    "FingerprintTemplate",
+    "Minutia",
 )
 
 

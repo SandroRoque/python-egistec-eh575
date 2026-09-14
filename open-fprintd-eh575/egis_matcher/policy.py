@@ -33,17 +33,21 @@ def passes_thresholds(metrics: Mapping, thresholds: Mapping):
 class ConfirmationPolicy:
     frames_per_attempt: int = 3
     required_consecutive_accepts: int = 2
+    require_same_identity: bool = True
 
     def __post_init__(self):
         if self.frames_per_attempt < 1:
             raise ValueError("frames_per_attempt must be positive")
         if self.required_consecutive_accepts < 1:
             raise ValueError("required_consecutive_accepts must be positive")
+        if not isinstance(self.require_same_identity, bool):
+            raise ValueError("require_same_identity must be boolean")
 
     def to_dict(self):
         return {
             "frames_per_attempt": self.frames_per_attempt,
             "required_consecutive_accepts": self.required_consecutive_accepts,
+            "require_same_identity": self.require_same_identity,
         }
 
 
@@ -51,10 +55,29 @@ class ConfirmationTracker:
     def __init__(self, policy=None):
         self.policy = policy or ConfirmationPolicy()
         self.consecutive_accepts = 0
+        self.identity = None
+        self.previous_identity = None
+        self.last_reset_reason = None
 
-    def record(self, accepted):
-        self.consecutive_accepts = self.consecutive_accepts + 1 if accepted else 0
+    def record(self, accepted, identity=None):
+        if not accepted:
+            self.reset("not_accepted")
+            return False
+        if self.policy.require_same_identity:
+            if self.identity is not None and identity != self.identity:
+                previous = self.identity
+                self.reset("identity_switch")
+                self.previous_identity = previous
+                self.identity = identity
+                self.consecutive_accepts = 1
+                self.last_reset_reason = "identity_switch"
+                return False
+            self.identity = identity
+        self.last_reset_reason = None
+        self.consecutive_accepts += 1
         return self.consecutive_accepts >= self.policy.required_consecutive_accepts
 
-    def reset(self):
+    def reset(self, reason="reset"):
         self.consecutive_accepts = 0
+        self.identity = None
+        self.last_reset_reason = reason

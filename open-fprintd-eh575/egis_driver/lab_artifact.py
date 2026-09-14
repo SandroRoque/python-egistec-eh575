@@ -13,7 +13,8 @@ from egis_driver.evaluation import sha256_file, tree_digest
 PAYLOAD_EXECUTABLES = ("open-fprintd", "egis-bridge", "egis-calibrate")
 PRODUCTION_CONFIRMATION_POLICY = {
     "frames_per_attempt": 3,
-    "required_consecutive_accepts": 2,
+    "required_consecutive_accepts": 3,
+    "require_same_identity": True,
 }
 
 

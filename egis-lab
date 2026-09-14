@@ -3,12 +3,14 @@ import argparse
 import cv2
 import hashlib
 import json
+import numpy as np
 import os
 import pwd
 import shutil
 import subprocess
 import sys
 import time
+import usb.util
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,11 +21,16 @@ from egis_driver.evaluation import evaluate, sha256_file, write_report
 from egis_driver.lab_artifact import build_candidate
 from egis_driver.compatibility import doctor_report, public_compatibility_report
 from egis_driver.egis_driver import EgisDriver
+from egis_driver.fingerprint_matcher import FingerprintMatcher as ProductionMatcher
+from egis_driver.persistence import Persistence
 from egis_driver.sequence_recording import SequenceRecorder, load_sequence
 from egis_driver.streaming import CapturePump
 from egis_driver.atlas_storage import load_atlas, save_atlas, write_private_json
 from egis_driver.sequence_evaluation import enroll_sequences, evaluate_sequence, sequence_events
 from egis_matcher.sequence import TouchTracker
+from egis_matcher.fingerprint_matcher import FingerprintMatcher, FINGERPRINT_MATCHER_VERSION
+from egis_driver.sequence_evaluation import read_touch
+from egis_driver.streaming import FrameStatus
 
 
 LAB_ROOT = ROOT / ".egis-lab"
@@ -172,6 +179,7 @@ def cmd_record_sequence(args):
     subprocess.run(["systemctl", "stop", "egis-bridge"], check=True)
     recorder = None
     pump = None
+    driver = None
     try:
         driver = EgisDriver()
         recorder = SequenceRecorder(destination, metadata={
@@ -180,6 +188,10 @@ def cmd_record_sequence(args):
             "finger": args.finger,
             "source_commit": commit,
             "sensor_profile": driver.profile.name,
+            **({"session_id": args.session_id,
+                "attempt": args.attempt,
+                "capture_order": args.capture_order}
+               if hasattr(args, "session_id") else {}),
         }).start()
         print(
             f"Recording {args.role} sequence '{args.label}' "
@@ -256,7 +268,242 @@ def cmd_record_sequence(args):
         if recorder is not None:
             recorder.abort()
             _chown_tree(destination, account.pw_uid, account.pw_gid)
+        if driver is not None:
+            try:
+                usb.util.dispose_resources(driver.dev)
+            except Exception:
+                pass
         subprocess.run(["systemctl", "start", "egis-bridge"], check=False)
+
+
+FINGER_ORDER = (
+    "right-index-finger", "left-index-finger",
+    "right-thumb", "left-thumb",
+)
+ALL_FINGERS = FINGER_ORDER + ("right-pinky", "left-pinky")
+
+
+def _latest_sequence(label):
+    matches = sorted(
+        (path for path in (LAB_ROOT / "sequences").glob(f"*-{label}")
+         if path.is_dir() and (path / "manifest.json").is_file()),
+        key=lambda path: path.stat().st_mtime,
+    )
+    return matches[-1] if matches else None
+
+
+def _sequence_quality(path):
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    events = manifest.get("events", [])
+    valid = sum(event.get("status") == "valid" for event in events)
+    clean = bool(
+        manifest.get("complete") and
+        not manifest.get("recorder_dropped", 0) and
+        not any(event.get("status") == "io-error" for event in events)
+    )
+    return {"path": str(path), "valid_frames": valid, "clean": clean}
+
+
+def cmd_capture_enrollment_session(args):
+    session = args.session_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    finger_order = tuple(getattr(args, "fingers", FINGER_ORDER))
+    role = getattr(args, "role", "enrollment")
+    max_captures = None if args.max_captures == 0 else args.max_captures
+    if max_captures is not None and max_captures < args.min_captures:
+        raise SystemExit("--max-captures must be at least --min-captures")
+    print(
+        f"Guided {role} session. Each touch is saved privately.", flush=True)
+    print(f"Session ID: {session}", flush=True)
+    for finger in finger_order:
+        existing = []
+        for path in sorted((LAB_ROOT / "sequences").glob(f"*-{session}-{finger}-{role}-*")):
+            manifest_path = path / "manifest.json"
+            if manifest_path.is_file():
+                existing.append(_sequence_quality(path))
+        accepted = [item for item in existing if item["clean"] and
+                    item["valid_frames"] >= args.min_valid_frames]
+        attempt = len(existing)
+        if len(accepted) >= args.min_captures:
+            print(f"{finger}: already has enough clean recordings; advancing.", flush=True)
+            continue
+        while max_captures is None or attempt < max_captures:
+            attempt += 1
+            label = f"{session}-{finger}-{role}-{attempt}"
+            print("\n" + "=" * 68, flush=True)
+            print(f"NEXT FINGER: {finger.upper()}", flush=True)
+            print(f"Attempt {attempt}; place only that finger on the sensor.", flush=True)
+            input("Press Enter when you have read this and are ready: ")
+            record_args = argparse.Namespace(
+                label=label, finger=finger, role=role,
+                max_seconds=args.max_seconds,
+                session_id=session,
+                attempt=attempt,
+                capture_order=finger_order.index(finger) + 1,
+            )
+            for retry in range(3):
+                try:
+                    result = cmd_record_sequence(record_args)
+                    break
+                except Exception as error:
+                    if "Resource busy" not in str(error) or retry == 2:
+                        raise
+                    wait = 1.0 + retry
+                    print(
+                        f"Sensor is still busy; waiting {wait:.1f}s before retry "
+                        f"({retry + 1}/3)...", flush=True)
+                    time.sleep(wait)
+            path = _latest_sequence(label)
+            if path is None:
+                raise SystemExit(f"recording did not produce a sequence: {label}")
+            quality = _sequence_quality(path)
+            if quality["clean"] and quality["valid_frames"] >= args.min_valid_frames:
+                accepted.append(quality)
+                print(
+                    f"Accepted {finger}: {quality['valid_frames']} valid frame(s) "
+                    f"({len(accepted)}/{args.min_captures} minimum).", flush=True)
+            else:
+                print(
+                    f"Retained but not counted as clean: {quality['valid_frames']} "
+                    "valid frame(s); repeat this finger.", flush=True)
+            print(
+                f"Lift your {finger.replace('-', ' ')} completely off the sensor.",
+                flush=True)
+            time.sleep(args.release_delay)
+            input("Press Enter after your finger is lifted and you have seen the next prompt: ")
+            stable = (
+                len(accepted) >= args.min_captures and
+                len(accepted) >= args.stable_captures and
+                all(item["valid_frames"] >= args.min_valid_frames
+                    for item in accepted[-args.stable_captures:])
+            )
+            if stable:
+                print(f"{finger}: quality target reached; advancing.", flush=True)
+                break
+            if result not in (0, 2):
+                raise SystemExit(f"recording failed for {label}")
+        else:
+            print(f"{finger}: capture limit reached; advancing.", flush=True)
+        if len(accepted) < args.min_captures:
+            print(
+                f"WARNING: {finger} has only {len(accepted)} clean recording(s).",
+                flush=True)
+    print(f"\n{role.title()} session complete. Raw sequences retained privately.", flush=True)
+    return 0
+
+
+def cmd_prepare_enrollment_session(args):
+    root = _private_lab_path(args.output)
+    root.mkdir(parents=True, exist_ok=True)
+    grouped = {finger: [] for finger in FINGER_ORDER}
+    for path in sorted((LAB_ROOT / "sequences").glob("*")):
+        manifest_path = path / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        metadata = manifest.get("metadata", {})
+        if metadata.get("session_id") != args.session_id:
+            continue
+        finger = metadata.get("finger")
+        if finger in grouped:
+            grouped[finger].append((_sequence_quality(path), path))
+    matrix = []
+    atlases = {}
+    for finger, entries in grouped.items():
+        if len(entries) < 2:
+            raise SystemExit(
+                f"session {args.session_id} needs at least two recordings for {finger}")
+        entries.sort(key=lambda item: item[1].name)
+        probe = entries[-1][1]
+        enrollment = [path for _, path in entries[:-1]]
+        atlas, sources = enroll_sequences(enrollment, finger=finger)
+        atlas_dir = root / finger
+        save_atlas(atlas, atlas_dir, sources, finger=finger)
+        atlases[finger] = str(atlas_dir)
+        matrix.append({
+            "target_finger": finger,
+            "probe": str(probe),
+            "expected": "genuine",
+        })
+        for other in FINGER_ORDER:
+            if other == finger:
+                continue
+            other_entries = grouped[other]
+            other_entries.sort(key=lambda item: item[1].name)
+            matrix.append({
+                "target_finger": finger,
+                "probe": str(other_entries[-1][1]),
+                "probe_finger": other,
+                "expected": "impostor",
+            })
+    manifest = {
+        "schema_version": 1,
+        "session_id": args.session_id,
+        "atlases": atlases,
+        "replays": matrix,
+    }
+    output = root / "replay-matrix.json"
+    output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    output.chmod(0o600)
+    print(output)
+    return 0
+
+
+def cmd_install_enrollment_session(args):
+    if os.geteuid() != 0:
+        raise SystemExit(
+            "Run with: sudo ./egis-lab install-enrollment-session SESSION_ID")
+    username = args.username or os.environ.get("SUDO_USER")
+    if not username or username == "root":
+        raise SystemExit("A non-root username is required")
+    grouped = {finger: [] for finger in FINGER_ORDER}
+    for path in sorted((LAB_ROOT / "sequences").glob("*")):
+        manifest_path = path / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        metadata = manifest.get("metadata", {})
+        finger = metadata.get("finger")
+        if (metadata.get("session_id") != args.session_id or
+                metadata.get("role") != "enrollment" or finger not in grouped):
+            continue
+        _, messages, _ = read_touch(
+            path, require_complete=True, allow_timeout=True)
+        frames = [message.pixels for message in messages
+                  if message.status is FrameStatus.VALID]
+        indices = np.linspace(0, len(frames) - 1, min(24, len(frames)), dtype=int)
+        grouped[finger].append([frames[index] for index in indices])
+    missing = [finger for finger, touches in grouped.items() if len(touches) < 3]
+    if missing:
+        raise SystemExit(
+            f"session {args.session_id} lacks three trusted touches for: " +
+            ", ".join(missing))
+
+    enrollment = Path("/var/lib/open-fprintd/egis")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = enrollment.with_name(f"egis.pre-schema5.{stamp}")
+    failed = enrollment.with_name(f"egis.failed-schema5.{stamp}")
+    subprocess.run(["systemctl", "stop", "egis-bridge", "open-fprintd"], check=True)
+    try:
+        if enrollment.exists():
+            os.replace(enrollment, backup)
+        enrollment.mkdir(mode=0o700, parents=True)
+        matcher = ProductionMatcher(Persistence("/var/lib/open-fprintd"))
+        for finger in FINGER_ORDER:
+            if not matcher.enroll_finger(
+                    f"{username}_{finger}", grouped[finger]):
+                raise RuntimeError(f"failed to build production template for {finger}")
+        print(f"Installed schema-5 templates for {username}: {', '.join(FINGER_ORDER)}")
+        print(f"Previous templates: {backup}")
+    except BaseException:
+        if enrollment.exists():
+            os.replace(enrollment, failed)
+        if backup.exists():
+            os.replace(backup, enrollment)
+        raise
+    finally:
+        subprocess.run(["systemctl", "start", "open-fprintd", "egis-bridge"],
+                       check=False)
+    return 0
 
 
 def cmd_analyze_sequence(args):
@@ -351,6 +598,72 @@ def cmd_match_sequence(args):
         "candidate_match", "candidate_correct", "time_to_evidence_capture_ms",
         "processing_p95_ms", "source_complete", "atlas_finger", "probe_finger")},
         indent=2, sort_keys=True))
+    print(output)
+
+
+def _valid_sequence_frames(directory):
+    directory = Path(directory)
+    if not (directory / "manifest.json").is_file() or not (directory / "frames.bin").is_file():
+        raise ValueError(
+            f"sequence directory is missing manifest.json or frames.bin: {directory}"
+        )
+    manifest, messages, spec = read_touch(directory)
+    frames = [message.pixels for message in messages
+              if message.status is FrameStatus.VALID]
+    # A sequence contains hundreds of near-identical sensor frames.  Keep a
+    # deterministic spread for the expensive skeleton/minutiae extraction so
+    # replay remains practical while retaining the full raw recording.
+    limit = 24
+    if len(frames) > limit:
+        indices = np.linspace(0, len(frames) - 1, limit, dtype=int)
+        frames = [frames[index] for index in indices]
+    return manifest, spec, frames
+
+
+def cmd_match_fingerprint_sequences(args):
+    matcher = FingerprintMatcher()
+    enrollment_frames = []
+    enrollment_sources = []
+    spec = None
+    for directory in args.enrollment:
+        manifest, current_spec, frames = _valid_sequence_frames(directory)
+        if spec is not None and current_spec != spec:
+            raise ValueError("enrollment sequences have different frame geometry")
+        spec = current_spec
+        enrollment_frames.extend(frames)
+        enrollment_sources.append({
+            "path": str(Path(directory).resolve()),
+            "finger": manifest.get("metadata", {}).get("finger"),
+            "frames": len(frames),
+        })
+    probe_manifest, probe_spec, probe_frames = _valid_sequence_frames(args.probe)
+    if spec != probe_spec:
+        raise ValueError("probe geometry differs from enrollment")
+    template = matcher.build_template(enrollment_frames)
+    result = matcher.match(probe_frames, template)
+    report = {
+        "schema_version": 1,
+        "experimental": True,
+        "promotable": False,
+        "matcher_version": FINGERPRINT_MATCHER_VERSION,
+        "candidate_match": result.matched,
+        "score": result.score,
+        "reason": result.reason,
+        "metrics": result.metrics,
+        "enrollment_sources": enrollment_sources,
+        "probe": {
+            "path": str(Path(args.probe).resolve()),
+            "finger": probe_manifest.get("metadata", {}).get("finger"),
+            "frames": len(probe_frames),
+        },
+    }
+    output = _private_lab_path(args.output or LAB_ROOT / "results" /
+                               f"fingerprint-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json")
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    write_private_json(output, report)
+    print("Experimental ridge/minutiae evidence; not a calibrated authentication result.")
+    print(json.dumps({key: report[key] for key in ("candidate_match", "score", "reason", "metrics")},
+                     indent=2, sort_keys=True))
     print(output)
 
 
@@ -479,8 +792,7 @@ def build_parser():
     record.add_argument("--label", required=True)
     record.add_argument(
         "--finger", required=True,
-        choices=("right-index-finger", "left-index-finger",
-                 "right-thumb", "left-thumb"),
+        choices=ALL_FINGERS,
     )
     record.add_argument(
         "--role",
@@ -489,6 +801,61 @@ def build_parser():
     )
     record.add_argument("--max-seconds", type=float, default=8.0)
     record.set_defaults(func=cmd_record_sequence)
+
+    session = sub.add_parser(
+        "capture-enrollment-session",
+        help="Guided quality-based enrollment for all four fingers",
+    )
+    session.add_argument("--min-captures", type=int, default=3)
+    session.add_argument(
+        "--max-captures", type=int, default=8,
+        help="per-finger safety cap; use 0 for uncapped collection",
+    )
+    session.add_argument("--min-valid-frames", type=int, default=100)
+    session.add_argument("--stable-captures", type=int, default=2)
+    session.add_argument("--release-delay", type=float, default=1.0)
+    session.add_argument("--max-seconds", type=float, default=8.0)
+    session.add_argument("--session-id", help="resume an existing guided session")
+    session.set_defaults(func=cmd_capture_enrollment_session)
+
+    impostors = sub.add_parser(
+        "capture-impostor-session",
+        help="Guided private capture of unenrolled impostor fingers",
+    )
+    impostors.add_argument(
+        "--fingers", nargs="+", choices=("right-pinky", "left-pinky"),
+        default=("right-pinky", "left-pinky"),
+    )
+    impostors.add_argument("--min-captures", type=int, default=3)
+    impostors.add_argument("--max-captures", type=int, default=8)
+    impostors.add_argument("--min-valid-frames", type=int, default=100)
+    impostors.add_argument("--stable-captures", type=int, default=2)
+    impostors.add_argument("--release-delay", type=float, default=1.0)
+    impostors.add_argument("--max-seconds", type=float, default=8.0)
+    impostors.add_argument("--session-id")
+    impostors.set_defaults(
+        func=cmd_capture_enrollment_session,
+        role="development",
+    )
+
+    prepare = sub.add_parser(
+        "prepare-enrollment-session",
+        help="Build four atlases and a cross-finger replay matrix from a session",
+    )
+    prepare.add_argument("session_id")
+    prepare.add_argument(
+        "--output", required=True,
+        help="private output directory under .egis-lab",
+    )
+    prepare.set_defaults(func=cmd_prepare_enrollment_session)
+
+    install_session = sub.add_parser(
+        "install-enrollment-session",
+        help="Replace live templates from a validated private guided session",
+    )
+    install_session.add_argument("session_id")
+    install_session.add_argument("--username")
+    install_session.set_defaults(func=cmd_install_enrollment_session)
 
     analyze = sub.add_parser(
         "analyze-sequence",
@@ -503,8 +870,7 @@ def build_parser():
     enroll_sequence.add_argument("sequences", nargs="+")
     enroll_sequence.add_argument(
         "--finger", required=True,
-        choices=("right-index-finger", "left-index-finger",
-                 "right-thumb", "left-thumb"),
+        choices=FINGER_ORDER,
     )
     enroll_sequence.add_argument("--output", required=True)
     enroll_sequence.set_defaults(func=cmd_enroll_sequences)
@@ -516,6 +882,16 @@ def build_parser():
     match_sequence.add_argument("--expected", choices=("genuine", "impostor"), required=True)
     match_sequence.add_argument("--output")
     match_sequence.set_defaults(func=cmd_match_sequence)
+
+    fingerprint_match = sub.add_parser(
+        "match-fingerprint-sequences",
+        help="Replay the experimental ridge/minutiae backend against private sequences",
+    )
+    fingerprint_match.add_argument("enrollment", nargs="+",
+                                   help="one or more private enrollment sequence directories")
+    fingerprint_match.add_argument("--probe", required=True)
+    fingerprint_match.add_argument("--output")
+    fingerprint_match.set_defaults(func=cmd_match_fingerprint_sequences)
 
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")

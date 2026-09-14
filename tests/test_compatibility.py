@@ -115,7 +115,7 @@ class PublicCompatibilityReportTests(unittest.TestCase):
                 "source_commit": "a" * 40,
                 "source_dirty": False,
                 "matcher_version": 5,
-                "template_schema_version": 4,
+                "template_schema_version": 5,
             },
             "platform": {
                 "distribution": {"id": "arch", "hostname": "private-host"},

@@ -37,7 +37,8 @@ greater than 250 ms.
 
 `baseline.json` and `username-index.json` remain historical experiments. Use
 `production-parity.json` for a candidate intended for promotion. It matches the
-live policy of three frames per attempt and two consecutive accepted attempts.
+live policy of three frames per attempt and three consecutive accepted attempts
+for the same identity.
 Reports record this policy, and candidate construction rejects reports that do
 not match it.
 
@@ -94,11 +95,29 @@ sudo ./egis-lab record-sequence --label right-thumb-enrollment \
   --finger right-thumb --role enrollment
 sudo ./egis-lab record-sequence --label left-thumb-enrollment \
   --finger left-thumb --role enrollment
+```
+
+For a guided run that avoids finger mix-ups, use the four-finger session. It
+names the required finger before every touch, waits for release, and retains
+all private attempts for quality-based selection:
+
+```bash
+sudo ./egis-lab capture-enrollment-session
+```
+
+The default requires three clean touches and uses an eight-attempt safety cap
+per finger. Use `--max-captures 12` or `--max-captures 0` to compare larger or
+uncapped collections. Afterward, prepare atlases and cross-finger replay data
+without recapturing impostors:
+
+```bash
+./egis-lab prepare-enrollment-session SESSION_ID \
+  --output .egis-lab/atlases/SESSION_ID
+```
 
 Record separate development probes for each enrolled finger and for cross-finger
 impostors. The probe metadata is checked against the atlas, so a genuine replay
 must use the atlas finger and an impostor replay must use a different one.
-```
 
 Move the finger to expose complementary overlapping regions during each touch.
 For each of the four fingers, record at least three separate enrollment touches
@@ -133,6 +152,32 @@ The incremental matcher reuses features and admits evidence only for new support
 regions with sufficient motion and consistent alignment. The report records each
 frame's reason, supported cells, admitted-frame count, experimental sufficiency,
 processing latency, and time to sufficient evidence along the capture timeline.
+
+The feature-specific ridge/minutiae backend can be replayed without touching the
+service or sensor. It produces private, versioned evidence only and is not an
+authentication decision:
+
+```bash
+./egis-lab match-fingerprint-sequences \
+  .egis-lab/sequences/ENROLLMENT-TOUCH-1 \
+  .egis-lab/sequences/ENROLLMENT-TOUCH-2 \
+  --probe .egis-lab/sequences/PROBE
+```
+
+The SIFT matcher remains the baseline. Compare false accepts, false rejects, and
+processing time on the same replay set before considering production integration.
+
+For unenrolled-finger impostor coverage, capture both pinkies with the guided
+private workflow. These recordings are development probes only and are never
+added to an atlas:
+
+```bash
+sudo ./egis-lab capture-impostor-session
+```
+
+Replay those probes against each of the four atlases before recalibrating
+production thresholds. A candidate must reject every pinky probe and must also
+require the same identity on consecutive confirmation attempts.
 Enrollment and replay record the algorithm source digest and OpenCV/NumPy versions
 so reports can be traced to the implementation that produced them.
 Processing time is also recorded separately: replay evaluates every recorded frame

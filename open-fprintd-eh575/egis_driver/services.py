@@ -21,7 +21,7 @@ logger = logging.getLogger("SERVICE")
 
 ENROLL_STAGES = 10
 VERIFY_FRAME_COUNT = 3
-VERIFY_CONFIRMATION_ATTEMPTS = 2
+VERIFY_CONFIRMATION_ATTEMPTS = 3
 PRODUCTION_CONFIRMATION_POLICY = ConfirmationPolicy(
     frames_per_attempt=VERIFY_FRAME_COUNT,
     required_consecutive_accepts=VERIFY_CONFIRMATION_ATTEMPTS,
@@ -894,9 +894,18 @@ class EgisService:
         if "_" in name_rest:
             confirmation.reset()
             return False
-        confirmed = confirmation.record(True)
+        confirmed = confirmation.record(True, identity=name_rest)
+        if confirmation.last_reset_reason == "identity_switch":
+            self._match_outcomes["reason:identity_switch"] += 1
+            logger.warning(
+                "Verification identity switch: previous=%s current=%s; "
+                "confirmation reset",
+                confirmation.previous_identity,
+                name_rest,
+            )
         logger.info(
-            "Verification confirmation %d/%d",
+            "Verification confirmation identity=%s %d/%d",
+            confirmation.identity,
             confirmation.consecutive_accepts,
             self._confirmation_policy.required_consecutive_accepts,
         )

@@ -146,7 +146,8 @@ class CandidateArtifactTests(unittest.TestCase):
                 "acceptance": {"max_latency_regression": 0.20},
                 "confirmation_policy": {
                     "frames_per_attempt": 3,
-                    "required_consecutive_accepts": 2,
+                    "required_consecutive_accepts": 3,
+                    "require_same_identity": True,
                 },
             },
         }

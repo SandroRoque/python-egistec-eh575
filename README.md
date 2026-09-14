@@ -76,18 +76,18 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 1. 10 touches, each captures continuously at ~29 FPS while finger is on sensor
 2. Quality-gated frame selection (contrast, sharpness, foreground, ridge clarity)
 3. SSIM-based near-duplicate removal
-4. Top ~40 diverse schema-v4 templates stored with SIFT descriptors, normalized image patches, and ridge-orientation descriptors
+4. Top ~40 diverse schema-v5 templates stored with SIFT descriptors, normalized image patches, and ridge-orientation descriptors; keypoints within five sensor pixels of the capture boundary are excluded
 
 ### Verification
 1. 3-frame ensemble capture per attempt
 2. FLANN/SIFT matching proposes candidate templates for the requested user and finger
 3. Each live frame is aligned independently with RANSAC
 4. Aligned patches are checked for image correlation and ridge-orientation consistency
-5. Acceptance requires the fixed identity policy, calibrated validation, and enough margin over competing enrolled fingers
+5. Acceptance requires three consecutive accepted attempts for the same identity, calibrated validation, and enough margin over competing enrolled fingers
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
-Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Existing schema-v4 enrollments remain compatible, but calibration thresholds from earlier matcher versions are rejected and must be regenerated. Older template schemas are ignored because they do not contain the image/ridge data needed for hardened verification.
+Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v5 enrollment is required so both stored and live SIFT features exclude the sensor boundary. Older template schemas are ignored.
 
 ## Installation
 
@@ -144,7 +144,11 @@ git pull
 sudo ./install-stable.sh
 ```
 
-Re-enrollment is required when the template schema changes. Matcher v5 can reuse schema-v4 enrollments, but requires calibration analysis to be rerun so validated matcher-v5 thresholds are written.
+Re-enrollment is required when the template schema changes. A trusted guided session can be installed without rescanning:
+
+```bash
+sudo ./egis-lab install-enrollment-session SESSION_ID --username USERNAME
+```
 
 ## Usage
 

@@ -64,6 +64,7 @@ def load_lab_config(path):
     policy = ConfirmationPolicy(
         frames_per_attempt=frames_per_attempt,
         required_consecutive_accepts=min_confirmed_attempts,
+        require_same_identity=bool(data.get("require_same_identity", True)),
     )
     return {
         "name": str(data.get("name") or Path(path).stem),
@@ -117,8 +118,9 @@ def _run_once(dataset_root, config):
             attempt_elapsed_ms.append(
                 (time.perf_counter() - attempt_started) * 1000.0
             )
+            identity, _ = decision.as_legacy_result()
             if passes_thresholds(stats.get("best", {}), config["thresholds"]):
-                if confirmation.record(True):
+                if confirmation.record(True, identity=identity):
                     confirmed_stats = stats
                     break
             else:

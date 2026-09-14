@@ -7,9 +7,10 @@ from egis_matcher.frame import FrameSpec
 class ImageFeatureExtractor:
     """Image preprocessing, local features, and ridge consistency metrics."""
 
-    def __init__(self, upscale_factor=2, frame_spec=None):
+    def __init__(self, upscale_factor=2, frame_spec=None, edge_margin=5):
         self.upscale_factor = upscale_factor
         self.frame_spec = frame_spec or FrameSpec(width=103, height=52)
+        self.edge_margin = int(edge_margin)
         self.detector = cv2.SIFT_create(
             nfeatures=0,
             nOctaveLayers=3,
@@ -37,12 +38,23 @@ class ImageFeatureExtractor:
             (w * self.upscale_factor, h * self.upscale_factor),
             interpolation=cv2.INTER_CUBIC,
         )
-        kp, des = self.detector.detectAndCompute(upscaled, None)
+        margin = self.edge_margin * self.upscale_factor
+        mask = np.full(upscaled.shape, 255, dtype=np.uint8)
+        mask[:margin, :] = 0
+        mask[-margin:, :] = 0
+        mask[:, :margin] = 0
+        mask[:, -margin:] = 0
+        kp, des = self.detector.detectAndCompute(upscaled, mask)
         if kp is not None:
             scale = 1.0 / self.upscale_factor
             for k in kp:
                 k.pt = (k.pt[0] * scale, k.pt[1] * scale)
                 k.size = k.size * scale
+            retained = [index for index, keypoint in enumerate(kp) if (
+                self.edge_margin <= keypoint.pt[0] < w - self.edge_margin and
+                self.edge_margin <= keypoint.pt[1] < h - self.edge_margin)]
+            kp = [kp[index] for index in retained]
+            des = des[retained] if des is not None and retained else None
         return kp, des
 
     def frame_quality(self, img):

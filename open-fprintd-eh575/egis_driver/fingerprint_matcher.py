@@ -12,7 +12,7 @@ from egis_matcher.template_builder import TemplateBuilder
 logger = logging.getLogger("MATCHER")
 
 MATCHER_VERSION = 5
-TEMPLATE_SCHEMA_VERSION = 4
+TEMPLATE_SCHEMA_VERSION = 5
 class FingerprintMatcher:
     def __init__(self, persistence=None, matcher_config=None, frame_spec=None):
         self.persistence = persistence or Persistence("/var/lib/open-fprintd")
