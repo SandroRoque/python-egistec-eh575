@@ -159,6 +159,23 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
                 default_thresholds,
             )
 
+    def test_enrollment_persists_production_touch_atlas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = self._matcher(tmp)
+            scene = np.random.default_rng(12).integers(
+                0, 256, size=(60, 150), dtype=np.uint8)
+            frames = [scene[:52, x:x + 103].tobytes() for x in (0, 12, 24, 36)]
+
+            self.assertTrue(matcher.enroll_finger(
+                "testuser_right-index-finger", [frames]))
+
+            atlas_path = os.path.join(
+                matcher.persistence.atlas_dir, "testuser_right-index-finger")
+            with np.load(os.path.join(atlas_path, "atlas.npz"),
+                         allow_pickle=False) as arrays:
+                self.assertFalse(any(name.startswith("raw_") for name in arrays.files))
+            self.assertIsNotNone(matcher.new_touch_identity_matcher("testuser"))
+
     def test_username_index_excludes_other_users_before_matching(self):
         with tempfile.TemporaryDirectory() as tmp:
             matcher = fingerprint_matcher.FingerprintMatcher(

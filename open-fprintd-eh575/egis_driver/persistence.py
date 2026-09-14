@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -16,6 +18,7 @@ class Persistence:
     def __init__(self, root_dir="/var/lib/open-fprintd"):
         self.root_dir = root_dir
         self.enroll_dir = os.path.join(root_dir, "egis")
+        self.atlas_dir = os.path.join(root_dir, "egis-atlas")
         self.calibration_dir = os.path.join(root_dir, "egis-calibration")
         self.sample_dir = os.path.join(self.calibration_dir, "samples")
         self._threshold_file = os.path.join(self.calibration_dir, "thresholds.json")
@@ -27,6 +30,7 @@ class Persistence:
 
     def ensure_dirs(self):
         os.makedirs(self.enroll_dir, mode=0o700, exist_ok=True)
+        os.makedirs(self.atlas_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.calibration_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.sample_dir, mode=0o700, exist_ok=True)
 
@@ -81,6 +85,37 @@ class Persistence:
                         os.remove(os.path.join(self.enroll_dir, sidecar))
                     except OSError:
                         pass
+
+    def replace_atlas(self, safe_name, atlas, save):
+        root = Path(self.atlas_dir)
+        target = root / safe_name
+        temporary = root / f".{safe_name}.tmp-{os.getpid()}"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        save(atlas, temporary)
+        old = root / f".{safe_name}.old-{os.getpid()}"
+        if target.exists():
+            os.replace(target, old)
+        try:
+            os.replace(temporary, target)
+        except BaseException:
+            if old.exists():
+                os.replace(old, target)
+            raise
+        if old.exists():
+            shutil.rmtree(old)
+
+    def atlas_paths(self):
+        root = Path(self.atlas_dir)
+        return sorted(path for path in root.iterdir() if path.is_dir() and
+                      not path.name.startswith("."))
+
+    def delete_atlases(self, safe_names):
+        root = Path(self.atlas_dir).resolve()
+        for safe_name in safe_names:
+            target = (root / safe_name).resolve()
+            if target.parent == root and target.is_dir():
+                shutil.rmtree(target)
 
     # ------------------------------------------------------------------
     #  Calibration thresholds

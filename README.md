@@ -76,7 +76,7 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 1. 10 touches, each captures continuously at ~29 FPS while finger is on sensor
 2. Quality-gated frame selection (contrast, sharpness, foreground, ridge clarity)
 3. SSIM-based near-duplicate removal
-4. Top ~40 diverse schema-v5 templates stored with SIFT descriptors, normalized image patches, and ridge-orientation descriptors; keypoints within five sensor pixels of the capture boundary are excluded
+4. Schema-v6 stores the hardened SIFT representation plus a derived touch atlas; production atlases omit raw capture frames
 
 ### Verification
 1. 3-frame ensemble capture per attempt
@@ -87,7 +87,7 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
-Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v5 enrollment is required so both stored and live SIFT features exclude the sensor boundary. Older template schemas are ignored.
+Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment includes a root-only derived touch atlas while excluding raw recorded sequences. Older template schemas are ignored.
 
 ## Installation
 

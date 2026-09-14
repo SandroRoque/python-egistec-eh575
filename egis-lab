@@ -480,14 +480,20 @@ def cmd_install_enrollment_session(args):
             ", ".join(missing))
 
     enrollment = Path("/var/lib/open-fprintd/egis")
+    atlas_root = Path("/var/lib/open-fprintd/egis-atlas")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = enrollment.with_name(f"egis.pre-schema5.{stamp}")
-    failed = enrollment.with_name(f"egis.failed-schema5.{stamp}")
+    backup = enrollment.with_name(f"egis.pre-schema6.{stamp}")
+    failed = enrollment.with_name(f"egis.failed-schema6.{stamp}")
+    atlas_backup = atlas_root.with_name(f"egis-atlas.pre-schema6.{stamp}")
+    atlas_failed = atlas_root.with_name(f"egis-atlas.failed-schema6.{stamp}")
     subprocess.run(["systemctl", "stop", "egis-bridge", "open-fprintd"], check=True)
     try:
         if enrollment.exists():
             os.replace(enrollment, backup)
+        if atlas_root.exists():
+            os.replace(atlas_root, atlas_backup)
         enrollment.mkdir(mode=0o700, parents=True)
+        atlas_root.mkdir(mode=0o700, parents=True)
         matcher = ProductionMatcher(Persistence("/var/lib/open-fprintd"))
         for finger in FINGER_ORDER:
             if not matcher.enroll_finger(
@@ -495,11 +501,17 @@ def cmd_install_enrollment_session(args):
                 raise RuntimeError(f"failed to build production template for {finger}")
         print(f"Installed schema-5 templates for {username}: {', '.join(FINGER_ORDER)}")
         print(f"Previous templates: {backup}")
+        if atlas_backup.exists():
+            print(f"Previous touch atlases: {atlas_backup}")
     except BaseException:
         if enrollment.exists():
             os.replace(enrollment, failed)
         if backup.exists():
             os.replace(backup, enrollment)
+        if atlas_root.exists():
+            os.replace(atlas_root, atlas_failed)
+        if atlas_backup.exists():
+            os.replace(atlas_backup, atlas_root)
         raise
     finally:
         subprocess.run(["systemctl", "start", "open-fprintd", "egis-bridge"],

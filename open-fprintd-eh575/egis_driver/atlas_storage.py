@@ -41,7 +41,8 @@ def write_private_json(path, data):
         stream.write("\n")
 
 
-def save_atlas(atlas, directory, sources, finger=None):
+def save_atlas(atlas, directory, sources, finger=None, *, experimental=True,
+               include_raw=True):
     if not atlas.keyframes:
         raise ValueError("enrollment produced no usable keyframes")
     directory = Path(directory)
@@ -50,7 +51,8 @@ def save_atlas(atlas, directory, sources, finger=None):
     frames = []
     for index, keyframe in enumerate(atlas.keyframes):
         item = keyframe.observation
-        arrays[f"raw_{index}"] = np.frombuffer(item.raw_frame, dtype=np.uint8)
+        if include_raw:
+            arrays[f"raw_{index}"] = np.frombuffer(item.raw_frame, dtype=np.uint8)
         arrays[f"image_{index}"] = item.image
         arrays[f"descriptors_{index}"] = item.descriptors
         arrays[f"points_{index}"] = np.float32([
@@ -72,7 +74,8 @@ def save_atlas(atlas, directory, sources, finger=None):
     manifest = {
         "schema_version": ATLAS_SCHEMA_VERSION,
         "matcher_version": SEQUENCE_MATCHER_VERSION,
-        "experimental": True,
+        "experimental": bool(experimental),
+        "contains_raw_frames": bool(include_raw),
         "implementation": implementation_fingerprint(),
         "frame_spec": asdict(atlas.frame_spec),
         "policy": asdict(atlas.policy),
@@ -86,7 +89,7 @@ def save_atlas(atlas, directory, sources, finger=None):
     return manifest
 
 
-def load_atlas(directory):
+def load_atlas(directory, *, require_experimental=True):
     directory = Path(directory)
     manifest_path = directory / "manifest.json"
     payload = directory / "atlas.npz"
@@ -95,7 +98,8 @@ def load_atlas(directory):
     manifest = json.loads(manifest_path.read_text())
     if (manifest.get("schema_version") != ATLAS_SCHEMA_VERSION or
             manifest.get("matcher_version") != SEQUENCE_MATCHER_VERSION or
-            manifest.get("experimental") is not True):
+            (require_experimental is not None and
+             manifest.get("experimental") is not require_experimental)):
         raise ValueError("unsupported atlas schema or matcher version; re-enroll")
     if hashlib.sha256(payload.read_bytes()).hexdigest() != manifest["payload_sha256"]:
         raise ValueError("atlas checksum mismatch")
@@ -112,12 +116,14 @@ def load_atlas(directory):
     atlas = FeatureAtlas(spec, policy)
     with np.load(payload, allow_pickle=False) as arrays:
         for index, frame in enumerate(frames):
-            raw = arrays[f"raw_{index}"]
+            raw = arrays[f"raw_{index}"] if manifest.get(
+                "contains_raw_frames", True) else None
             image = arrays[f"image_{index}"]
             descriptors = arrays[f"descriptors_{index}"]
             points = arrays[f"points_{index}"]
             transform = arrays[f"transform_{index}"]
-            if (raw.dtype != np.uint8 or raw.shape != (spec.byte_count,) or
+            if ((raw is not None and
+                 (raw.dtype != np.uint8 or raw.shape != (spec.byte_count,))) or
                     image.dtype != np.uint8 or image.shape != (spec.height, spec.width) or
                     points.ndim != 2 or points.shape[1] != 7 or
                     not policy.min_features <= len(points) <= 10000 or
@@ -138,7 +144,7 @@ def load_atlas(directory):
                 transform.astype(np.float32))
             observation = TrackedObservation(
                 int(frame["sequence"]), image, keypoints, descriptors,
-                quality, registration, raw.tobytes())
+                quality, registration, raw.tobytes() if raw is not None else None)
             keyframe = AtlasKeyframe(int(frame["touch"]), observation)
             atlas.keyframes.append(keyframe)
             atlas._coverage.setdefault(keyframe.component, set()).update(

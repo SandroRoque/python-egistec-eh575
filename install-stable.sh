@@ -146,7 +146,8 @@ for index in "${!CONFIG_TARGETS[@]}"; do
     "${CONFIG_TARGETS[$index]}"
 done
 
-install -d -m 0700 "$DATA_ROOT/egis" "$DATA_ROOT/egis-calibration"
+install -d -m 0700 "$DATA_ROOT/egis" "$DATA_ROOT/egis-atlas" \
+  "$DATA_ROOT/egis-calibration"
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=usb
 systemctl daemon-reload

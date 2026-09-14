@@ -153,6 +153,21 @@ class AtlasTests(unittest.TestCase):
             matcher.observe(self.frames[0])
             self.assertTrue(matcher.observe(self.frames[1])["evidence_sufficient"])
 
+    def test_production_atlas_omits_raw_frames_and_round_trips(self):
+        atlas = build_atlas(self.frames)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "atlas"
+            manifest = save_atlas(
+                atlas, directory, [], finger="user_right-index-finger",
+                experimental=False, include_raw=False)
+            self.assertFalse(manifest["contains_raw_frames"])
+            with np.load(directory / "atlas.npz", allow_pickle=False) as arrays:
+                self.assertFalse(any(name.startswith("raw_") for name in arrays.files))
+            restored, _ = load_atlas(directory, require_experimental=False)
+            self.assertTrue(restored.keyframes)
+            self.assertTrue(all(item.observation.raw_frame is None
+                                for item in restored.keyframes))
+
     def test_atlas_checksum_and_version_mismatch_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "atlas"
