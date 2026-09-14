@@ -8,6 +8,7 @@ import pwd
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -179,12 +180,54 @@ def cmd_record_sequence(args):
             "source_commit": commit,
             "sensor_profile": driver.profile.name,
         }).start()
-        print("Touch and move the requested finger across the sensor.")
+        print(
+            f"Recording {args.role} sequence '{args.label}' "
+            f"(up to {args.max_seconds:.1f}s).",
+            flush=True,
+        )
+        print("Waiting for contact...", flush=True)
         initial = None
+        wait_started = time.monotonic()
         while initial is None:
             frame, contrast, present = driver.capture_presence_frame()
             if present:
                 initial = frame, contrast
+                print(
+                    f"Contact detected (contrast={contrast:.1f}); "
+                    "move your finger across the sensor.",
+                    flush=True,
+                )
+            elif time.monotonic() - wait_started >= 1.0:
+                print("Still waiting for contact...", flush=True)
+                wait_started = time.monotonic()
+
+        progress = {"valid": 0, "last_report": time.monotonic()}
+
+        def observe(message):
+            accepted = recorder.observe(message)
+            now = time.monotonic()
+            if message.status.value == "valid":
+                progress["valid"] += 1
+            if message.dropped_before:
+                print(
+                    f"Capture queue dropped {message.dropped_before} frame(s); "
+                    "recording marked incomplete.",
+                    flush=True,
+                )
+            if message.status.value == "contact_end":
+                print(
+                    f"Contact released; captured {progress['valid']} valid frame(s).",
+                    flush=True,
+                )
+            elif (message.status.value == "valid" and
+                  now - progress["last_report"] >= 0.5):
+                print(
+                    f"Capturing... {progress['valid']} valid frame(s)",
+                    flush=True,
+                )
+                progress["last_report"] = now
+            return accepted
+
         pump = CapturePump(
             driver,
             driver.frame_spec,
@@ -192,7 +235,7 @@ def cmd_record_sequence(args):
             capture_epoch=1,
             initial_frame=initial[0],
             initial_contrast=initial[1],
-            on_message=recorder.observe,
+            on_message=observe,
         ).start()
         complete = pump.wait(timeout=args.max_seconds)
         pump.stop()
@@ -202,7 +245,11 @@ def cmd_record_sequence(args):
         recorder.close(complete=complete)
         recorder = None
         _chown_tree(destination, account.pw_uid, account.pw_gid)
-        print(destination)
+        print(
+            f"Sequence saved: {destination} "
+            f"({progress['valid']} valid frame(s), complete={complete})",
+            flush=True,
+        )
         return 0 if complete else 2
     finally:
         if pump is not None:
