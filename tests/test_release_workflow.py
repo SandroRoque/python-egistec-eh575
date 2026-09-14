@@ -139,6 +139,21 @@ class RepositoryGuardTests(unittest.TestCase):
         self.assertTrue(any("absolute home path" in error for error in errors))
         self.assertTrue(any("forbidden capture" in error for error in errors))
 
+    def test_textual_capture_exports_are_rejected_by_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "wireshark" / "capture.csv"
+            capture.parent.mkdir()
+            capture.write_text("packet,payload\n1,deadbeef\n")
+
+            errors = guard.inspect_files(
+                [Path("wireshark/capture.csv")], root)
+
+        self.assertEqual(
+            errors,
+            ["generated/private path is tracked: wireshark/capture.csv"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

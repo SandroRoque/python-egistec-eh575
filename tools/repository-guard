@@ -6,7 +6,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN_PARTS = {".egis-lab", "dist", "__pycache__", ".egistec"}
+FORBIDDEN_PARTS = {
+    ".egis-lab", ".egistec", "__pycache__", "continuous_scans", "dist",
+    "wireshark",
+}
 FORBIDDEN_SUFFIXES = {
     ".bin", ".key", ".npy", ".npz", ".p12", ".pcap", ".pcapng",
     ".pem", ".pyc", ".raw", ".tar", ".tar.gz", ".tar.xz", ".zip",
