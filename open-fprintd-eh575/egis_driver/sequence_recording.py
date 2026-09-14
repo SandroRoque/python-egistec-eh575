@@ -1,5 +1,6 @@
 import json
 import os
+import math
 import queue
 import threading
 from dataclasses import asdict
@@ -95,9 +96,17 @@ class SequenceRecorder:
 
 def load_sequence(directory):
     directory = Path(directory)
+    if ((directory / "manifest.json").stat().st_size > 8 * 1024 * 1024 or
+            (directory / "frames.bin").stat().st_size > 64 * 1024 * 1024):
+        raise ValueError("sequence exceeds replay size budget")
     manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("schema_version") != 1 or len(manifest.get("events", [])) > 4096:
+        raise ValueError("unsupported sequence schema or event count")
     frame_data = (directory / "frames.bin").read_bytes()
     messages = []
+    expected_offset = 0
+    previous_sequence = 0
+    previous_finished = -math.inf
     for stored_event in manifest["events"]:
         event = dict(stored_event)
         frame = event["frame_spec"]
@@ -105,6 +114,29 @@ def load_sequence(directory):
         length = int(event.pop("length"))
         event["frame_spec"] = FrameSpec(**frame)
         event["status"] = FrameStatus(event["status"])
+        spec = event["frame_spec"]
+        if (spec.dtype != "uint8" or not 0 < spec.width <= 1024 or
+                not 0 < spec.height <= 1024):
+            raise ValueError("invalid sequence frame geometry")
+        if (offset != expected_offset or length < 0 or offset + length > len(frame_data) or
+                event["observed_bytes"] != length):
+            raise ValueError("sequence frame offsets or lengths are corrupt")
+        if event["status"] in {FrameStatus.VALID, FrameStatus.NO_CONTACT}:
+            if length != spec.byte_count:
+                raise ValueError("sequence contains a truncated frame")
+        elif event["status"] is not FrameStatus.IO_ERROR and length != 0:
+            raise ValueError("terminal sequence event contains pixels")
+        if (event["sequence"] <= previous_sequence or event["dropped_before"] < 0 or
+                not all(math.isfinite(event[key]) for key in (
+                    "captured_started", "captured_finished", "contrast")) or
+                event["captured_started"] < previous_finished or
+                event["captured_finished"] < event["captured_started"]):
+            raise ValueError("sequence order or timestamps are corrupt")
+        previous_sequence = event["sequence"]
+        previous_finished = event["captured_finished"]
+        expected_offset = offset + length
         event["pixels"] = frame_data[offset:offset + length] or None
         messages.append(FrameMessage(**event))
+    if expected_offset != len(frame_data):
+        raise ValueError("sequence has unreferenced trailing frame bytes")
     return manifest, messages

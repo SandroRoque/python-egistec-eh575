@@ -20,6 +20,8 @@ from egis_driver.compatibility import doctor_report, public_compatibility_report
 from egis_driver.egis_driver import EgisDriver
 from egis_driver.sequence_recording import SequenceRecorder, load_sequence
 from egis_driver.streaming import CapturePump
+from egis_driver.atlas_storage import load_atlas, save_atlas, write_private_json
+from egis_driver.sequence_evaluation import enroll_sequences, evaluate_sequence, sequence_events
 from egis_matcher.sequence import TouchTracker
 
 
@@ -222,15 +224,8 @@ def cmd_analyze_sequence(args):
         raise SystemExit("sequence changes frame geometry")
     tracker = TouchTracker(spec)
     observations = []
-    previous_sequence = None
-    for message in messages:
-        discontinuity = (
-            message.dropped_before > 0 or
-            (previous_sequence is not None and
-             message.sequence != previous_sequence + 1)
-        )
-        previous_sequence = message.sequence
-        if discontinuity:
+    for message, boundary in sequence_events(messages):
+        if boundary:
             tracker.discontinuity()
         if message.status.value != "valid":
             continue
@@ -278,6 +273,38 @@ def cmd_analyze_sequence(args):
     report_path.chmod(0o600)
     print(report_path)
     return 0
+
+
+def _private_lab_path(value):
+    path = Path(value).resolve()
+    if not path.is_relative_to(LAB_ROOT.resolve()) or path == LAB_ROOT.resolve():
+        raise ValueError("atlas artifacts and reports must stay under .egis-lab")
+    LAB_ROOT.mkdir(mode=0o700, exist_ok=True)
+    LAB_ROOT.chmod(0o700)
+    return path
+
+
+def cmd_enroll_sequences(args):
+    output = _private_lab_path(args.output)
+    atlas, sources = enroll_sequences(args.sequences)
+    manifest = save_atlas(atlas, output, sources)
+    print(json.dumps(manifest["summary"], indent=2, sort_keys=True))
+    print(output)
+
+
+def cmd_match_sequence(args):
+    atlas, atlas_manifest = load_atlas(args.atlas)
+    report = evaluate_sequence(atlas, atlas_manifest, args.sequence, args.expected)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output = _private_lab_path(
+        args.output or LAB_ROOT / "results" / f"sequence-{stamp}.json")
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    write_private_json(output, report)
+    print("Experimental spatial evidence; not a calibrated authentication result.")
+    print(json.dumps({key: report[key] for key in (
+        "candidate_match", "candidate_correct", "time_to_evidence_capture_ms",
+        "processing_p95_ms", "source_complete")}, indent=2, sort_keys=True))
+    print(output)
 
 
 def _resolve_dataset(value):
@@ -413,6 +440,20 @@ def build_parser():
     analyze.add_argument("--output")
     analyze.set_defaults(func=cmd_analyze_sequence)
 
+    enroll_sequence = sub.add_parser(
+        "enroll-sequences", help="Build a private experimental atlas from enrollment touches")
+    enroll_sequence.add_argument("sequences", nargs="+")
+    enroll_sequence.add_argument("--output", required=True)
+    enroll_sequence.set_defaults(func=cmd_enroll_sequences)
+
+    match_sequence = sub.add_parser(
+        "match-sequence", help="Replay spatial matching against an experimental atlas")
+    match_sequence.add_argument("sequence")
+    match_sequence.add_argument("--atlas", required=True)
+    match_sequence.add_argument("--expected", choices=("genuine", "impostor"), required=True)
+    match_sequence.add_argument("--output")
+    match_sequence.set_defaults(func=cmd_match_sequence)
+
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")
     evaluate_p.add_argument("--config", default=str(ROOT / "lab-configs/baseline.json"))
@@ -450,6 +491,8 @@ def main():
         return args.func(args) or 0
     except KeyboardInterrupt:
         return 130
+    except (ValueError, FileExistsError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

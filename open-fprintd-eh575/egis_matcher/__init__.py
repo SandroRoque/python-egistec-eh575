@@ -9,6 +9,8 @@ _EXPORTS = {
     "MatcherCore": ("egis_matcher.core", "MatcherCore"),
     "MatcherConfig": ("egis_matcher.matcher_config", "MatcherConfig"),
     "TouchTracker": ("egis_matcher.sequence", "TouchTracker"),
+    "FeatureAtlas": ("egis_matcher.atlas", "FeatureAtlas"),
+    "StreamingAtlasMatcher": ("egis_matcher.atlas", "StreamingAtlasMatcher"),
     "passes_thresholds": ("egis_matcher.policy", "passes_thresholds"),
 }
 
@@ -21,6 +23,8 @@ __all__ = (
     "MatcherCore",
     "MatcherConfig",
     "TouchTracker",
+    "FeatureAtlas",
+    "StreamingAtlasMatcher",
     "passes_thresholds",
 )
 

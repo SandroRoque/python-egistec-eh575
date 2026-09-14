@@ -41,6 +41,15 @@ class SequenceTrackingTests(unittest.TestCase):
                             second.registration.component)
         self.assertEqual(tracker.summary()["discontinuities"], 1)
 
+    def test_later_frames_cannot_reconnect_across_a_discontinuity(self):
+        tracker = TouchTracker(self.spec)
+        tracker.observe(self.image.tobytes(), 1)
+        tracker.discontinuity()
+        tracker.observe(bytes(self.spec.byte_count), 3)
+        later = tracker.observe(self.image.tobytes(), 4)
+        self.assertIsNone(later.registration.reference)
+        self.assertNotEqual(later.registration.component, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

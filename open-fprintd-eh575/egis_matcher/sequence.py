@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -20,6 +20,7 @@ class Registration:
     spatial_cells: int = 0
     confidence: float = 0.0
     reason: str | None = None
+    target_indices: tuple[int, ...] = ()
 
 
 @dataclass
@@ -30,6 +31,7 @@ class TrackedObservation:
     descriptors: np.ndarray | None
     quality: float
     registration: Registration
+    raw_frame: bytes | None = None
 
 
 class TouchTracker:
@@ -37,7 +39,9 @@ class TouchTracker:
 
     def __init__(self, frame_spec, features=None, max_references=3,
                  ratio=0.75, min_inliers=6, min_inlier_ratio=0.35,
-                 min_spatial_cells=3, min_ridge_score=0.25):
+                 min_spatial_cells=3, min_ridge_score=0.25, max_frames=512):
+        if max_references < 1 or max_frames < 1:
+            raise ValueError("tracking limits must be positive")
         self.features = features or ImageFeatureExtractor(frame_spec=frame_spec)
         self.frame_spec = frame_spec
         self.max_references = max_references
@@ -46,33 +50,44 @@ class TouchTracker:
         self.min_inlier_ratio = min_inlier_ratio
         self.min_spatial_cells = min_spatial_cells
         self.min_ridge_score = min_ridge_score
+        self.max_frames = max_frames
         self.observations = []
         self.discontinuities = 0
         self._next_component = 0
         self._force_component = False
+        self._reference_floor = 0
 
     def begin_touch(self):
         self.observations = []
         self.discontinuities = 0
         self._next_component = 0
         self._force_component = False
+        self._reference_floor = 0
 
     def discontinuity(self):
         self.discontinuities += 1
         self._force_component = True
+        self._reference_floor = len(self.observations)
 
     def end_touch(self):
         return self.summary()
 
     def observe(self, raw_frame, sequence=None):
+        if len(raw_frame) != self.frame_spec.byte_count:
+            raise ValueError("invalid sequence frame size")
+        if len(self.observations) >= self.max_frames:
+            raise ValueError("touch exceeds tracking frame budget")
+        if sequence is None:
+            sequence = self.observations[-1].sequence + 1 if self.observations else 1
+        if self.observations and sequence <= self.observations[-1].sequence:
+            raise ValueError("frame sequences must increase")
         image_raw = self.features.raw_frame_to_image(raw_frame)
         image = self.features.preprocess(image_raw)
         keypoints, descriptors = self.features.detect_features(image)
         keypoints = tuple(keypoints or ())
         quality = float(self.features.frame_quality(image_raw))
-        sequence = len(self.observations) + 1 if sequence is None else sequence
-
-        reference_start = max(0, len(self.observations) - self.max_references)
+        reference_start = max(self._reference_floor,
+                              len(self.observations) - self.max_references)
         registration = None
         if (not self._force_component and descriptors is not None and
                 len(keypoints) >= 4):
@@ -106,14 +121,30 @@ class TouchTracker:
             descriptors,
             quality,
             registration,
+            bytes(raw_frame),
         )
         self.observations.append(observation)
         return observation
+
+    def register(self, observation, reference, reference_index=None):
+        """Align already-extracted frame features against an atlas reference."""
+        if observation.descriptors is None or reference.descriptors is None:
+            return Registration(False, reference.registration.component,
+                                reference_index, np.eye(3, dtype=np.float32),
+                                reason="missing_descriptors")
+        return self._register(observation.image, observation.keypoints,
+                              observation.descriptors, reference, reference_index)
 
     def _register(self, image, keypoints, descriptors, reference, reference_index):
         matcher = cv2.BFMatcher(self.features.descriptor_norm, crossCheck=False)
         pairs = matcher.knnMatch(descriptors, reference.descriptors, k=2)
         good = [pair[0] for pair in pairs if len(pair) == 2 and pair[0].distance < self.ratio * pair[1].distance]
+        # Multiple live descriptors must not inflate support for one reference
+        # feature. Keep only the best correspondence for each target.
+        targets = {}
+        for match in sorted(good, key=lambda item: item.distance):
+            targets.setdefault(match.trainIdx, match)
+        good = list(targets.values())
         identity = np.eye(3, dtype=np.float32)
         if len(good) < 4:
             return Registration(False, reference.registration.component,
@@ -123,7 +154,7 @@ class TouchTracker:
         target = np.float32([reference.keypoints[item.trainIdx].pt for item in good])
         affine, mask = cv2.estimateAffinePartial2D(
             source, target, method=cv2.RANSAC, ransacReprojThreshold=4.0)
-        if affine is None or mask is None:
+        if affine is None or mask is None or not np.isfinite(affine).all():
             return Registration(False, reference.registration.component,
                                 reference_index, identity, matches=len(good),
                                 reason="no_transform")
@@ -135,6 +166,10 @@ class TouchTracker:
         angle = abs(math.degrees(math.atan2(float(affine[1, 0]), float(affine[0, 0]))))
         local = np.vstack([affine, [0.0, 0.0, 1.0]]).astype(np.float32)
         transform = reference.registration.transform @ local
+        if not np.isfinite(transform).all():
+            return Registration(False, reference.registration.component,
+                                reference_index, identity, matches=len(good),
+                                reason="nonfinite_transform")
         ridge = self.features.ridge_consistency(
             image,
             {
@@ -169,6 +204,7 @@ class TouchTracker:
             cells,
             confidence,
             None if accepted else "validation_failed",
+            tuple(item.trainIdx for item, keep in zip(good, mask.ravel()) if keep),
         )
 
     def _spatial_cells(self, points):

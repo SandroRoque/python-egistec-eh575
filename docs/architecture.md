@@ -22,6 +22,8 @@ independently released device backend.
 | `egis_driver/streaming.py` | Ordered continuous capture stream and isolated matcher worker process | Fingerprint features, enrollment policy, D-Bus |
 | `egis_driver/sequence_recording.py` | Private loss-detecting sequence recording and replay | Matching decisions and public artifacts |
 | `egis_matcher/sequence.py` | Frame registration, disconnected-component tracking, and experimental mosaics | Sensor access and persistent paths |
+| `egis_matcher/atlas.py` | Experimental sequence enrollment and incremental spatial match evidence | USB, files, production authentication decisions |
+| `egis_driver/atlas_storage.py`, `sequence_evaluation.py` | Private atlas serialization, sequence provenance, and replay reports | Production template loading and promotion |
 | `egis_driver/services.py` | Authentication-session state and suspend/resume behavior | Matching calculations and USB commands |
 | `openfprintd/` | Standard fprint D-Bus surface, client ownership, authorization | EH575 protocol and image processing |
 | `egis_driver/evaluation.py` | Offline replay and acceptance gates | Live installation |
@@ -85,11 +87,29 @@ SIGINT, and SIGTERM. Shutdown leaves physical cleanup on the owner thread.
 
 Ordered sequences retain every sensor observation and its timing. The independent
 `TouchTracker` estimates validated frame relationships, keeps disconnected regions
-as separate components, and can render experimental mosaics without changing the
-production matcher. This is intentionally an evaluation seam: a new atlas or
-streaming-evidence matcher must clear private replay and holdout gates before it
-replaces the production representation. Enrollment schema migration is not a
-design constraint; a new matcher may require re-enrollment.
+as separate components, and can render experimental mosaics. A discontinuity
+permanently excludes older frames from subsequent registration references.
+
+`FeatureAtlas` selects enrollment keyframes for their additional spatial feature
+support, retaining their raw pixels, preprocessed images, descriptors, transforms,
+and source touch identities. Coverage counts refer to occupied feature-grid cells;
+they are not a measurement of total fingerprint area. Separate enrollment touches
+and disconnected components retain separate coordinate systems. Source recordings
+remain intact when redundant frames are omitted from the derived atlas.
+
+`StreamingAtlasMatcher.observe` extracts features once, tracks the live frame, and
+aligns it against atlas keyframes. A frame adds evidence only when it supplies new
+supported cells and moves sufficiently from the last admitted view. Frame-to-atlas
+poses must agree with the live registration chain. Gaps, weak/unmatched frames,
+inconsistent poses, and component changes reset evidence. Repeated views do not
+increase the admitted-frame count.
+
+This path reports experimental evidence sufficiency, never a calibrated
+authentication acceptance. Its separate schema and matcher version are rejected
+on mismatch; no migration is required. Numeric artifacts load without pickle and
+retain checksummed source provenance. Production verification still uses the
+existing matcher. Private replay and untouched holdout validation must precede
+integration of atlas evidence into the live worker and enrollment callbacks.
 
 ## Security Boundaries
 

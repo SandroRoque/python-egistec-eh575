@@ -34,7 +34,7 @@ class MatcherLibraryBoundaryTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import sys; from egis_matcher import MatcherCore; "
+                "import sys; from egis_matcher import MatcherCore, FeatureAtlas, StreamingAtlasMatcher; "
                 "assert all(name not in sys.modules for name in ('usb', 'dbus', 'gi'))",
             ],
             capture_output=True,

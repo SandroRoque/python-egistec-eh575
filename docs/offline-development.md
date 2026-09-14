@@ -80,6 +80,59 @@ implementation and thresholds, test unseen holdout sequences, then integrate the
 new representation behind the existing matcher interface. Any representation
 change may deliberately require fresh enrollment; there is no migration gate.
 
+## Experimental Atlas Enrollment and Streaming Replay
+
+Collect enrollment touches separately from development and holdout probes:
+
+```bash
+sudo ./egis-lab record-sequence --label index-enrollment --role enrollment
+sudo ./egis-lab record-sequence --label index-probe --role development
+sudo ./egis-lab record-sequence --label thumb-probe --role development
+```
+
+Move the finger to expose complementary overlapping regions during each touch.
+Build an atlas from one or more enrollment recordings:
+
+```bash
+./egis-lab enroll-sequences \
+  .egis-lab/sequences/ENROLLMENT-TOUCH-1 \
+  .egis-lab/sequences/ENROLLMENT-TOUCH-2 \
+  --output .egis-lab/atlases/index-v1
+```
+
+Enrollment requires complete recordings labeled `enrollment`. It retains quality
+keyframes that add spatial feature coverage and omits redundant views from the
+derived atlas. The original recordings remain unchanged. Components from different
+touches are not assumed to align and their coverage is reported separately.
+
+Replay independently recorded genuine and wrong-finger probes:
+
+```bash
+./egis-lab match-sequence .egis-lab/sequences/INDEX-PROBE \
+  --atlas .egis-lab/atlases/index-v1 --expected genuine
+./egis-lab match-sequence .egis-lab/sequences/THUMB-PROBE \
+  --atlas .egis-lab/atlases/index-v1 --expected impostor
+```
+
+The incremental matcher reuses features and admits evidence only for new supported
+regions with sufficient motion and consistent alignment. The report records each
+frame's reason, supported cells, admitted-frame count, experimental sufficiency,
+processing latency, and time to sufficient evidence along the capture timeline.
+Enrollment and replay record the algorithm source digest and OpenCV/NumPy versions
+so reports can be traced to the implementation that produced them.
+Processing time is also recorded separately: replay evaluates every recorded frame
+and does not simulate the live queue's scheduling or drops. Exact enrollment
+recordings cannot be used as probes, even if copied to another path. Incomplete
+recordings can be inspected but have `valid_trial=false` and no correctness score.
+
+Atlas files and reports stay under `.egis-lab`, use owner-only permissions, and
+refuse to overwrite previous artifacts. Atlases store numeric arrays without
+pickle plus versioned metadata and checksums. They are biometric data, including
+descriptors, transforms, and source paths; none belongs in Git or public reports.
+Reports are explicitly experimental and non-promotable. The existing live matcher
+and its thresholds are unchanged; real sequence accuracy, cross-touch alignment,
+and calibration remain prerequisites for live adoption.
+
 On an installed system, summarize privacy-safe runtime outcomes with:
 
 ```bash
