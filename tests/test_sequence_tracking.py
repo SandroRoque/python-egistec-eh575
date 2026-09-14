@@ -5,6 +5,7 @@ import numpy as np
 
 from egis_matcher.frame import FrameSpec
 from egis_matcher.sequence import TouchTracker
+from egis_matcher.stitching import TouchStitcher
 
 
 class SequenceTrackingTests(unittest.TestCase):
@@ -49,6 +50,46 @@ class SequenceTrackingTests(unittest.TestCase):
         later = tracker.observe(self.image.tobytes(), 4)
         self.assertIsNone(later.registration.reference)
         self.assertNotEqual(later.registration.component, 0)
+
+    def test_stitcher_masks_sensor_edges_and_grows_canvas(self):
+        tracker = TouchTracker(
+            self.spec, min_inliers=4, min_spatial_cells=2,
+            min_ridge_score=-1.0)
+        stitcher = TouchStitcher(self.spec, tracker=tracker, border=4)
+        stitcher.begin_touch()
+        stitcher.observe(self.image.tobytes(), 1)
+        shifted = cv2.warpAffine(
+            self.image, np.float32([[1, 0, 8], [0, 1, 0]]), (103, 52))
+        stitcher.observe(shifted.tobytes(), 2)
+        result = stitcher.snapshot(force=True)
+        self.assertIsNotNone(result)
+        self.assertGreater(result.coverage_pixels, 0)
+        self.assertEqual(result.image.shape, result.mask.shape)
+        self.assertTrue(np.all(result.image[result.mask == 0] == 255))
+
+    def test_stitcher_does_not_join_discontinuous_components(self):
+        stitcher = TouchStitcher(self.spec)
+        stitcher.begin_touch()
+        stitcher.observe(self.image.tobytes(), 1)
+        stitcher.discontinuity()
+        stitcher.observe(self.image.tobytes(), 2)
+        result = stitcher.snapshot(force=True)
+        self.assertEqual(result.admitted_frames, 1)
+
+    def test_winner_blend_preserves_a_source_pixel(self):
+        stitcher = TouchStitcher(self.spec, blend="winner", border=4)
+        stitcher.begin_touch()
+        stitcher.observe(self.image.tobytes(), 1)
+        result = stitcher.snapshot(force=True)
+        self.assertGreater(np.unique(result.image[result.mask > 0]).size, 1)
+
+    def test_median_blend_produces_a_masked_composite(self):
+        stitcher = TouchStitcher(self.spec, blend="median", border=4)
+        stitcher.begin_touch()
+        stitcher.observe(self.image.tobytes(), 1)
+        result = stitcher.snapshot(force=True)
+        self.assertEqual(result.image.shape, result.mask.shape)
+        self.assertTrue(np.all(result.image[result.mask == 0] == 255))
 
 
 if __name__ == "__main__":

@@ -111,6 +111,17 @@ retain checksummed source provenance. Production verification still uses the
 existing matcher. Private replay and untouched holdout validation must precede
 integration of atlas evidence into the live worker and enrollment callbacks.
 
+`TouchStitcher` is the engine-independent swipe-to-image boundary. It uses SIFT
+only to estimate relationships between ordered frames, excludes the physical
+sensor edge, never joins disconnected coordinate systems, and emits a grayscale
+composite plus its validity mask. It contains no identity or acceptance logic.
+
+External fingerprint engines consume immutable stitched images through an
+extract/compare contract. The NBIS candidate executes `cwsq`, `mindtct`, and
+`bozorth3` in owner-private temporary directories with fixed arguments,
+timeouts, bounded parsing, and fail-closed results. Production authority is
+unchanged until a candidate passes private replay and fresh live holdout gates.
+
 ## Security Boundaries
 
 - The manager authorizes registration before accepting a backend.

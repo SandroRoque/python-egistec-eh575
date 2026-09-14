@@ -198,6 +198,21 @@ added to an atlas:
 sudo ./egis-lab capture-impostor-session
 ```
 
+Evaluate the fingerprint-specific NBIS candidate on stitched touches:
+
+```bash
+sudo ./install-nbis.sh
+export EGIS_NBIS_BIN=/opt/nbis-5.0.0/bin
+./egis-lab evaluate-nbis \
+  --session 20260914T035727Z \
+  --include-development-probes \
+  --output .egis-lab/results/nbis-evaluation
+```
+
+Exit status zero means every replay gate passed. Status 2 prevents integration.
+The detailed report contains private biometric evidence and must not be added to
+git; the command prints only aggregate results.
+
 Replay those probes against each of the four atlases before recalibrating
 production thresholds. A candidate must reject every pinky probe and must also
 require the same identity on consecutive confirmation attempts.

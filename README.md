@@ -95,6 +95,26 @@ after replay and live holdout gates pass.
 
 Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment includes a root-only derived touch atlas while excluding raw recorded sequences. Older template schemas are ignored.
 
+## Fingerprint-engine evaluation
+
+The generic SIFT matcher is retained only as a temporary production authority
+and as the motion estimator for stitched swipe captures. New identity engines
+must pass the private replay gate before integration.
+
+```bash
+sudo ./install-nbis.sh
+export EGIS_NBIS_BIN=/opt/nbis-5.0.0/bin
+./egis-lab evaluate-nbis \
+  --session 20260914T035727Z \
+  --include-development-probes \
+  --output .egis-lab/results/nbis-evaluation
+```
+
+The pinned helper builds the official public-domain NIST release without
+placing its source or binaries in git. Evaluation exits with status 2 unless
+extraction, identity accuracy, score separation, and latency all pass. Reports
+and biometric artifacts remain private under `.egis-lab`.
+
 ## Installation
 
 ### Install from source
