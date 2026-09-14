@@ -87,6 +87,12 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
+`EGIS_MATCH_MODE` selects `window`, `shadow`, or `touch` matching. The default
+is `shadow`: the window matcher remains authoritative while a bounded worker
+accumulates touch-atlas evidence and emits sanitized `[SHADOW]` metrics. `touch`
+fails closed when its worker or atlas is unavailable; it must be enabled only
+after replay and live holdout gates pass.
+
 Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment includes a root-only derived touch atlas while excluding raw recorded sequences. Older template schemas are ignored.
 
 ## Installation

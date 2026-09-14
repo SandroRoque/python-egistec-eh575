@@ -179,6 +179,17 @@ shared feature extraction and identity-margin rejection:
 The result is still shadow evidence. It cannot unlock the system until the
 production persistence, worker protocol, replay gates, and live holdout are complete.
 
+After schema-v6 deployment, inspect live shadow evidence without exposing
+biometric payloads:
+
+```bash
+sudo journalctl -u egis-bridge -f -o short-precise | rg '\[SHADOW\]'
+```
+
+Shadow mode is the default. `EGIS_MATCH_MODE=touch` is reserved for promotion
+after replay and the six-touch physical holdout pass; missing atlases, worker
+failure, ambiguity, and discontinuity always fail closed.
+
 For unenrolled-finger impostor coverage, capture both pinkies with the guided
 private workflow. These recordings are development probes only and are never
 added to an atlas:

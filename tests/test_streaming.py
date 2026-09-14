@@ -10,6 +10,7 @@ from egis_driver.streaming import (
     FrameStatus,
     FrameStream,
     MatcherWorker,
+    TouchMatcherWorker,
 )
 from egis_matcher.frame import FrameSpec
 
@@ -49,6 +50,14 @@ class FakeBackend:
 
 
 class StreamingTests(unittest.TestCase):
+    def test_touch_worker_fails_closed_without_atlases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = TouchMatcherWorker(
+                temporary, FrameSpec(103, 52), startup_timeout=5.0)
+            self.addCleanup(worker.close)
+            worker.start()
+            self.assertFalse(worker.begin(1, "testuser", None))
+
     def test_bounded_stream_drops_oldest_and_reports_discontinuity(self):
         stream = FrameStream(capacity=2)
         stream.publish(message(1))

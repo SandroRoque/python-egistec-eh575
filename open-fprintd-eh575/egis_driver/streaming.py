@@ -378,3 +378,155 @@ class DirectMatcherWorker:
 
     def close(self):
         return None
+
+
+def _touch_matcher_process(connection, persistence_root, frame_spec, config):
+    from egis_driver.fingerprint_matcher import FingerprintMatcher
+    from egis_driver.persistence import Persistence
+
+    matcher = FingerprintMatcher(
+        persistence=Persistence(persistence_root),
+        matcher_config=MatcherConfig.from_dict(config),
+        frame_spec=frame_spec,
+    )
+    session = None
+    generation = None
+    connection.send(("ready",))
+    while True:
+        message = connection.recv()
+        command = message[0]
+        if command == "shutdown":
+            return
+        if command == "begin":
+            _, generation, username, finger_name = message
+            session = matcher.new_touch_identity_matcher(username, finger_name)
+            if session is not None:
+                session.begin_touch()
+            connection.send(("begun", generation, session is not None))
+        elif command == "observe":
+            _, request_id, request_generation, frame, sequence = message
+            if session is None or request_generation != generation:
+                decision = None
+            else:
+                try:
+                    decision = session.observe(frame, sequence)
+                except (ValueError, TypeError):
+                    decision = None
+            connection.send(("touch_decision", request_id,
+                             request_generation, decision))
+        elif command == "discontinuity":
+            _, request_generation = message
+            if session is not None and request_generation == generation:
+                session.discontinuity()
+        elif command == "end":
+            session = None
+            generation = None
+            connection.send(("ended",))
+
+
+class TouchMatcherWorker:
+    """Bounded asynchronous client for one continuous touch session."""
+
+    def __init__(self, persistence_root, frame_spec, config=None,
+                 startup_timeout=10.0):
+        self.persistence_root = str(persistence_root)
+        self.frame_spec = frame_spec
+        self.config = (config or MatcherConfig()).to_dict()
+        self.startup_timeout = startup_timeout
+        self._context = multiprocessing.get_context("spawn")
+        self._process = None
+        self._connection = None
+        self._request_id = 0
+        self._pending = None
+        self._generation = None
+        self._lock = threading.Lock()
+
+    def _start(self):
+        parent, child = self._context.Pipe()
+        process = self._context.Process(
+            target=_touch_matcher_process,
+            args=(child, self.persistence_root, self.frame_spec, self.config),
+            name="egis-touch-matcher", daemon=True)
+        process.start()
+        child.close()
+        if not parent.poll(self.startup_timeout) or parent.recv() != ("ready",):
+            process.terminate()
+            raise RuntimeError("touch matcher worker startup failed")
+        self._connection, self._process = parent, process
+
+    def begin(self, generation, username, finger_name):
+        with self._lock:
+            if self._process is None or not self._process.is_alive():
+                return False
+            self._pending = None
+            self._generation = generation
+            self._connection.send(("begin", generation, username, finger_name))
+            if not self._connection.poll(2.0):
+                return False
+            return self._connection.recv() == ("begun", generation, True)
+
+    def start(self):
+        with self._lock:
+            if self._process is None or not self._process.is_alive():
+                self._start()
+
+    def observe(self, frame, sequence):
+        with self._lock:
+            completed = None
+            if self._pending is not None:
+                if not self._connection.poll(0):
+                    return None
+                kind, request_id, generation, completed = self._connection.recv()
+                if ((kind, request_id, generation) !=
+                        ("touch_decision", self._pending, self._generation)):
+                    completed = None
+                self._pending = None
+            self._request_id += 1
+            self._pending = self._request_id
+            self._connection.send(("observe", self._request_id,
+                                   self._generation, frame, sequence))
+            return completed
+
+    def discontinuity(self):
+        with self._lock:
+            if self._connection is not None:
+                if self._drain_pending(1.0):
+                    self._connection.send(("discontinuity", self._generation))
+
+    def end(self):
+        with self._lock:
+            if self._connection is not None:
+                if self._drain_pending(1.0):
+                    self._connection.send(("end", self._generation))
+                    if self._connection.poll(1.0):
+                        self._connection.recv()
+            self._generation = None
+
+    def _drain_pending(self, timeout):
+        if self._pending is None or self._connection is None:
+            return True
+        if self._connection.poll(timeout):
+            self._connection.recv()
+            self._pending = None
+            return True
+        self._connection.close()
+        self._process.terminate()
+        self._process.join(timeout=1.0)
+        self._connection = self._process = None
+        self._pending = None
+        return False
+
+    def close(self):
+        with self._lock:
+            if self._connection is not None:
+                try:
+                    self._connection.send(("shutdown",))
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                self._connection.close()
+            if self._process is not None:
+                self._process.join(timeout=0.25)
+                if self._process.is_alive():
+                    self._process.terminate()
+                    self._process.join(timeout=1.0)
+            self._connection = self._process = None

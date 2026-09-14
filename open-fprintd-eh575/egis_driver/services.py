@@ -14,6 +14,7 @@ from egis_driver.streaming import (
     DirectMatcherWorker,
     FrameStatus,
     MatcherWorker,
+    TouchMatcherWorker,
 )
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 
@@ -83,6 +84,21 @@ class EgisService:
         self._capture = capture_coordinator or CaptureCoordinator(self._sensor.session())
         self._confirmation_policy = (
             confirmation_policy or PRODUCTION_CONFIRMATION_POLICY)
+        self._match_mode = runtime_paths.match_mode
+        self._touch_matcher_worker = None
+        if matcher is None and self._match_mode != "window":
+            try:
+                self._touch_matcher_worker = TouchMatcherWorker(
+                    self._persistence.root_dir,
+                    self._sensor.frame_spec,
+                    self._matcher.matcher_config,
+                )
+                self._touch_matcher_worker.start()
+            except Exception as error:
+                logger.warning("Touch matcher shadow unavailable: %s", error)
+                if self._touch_matcher_worker is not None:
+                    self._touch_matcher_worker.close()
+                self._touch_matcher_worker = None
 
         self._operation_lock = threading.RLock()
         self._operation_generation = 0
@@ -276,6 +292,8 @@ class EgisService:
         self._stop_scan("service-close")
         self._sensor.close()
         self._matcher_worker.close()
+        if self._touch_matcher_worker is not None:
+            self._touch_matcher_worker.close()
 
     def suspend(self):
         with self._resume_lock:
@@ -505,6 +523,67 @@ class EgisService:
             VERIFY_PRESENCE_THRESHOLD,
             VERIFY_PRESENCE_DELTA,
         )
+
+    def _begin_touch_matching(self, operation, username, finger_name):
+        if self._touch_matcher_worker is None:
+            self._match_outcomes["touch:unavailable"] += 1
+            return False
+        try:
+            available = self._touch_matcher_worker.begin(
+                operation.generation, username, finger_name)
+        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
+                TypeError) as error:
+            logger.warning("Touch matcher session unavailable: %s", error)
+            available = False
+        self._match_outcomes[
+            "touch:ready" if available else "touch:unavailable"] += 1
+        return available
+
+    def _touch_discontinuity(self):
+        try:
+            self._touch_matcher_worker.discontinuity()
+            return True
+        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
+                TypeError) as error:
+            logger.warning("Touch matcher discontinuity failed: %s", error)
+            self._match_outcomes["touch:worker_failure"] += 1
+            return False
+
+    def _observe_touch(self, message):
+        try:
+            return self._touch_matcher_worker.observe(
+                message.pixels, message.sequence)
+        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
+                TypeError) as error:
+            logger.warning("Touch matcher observation failed: %s", error)
+            self._match_outcomes["touch:worker_failure"] += 1
+            return None
+
+    def _record_touch_decision(self, decision):
+        logger.info(
+            "[SHADOW] component=touch_matching accepted=%s identity=%s "
+            "reason=%s score=%.3f margin=%.3f cells=%d frames=%d",
+            decision.accepted,
+            decision.identity or "none",
+            decision.reason,
+            decision.score,
+            decision.margin,
+            decision.metrics["best"]["supported_cells"],
+            decision.metrics["best"]["admitted_frames"],
+        )
+        self._match_outcomes[
+            "touch:accept" if decision.accepted
+            else f"touch:reject:{decision.reason}"] += 1
+
+    def _end_touch_matching(self):
+        if self._touch_matcher_worker is None:
+            return
+        try:
+            self._touch_matcher_worker.end()
+        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
+                TypeError) as error:
+            logger.warning("Touch matcher cleanup failed: %s", error)
+            self._match_outcomes["touch:worker_failure"] += 1
 
     # ------------------------------------------------------------------
     #  Scan loop
@@ -753,6 +832,8 @@ class EgisService:
             initial_img,
             initial_contrast,
         ).start()
+        touch_available = self._begin_touch_matching(
+            operation, username, finger_name)
         frames = []
         window_started = None
         contact_deadline = time.monotonic() + 3.0
@@ -783,6 +864,8 @@ class EgisService:
                     frames = []
                     window_started = None
                     confirmation.reset()
+                    if touch_available:
+                        touch_available = self._touch_discontinuity()
                 if message.status is FrameStatus.CONTACT_END:
                     break
                 if message.status is FrameStatus.DEVICE_UNAVAILABLE:
@@ -796,6 +879,8 @@ class EgisService:
                     frames = []
                     window_started = None
                     confirmation.reset()
+                    if touch_available:
+                        touch_available = self._touch_discontinuity()
                     self._stream_capture_outcomes["io_error"] += 1
                     logger.info(
                         "[METRIC] component=verification_capture outcome=io_error "
@@ -805,6 +890,24 @@ class EgisService:
                     continue
                 if message.status is not FrameStatus.VALID:
                     continue
+
+                # Feed continuous evidence before the legacy fixed-window path.
+                # The worker keeps at most one frame in flight, so capture can
+                # never accumulate an unbounded matching backlog.
+                touch_decision = (
+                    self._observe_touch(message) if touch_available else None)
+                if touch_decision is not None:
+                    self._record_touch_decision(touch_decision)
+                if self._match_mode == "touch":
+                    if (touch_decision is not None and touch_decision.accepted and
+                            touch_decision.identity and
+                            touch_decision.identity.startswith(username + "_")):
+                        logger.info("AUTHENTICATED by touch evidence")
+                        self._emit_verify("verify-match", True, operation)
+                        self._finish_operation(operation)
+                        return
+                    continue
+
                 if not frames:
                     window_started = message.captured_started
                 frames.append(message.pixels)
@@ -843,6 +946,7 @@ class EgisService:
                     return
         finally:
             pump.stop()
+            self._end_touch_matching()
 
         logger.info("No match after %d attempts", attempt)
         if self._is_operation_active(operation):
