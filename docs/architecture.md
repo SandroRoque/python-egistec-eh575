@@ -122,6 +122,13 @@ extract/compare contract. The NBIS candidate executes `cwsq`, `mindtct`, and
 timeouts, bounded parsing, and fail-closed results. Production authority is
 unchanged until a candidate passes private replay and fresh live holdout gates.
 
+The SourceAFIS candidate uses the same boundary through a long-lived, pinned
+Java worker. Python sends grayscale composites and receives opaque templates
+and numeric scores; it implements no minutiae extraction or identity scoring.
+Evaluation includes complete-touch leave-one-touch-out comparisons and
+progressive swipe prefixes. Candidate engines and their templates remain
+strictly outside production until both replay modes pass.
+
 ## Security Boundaries
 
 - The manager authorizes registration before accepting a backend.

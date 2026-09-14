@@ -213,6 +213,24 @@ Exit status zero means every replay gate passed. Status 2 prevents integration.
 The detailed report contains private biometric evidence and must not be added to
 git; the command prints only aggregate results.
 
+Evaluate the pinned SourceAFIS candidate, including full-touch and progressive
+prefix replay, with:
+
+```bash
+sudo ./install-sourceafis.sh
+export EGIS_SOURCEAFIS_HOME=/opt/sourceafis-3.18.1
+./egis-lab evaluate-sourceafis \
+  --session 20260914T035727Z \
+  --include-development-probes \
+  --output .egis-lab/results/sourceafis-evaluation
+```
+
+This is also non-promotable unless every aggregate gate passes. SourceAFIS runs
+in a long-lived Java worker so reported comparison latency does not include JVM
+startup. Progressive replay rejects a candidate if any impostor prefix crosses
+the derived threshold or fewer than 90 percent of genuine touches settle on the
+correct identity through the remainder of the swipe.
+
 Replay those probes against each of the four atlases before recalibrating
 production thresholds. A candidate must reject every pinky probe and must also
 require the same identity on consecutive confirmation attempts.

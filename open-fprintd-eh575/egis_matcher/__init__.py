@@ -18,6 +18,8 @@ _EXPORTS = {
     "FingerprintMatcher": ("egis_matcher.fingerprint_matcher", "FingerprintMatcher"),
     "FingerprintTemplate": ("egis_matcher.fingerprint_matcher", "FingerprintTemplate"),
     "Minutia": ("egis_matcher.fingerprint_features", "Minutia"),
+    "SourceAfisEngine": ("egis_matcher.sourceafis", "SourceAfisEngine"),
+    "SourceAfisTemplate": ("egis_matcher.sourceafis", "SourceAfisTemplate"),
 }
 
 __all__ = (
@@ -38,6 +40,8 @@ __all__ = (
     "FingerprintMatcher",
     "FingerprintTemplate",
     "Minutia",
+    "SourceAfisEngine",
+    "SourceAfisTemplate",
 )
 
 

@@ -33,6 +33,7 @@ from egis_matcher.fingerprint_matcher import FingerprintMatcher, FINGERPRINT_MAT
 from egis_driver.sequence_evaluation import read_touch
 from egis_driver.streaming import FrameStatus
 from egis_driver.nbis_evaluation import evaluate_nbis
+from egis_driver.sourceafis_evaluation import evaluate_sourceafis
 
 
 LAB_ROOT = ROOT / ".egis-lab"
@@ -805,6 +806,71 @@ def cmd_evaluate_nbis(args):
     return 0 if report["gate_passed"] else 2
 
 
+def cmd_evaluate_sourceafis(args):
+    sequence_root = LAB_ROOT / "sequences"
+    selected = []
+    development_sessions = {}
+    for directory in sorted(sequence_root.iterdir()):
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.is_file() or not os.access(manifest_path, os.R_OK):
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        metadata = manifest.get("metadata", {})
+        if not manifest.get("complete") or manifest.get("recorder_dropped", 0):
+            continue
+        if (metadata.get("session_id") == args.session and
+                metadata.get("role") == "enrollment" and
+                metadata.get("finger") in FINGER_ORDER):
+            selected.append(directory)
+        if (args.include_development_probes and metadata.get("role") == "development" and
+                metadata.get("finger") in ("right-pinky", "left-pinky")):
+            development_sessions.setdefault(metadata.get("session_id"), []).append(directory)
+    if args.include_development_probes and development_sessions:
+        complete = [(session, paths) for session, paths in development_sessions.items()
+                    if {json.loads((path / "manifest.json").read_text())["metadata"]["finger"]
+                        for path in paths} == {"right-pinky", "left-pinky"}]
+        if not complete:
+            raise ValueError("no complete two-pinky development session found")
+        selected.extend(max(complete, key=lambda pair: pair[0])[1])
+    elif args.include_development_probes:
+        raise ValueError("no readable pinky development sequences found")
+    counts = {finger: sum(json.loads((path / "manifest.json").read_text())["metadata"]["finger"] == finger
+                          for path in selected) for finger in FINGER_ORDER}
+    if any(count < 3 for count in counts.values()):
+        raise ValueError("SourceAFIS evaluation requires three clean enrollment touches per finger")
+    output = _private_lab_path(args.output)
+    output.mkdir(parents=True, mode=0o700, exist_ok=False)
+    output.chmod(0o700)
+    report = evaluate_sourceafis(selected, home=args.sourceafis_home)
+    write_private_json(output / "report.json", report)
+    winner = report["winner"] or {}
+    progressive = report["progressive"]
+    genuine_prefixes = [item for item in progressive if item["role"] == "enrollment"]
+    summary = {
+        "gate_passed": report["gate_passed"],
+        "full_touch_gate_passed": report["full_touch_gate_passed"],
+        "prefix_gate_passed": report["prefix_gate_passed"],
+        "sequence_count": report["sequence_count"],
+        "winning_config": winner.get("config"),
+        "extraction_success": winner.get("extraction_success"),
+        "extraction_total": winner.get("extraction_total"),
+        "genuine_correct": winner.get("genuine_correct"),
+        "genuine_total": winner.get("genuine_total"),
+        "minimum_genuine_score": winner.get("minimum_genuine_score"),
+        "maximum_impostor_score": winner.get("maximum_impostor_score"),
+        "score_gap": winner.get("score_gap"),
+        "p95_extraction_ms": winner.get("p95_extraction_ms"),
+        "p95_comparison_ms": winner.get("p95_comparison_ms"),
+        "stable_genuine_prefixes": sum(item["stable_correct_frames"] is not None
+                                       for item in genuine_prefixes),
+        "genuine_prefix_total": len(genuine_prefixes),
+    }
+    write_private_json(output / "summary.json", summary)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(output / "report.json")
+    return 0 if report["gate_passed"] else 2
+
+
 def _resolve_dataset(value):
     path = Path(value) if value else LAB_ROOT / "current"
     path = path.resolve()
@@ -1049,6 +1115,16 @@ def build_parser():
     nbis_evaluate.add_argument("--nbis-bin")
     nbis_evaluate.add_argument("--output", required=True)
     nbis_evaluate.set_defaults(func=cmd_evaluate_nbis)
+
+    sourceafis_evaluate = sub.add_parser(
+        "evaluate-sourceafis",
+        help="Evaluate stitched touches and progressive prefixes with SourceAFIS",
+    )
+    sourceafis_evaluate.add_argument("--session", required=True)
+    sourceafis_evaluate.add_argument("--include-development-probes", action="store_true")
+    sourceafis_evaluate.add_argument("--sourceafis-home")
+    sourceafis_evaluate.add_argument("--output", required=True)
+    sourceafis_evaluate.set_defaults(func=cmd_evaluate_sourceafis)
 
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")
