@@ -43,12 +43,13 @@ class CaptureCoordinator:
         with self._counts_lock:
             return dict(self._counts)
 
-    def warm(self, frame_count=4, read_timeout=250):
+    def warm(self, frame_count=4, read_timeout=250, backend=None):
+        backend = backend if backend is not None else self.backend
         started = self._monotonic()
         contrasts = []
         failures = 0
         for _ in range(frame_count):
-            frame, contrast, _ = self.backend.capture_presence_frame(
+            frame, contrast, _ = backend.capture_presence_frame(
                 read_timeout=read_timeout)
             if frame is None:
                 failures += 1
@@ -101,12 +102,13 @@ class CaptureCoordinator:
             (self._monotonic() - started) * 1000.0, failures))
 
     def collect_touch(self, is_active, initial_frame, max_duration=3.0,
-                      min_contrast=15.0):
+                      min_contrast=15.0, backend=None):
+        backend = backend if backend is not None else self.backend
         started = self._monotonic()
         frames = [initial_frame]
         failures = 0
         while self._monotonic() - started < max_duration and is_active():
-            frame, contrast = self.backend.get_live_frame()
+            frame, contrast = backend.get_live_frame()
             if frame is None:
                 failures += 1
                 break

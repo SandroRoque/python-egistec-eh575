@@ -15,6 +15,7 @@ independently released device backend.
 |------|----------------|--------------|
 | `egis_driver/device_profile.py` | Immutable USB identity, descriptors, endpoints, frame geometry, and EH575 commands | USB I/O, matching, D-Bus |
 | `egis_driver/egis_driver.py` | Sensor discovery, descriptor validation, USB lifecycle, capture | Template storage, authentication policy |
+| `egis_driver/sensor_controller.py` | Single backend owner, bounded commands, cancelable sessions, suspend/release ordering | Image features, authentication policy, D-Bus |
 | `egis_matcher/` | Frame features, template construction, identity metrics, decisions, and confirmation policy | Filesystem paths, USB, D-Bus, service lifecycle |
 | `egis_driver/fingerprint_matcher.py` | Persistence-backed matcher adapter and template indexing | Sensor commands, service lifecycle |
 | `egis_driver/capture.py` | Touch detection and complete frame-window acquisition with measurable outcomes | Identity decisions and D-Bus status |
@@ -27,9 +28,11 @@ independently released device backend.
 | `egis_driver/compatibility.py` | Sanitized environment and compatibility reports | Raw biometric export |
 | `packaging/`, `install-stable.sh` | Exact deployment layout and rollback | Runtime behavior |
 
-`SensorBackend` is the boundary consumed by the service layer. `DeviceProfile`
-and `FrameSpec` are immutable hardware inputs. `RuntimePaths` isolates persistent
-state paths so tests and offline evaluation never need the live `/var/lib` tree.
+`SensorController` owns the live `SensorBackend`. Service operations receive
+`SensorSession` objects with the acquisition interface and a cancellation token.
+`DeviceProfile` and `FrameSpec` are immutable hardware inputs. `RuntimePaths`
+isolates persistent state paths so tests and offline evaluation never need the
+live `/var/lib` tree.
 
 `MatcherCore` is the independent algorithm boundary. Callers supply frame
 geometry, frames, templates, indexes, and thresholds; importing it does not load
@@ -49,6 +52,36 @@ count; confirmation evidence is then reset. Matching runs in a persistent spawne
 process, has a readiness handshake and request timeout, and is restarted on a
 crash or timeout. Generation and capture-epoch fields prevent late work from a
 canceled session from becoming an authentication result.
+
+Loss is attached to the first surviving frame after a queue gap, before that
+frame contributes evidence. USB errors clear the pending window and confirmation;
+repeated errors end capture as `device_unavailable`, not as a finger release.
+Matcher startup, protocol, and transport failures return unscorable decisions.
+Timeout recovery discards the failed worker and starts its replacement on the
+next request. Enrollment deletion cancels verification and invalidates the
+worker's cached templates before returning.
+
+The live service constructs and accesses its backend exclusively on the
+`egis-sensor-owner` thread. Readiness, presence polling, enrollment acquisition,
+continuous verification, reconnect, and physical release all pass through this
+owner. The capture pump produces frames independently of the matcher while its
+individual reads are executed by the owner. Standalone maintenance tools that
+stop the bridge still own their backend within their own process.
+
+Each session belongs to one suspend/resume epoch and one cancellation token.
+Cancellation abandons queued commands and discards late results from dispatched
+calls. Suspend invalidates sessions immediately and queues physical release after
+the current USB call; resume commands must follow that release. Stale producers
+therefore cannot reconnect the sleeping device. Canceled recovery cannot publish
+readiness or restart a paused verification in a newer suspend cycle.
+
+The command queue is bounded (32 pending commands; repeated pending releases are
+coalesced), and callers stop waiting after 10 seconds. Neither a caller timeout
+nor scan replacement starts another sensor owner. A native USB call that never
+returns still blocks subsequent physical work, including release, until the
+process is restarted; cancellation keeps callers responsive but cannot forcibly
+interrupt USB code. The bridge closes the controller and matcher on normal exit,
+SIGINT, and SIGTERM. Shutdown leaves physical cleanup on the owner thread.
 
 Ordered sequences retain every sensor observation and its timing. The independent
 `TouchTracker` estimates validated frame relationships, keeps disconnected regions

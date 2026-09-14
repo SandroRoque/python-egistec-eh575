@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from egis_driver.sequence_recording import SequenceRecorder, load_sequence
@@ -54,10 +55,54 @@ class StreamingTests(unittest.TestCase):
         stream.publish(message(2))
         stream.publish(message(3))
         stream.publish(message(4))
-        self.assertEqual(stream.receive().sequence, 3)
+        first = stream.receive()
+        self.assertEqual(first.sequence, 3)
+        self.assertEqual(first.dropped_before, 2)
         newest = stream.receive()
         self.assertEqual(newest.sequence, 4)
-        self.assertEqual(newest.dropped_before, 1)
+        self.assertEqual(newest.dropped_before, 0)
+
+    def test_capacity_one_carries_loss_once(self):
+        stream = FrameStream(capacity=1)
+        for sequence in range(1, 6):
+            stream.publish(message(sequence))
+        self.assertEqual(stream.receive().dropped_before, 4)
+        stream.publish(message(6))
+        self.assertEqual(stream.receive().dropped_before, 0)
+
+    def test_capture_exception_is_device_failure_not_finger_release(self):
+        backend = mock.Mock()
+        backend.get_live_frame.side_effect = OSError("synthetic failure")
+        pump = CapturePump(backend, SPEC, 1, 1, release_frames=2).start()
+        self.assertTrue(pump.wait(1.0))
+        self.assertEqual(
+            [event.status for event in pump.stream.drain()],
+            [FrameStatus.IO_ERROR, FrameStatus.IO_ERROR,
+             FrameStatus.DEVICE_UNAVAILABLE])
+
+    def test_startup_failure_returns_unscorable_and_cleans_up(self):
+        worker = MatcherWorker("unused", SPEC)
+        with mock.patch.object(worker, "_start", side_effect=RuntimeError("startup")):
+            decision = worker.evaluate([], "nobody", None, 1)
+        self.assertEqual(decision.reason, "matcher_worker_failed")
+        self.assertIsNone(worker._process)
+
+    def test_timeout_does_not_start_a_replacement_in_failed_request(self):
+        worker = MatcherWorker("unused", SPEC)
+        worker._process = mock.Mock()
+        worker._connection = mock.Mock()
+        worker._connection.poll.return_value = False
+        with mock.patch.object(worker, "_start") as start:
+            decision = worker.evaluate([], "nobody", None, 1)
+        self.assertEqual(decision.reason, "matcher_timeout")
+        start.assert_not_called()
+        self.assertIsNone(worker._process)
+
+    def test_reload_invalidates_without_starting_process(self):
+        worker = MatcherWorker("unused", SPEC)
+        with mock.patch.object(worker, "_start") as start:
+            worker.reload()
+        start.assert_not_called()
 
     def test_capture_pump_preserves_order_status_and_raw_observations(self):
         observed = []

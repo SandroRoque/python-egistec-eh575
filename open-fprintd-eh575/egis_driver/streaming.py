@@ -2,8 +2,11 @@ import multiprocessing
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from enum import Enum
+
+from egis_driver.sensor_controller import SensorCanceled, SensorSession
 
 from egis_matcher.decision import MatchDecision, MatchOutcome
 from egis_matcher.frame import FrameSpec
@@ -14,6 +17,7 @@ class FrameStatus(str, Enum):
     VALID = "valid"
     NO_CONTACT = "no_contact"
     IO_ERROR = "io_error"
+    DEVICE_UNAVAILABLE = "device_unavailable"
     CONTACT_END = "contact_end"
 
 
@@ -38,36 +42,36 @@ class FrameStream:
     def __init__(self, capacity=16):
         if capacity < 1:
             raise ValueError("capacity must be positive")
-        self._queue = queue.Queue(maxsize=capacity)
-        self._lock = threading.Lock()
-        self._dropped = 0
+        self._queue = deque()
+        self._capacity = capacity
+        self._condition = threading.Condition()
 
     def publish(self, message):
-        with self._lock:
-            while self._queue.full():
-                try:
-                    removed = self._queue.get_nowait()
-                    self._dropped += 1 + removed.dropped_before
-                except queue.Empty:
-                    break
-            if self._dropped:
-                message = FrameMessage(
-                    **{
-                        **message.__dict__,
-                        "dropped_before": message.dropped_before + self._dropped,
-                    }
-                )
-                self._dropped = 0
-            self._queue.put_nowait(message)
+        with self._condition:
+            if len(self._queue) == self._capacity:
+                removed = self._queue.popleft()
+                dropped = removed.dropped_before + 1
+                if self._queue:
+                    self._queue[0] = replace(
+                        self._queue[0],
+                        dropped_before=self._queue[0].dropped_before + dropped)
+                else:
+                    message = replace(
+                        message, dropped_before=message.dropped_before + dropped)
+            self._queue.append(message)
+            self._condition.notify()
 
     def receive(self, timeout=None):
-        return self._queue.get(timeout=timeout)
+        with self._condition:
+            if not self._condition.wait_for(lambda: bool(self._queue), timeout):
+                raise queue.Empty
+            return self._queue.popleft()
 
     def drain(self):
         messages = []
         while True:
             try:
-                messages.append(self._queue.get_nowait())
+                messages.append(self.receive(timeout=0))
             except queue.Empty:
                 return messages
 
@@ -93,6 +97,8 @@ class CapturePump:
         self._sleep = sleep
         self._on_message = on_message
         self._stop = threading.Event()
+        if isinstance(backend, SensorSession):
+            self.backend = backend.with_cancel(self._stop)
         self._thread = None
         self._sequence = 0
 
@@ -141,6 +147,7 @@ class CapturePump:
 
     def _run(self):
         low_contrast = 0
+        read_failures = 0
         pending = self.initial_frame
         pending_contrast = self.initial_contrast
         while not self._stop.is_set():
@@ -149,25 +156,40 @@ class CapturePump:
                 frame, contrast = pending, pending_contrast
                 pending = None
             else:
-                frame, contrast = self.backend.get_live_frame()
+                try:
+                    frame, contrast = self.backend.get_live_frame()
+                except SensorCanceled:
+                    return
+                except Exception:
+                    frame, contrast = None, 0.0
             finished = self._monotonic()
+            if self._stop.is_set():
+                return
             if frame is None:
                 self._publish(FrameStatus.IO_ERROR, started, finished)
-                low_contrast += 1
+                read_failures += 1
+                low_contrast = 0
             elif len(frame) != self.frame_spec.byte_count:
                 self._publish(
                     FrameStatus.IO_ERROR, started, finished, frame, contrast)
-                low_contrast += 1
+                read_failures += 1
+                low_contrast = 0
             elif contrast < self.min_contrast:
+                read_failures = 0
                 low_contrast += 1
                 self._publish(
                     FrameStatus.NO_CONTACT, started, finished,
                     bytes(frame), contrast)
             else:
+                read_failures = 0
                 low_contrast = 0
                 self._publish(
                     FrameStatus.VALID, started, finished, bytes(frame), contrast)
             self._sleep(0.001)
+            if read_failures >= self.release_frames:
+                now = self._monotonic()
+                self._publish(FrameStatus.DEVICE_UNAVAILABLE, now, now)
+                return
             if low_contrast >= self.release_frames:
                 now = self._monotonic()
                 self._publish(FrameStatus.CONTACT_END, now, now)
@@ -277,17 +299,17 @@ class MatcherWorker:
 
     def evaluate(self, frames, username, finger_name, generation):
         with self._lock:
-            if self._process is None or not self._process.is_alive():
-                self.restart()
             self._request_id += 1
             request_id = self._request_id
             try:
+                if self._process is None or not self._process.is_alive():
+                    self.restart()
                 self._connection.send((
                     "evaluate", request_id, generation, tuple(frames),
                     username, finger_name,
                 ))
                 if not self._connection.poll(self.timeout):
-                    self.restart()
+                    self._stop()
                     return MatchDecision(
                         MatchOutcome.UNSCORABLE,
                         reason="matcher_timeout",
@@ -304,8 +326,8 @@ class MatcherWorker:
                         metrics={},
                     )
                 return decision
-            except (BrokenPipeError, EOFError, OSError):
-                self.restart()
+            except (EOFError, OSError, RuntimeError, ValueError, TypeError):
+                self._stop()
                 return MatchDecision(
                     MatchOutcome.UNSCORABLE,
                     reason="matcher_worker_failed",
@@ -314,7 +336,9 @@ class MatcherWorker:
 
     def reload(self):
         with self._lock:
-            self.restart()
+            # Invalidate immediately; rebuild on the next evaluation so a
+            # failed startup cannot undo a completed enrollment mutation.
+            self._stop()
 
 
 class DirectMatcherWorker:

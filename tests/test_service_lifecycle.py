@@ -53,6 +53,22 @@ class FakeMatcher:
         return None, 0
 
 
+class TemplateInvalidationTests(unittest.TestCase):
+    def test_deletion_cancels_active_verification_and_invalidates_worker(self):
+        matcher = mock.Mock()
+        worker = mock.Mock()
+        service = EgisService(driver=FakeDriver(), matcher=matcher,
+                              matcher_worker=worker)
+        self.addCleanup(service.close)
+        operation = ScanOperation(1, ("verify", "test", None))
+        service._active_operation = operation
+        service.delete_enrolled_fingers("test")
+        self.assertTrue(operation.cancel_event.is_set())
+        self.assertIsNone(service._active_operation)
+        matcher.delete_user_fingers.assert_called_once_with("test")
+        worker.reload.assert_called_once_with()
+
+
 class EnrollmentMatcher(FakeMatcher):
     def __init__(self):
         self.enrollment = None
@@ -89,12 +105,22 @@ class PresentDriver(FakeDriver):
         return bytes(103 * 52), 30.0
 
 
+class CountingPresentDriver(PresentDriver):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def get_live_frame(self, read_timeout=1500):
+        self.reads += 1
+        return super().get_live_frame(read_timeout)
+
+
 class ControlledRecoveryService(EgisService):
     def __init__(self, *args, **kwargs):
         self.recovery_gate = threading.Event()
         super().__init__(*args, **kwargs)
 
-    def prepare_sensor(self, reason, force=False):
+    def prepare_sensor(self, reason, force=False, sensor=None):
         return True
 
     def _wait_for_finger_release(self, operation):
@@ -115,11 +141,13 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.statuses = []
 
     def _service(self, driver=None):
-        return ControlledRecoveryService(
+        service = ControlledRecoveryService(
             driver=driver or FakeDriver(),
             matcher=FakeMatcher(),
             on_verify_status=lambda result, done: self.statuses.append((result, done)),
         )
+        self.addCleanup(service.close)
+        return service
 
     def _wait_until(self, predicate, timeout=1.0):
         deadline = time.monotonic() + timeout
@@ -187,13 +215,14 @@ class ServiceLifecycleTests(unittest.TestCase):
         service.cancel()
 
     def test_idle_armed_verify_does_not_report_authentication_failure(self):
-        service = self._service()
+        driver = FakeDriver()
+        service = self._service(driver)
         with mock.patch(
                 "egis_driver.services.VERIFY_IDLE_LOG_INTERVAL_SECONDS",
                 0.02):
             service.start_verify("testuser", "right-index-finger")
             self.assertTrue(self._wait_until(
-                lambda: service._driver.capture_count >= 12,
+                lambda: driver.capture_count >= 12,
             ))
 
         self.assertIsNotNone(service._active_operation)
@@ -206,6 +235,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             driver=FakeDriver(),
             matcher=matcher,
         )
+        self.addCleanup(service.close)
         operation = ScanOperation(
             1,
             ("enroll", "testuser", "right-index-finger", True),
@@ -236,6 +266,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             matcher=matcher,
             on_verify_status=lambda result, done: statuses.append((result, done)),
         )
+        self.addCleanup(service.close)
         operation = ScanOperation(
             1,
             ("verify", "testuser", "right-index-finger", True),
@@ -257,6 +288,81 @@ class ServiceLifecycleTests(unittest.TestCase):
         diagnostics = service.diagnostics_snapshot()
         self.assertEqual(diagnostics["capture"]["captured"], 2)
         self.assertEqual(diagnostics["matching"]["accept"], 2)
+
+    def test_resuspend_cancels_recovery_and_preserves_paused_verification(self):
+        driver = FakeDriver()
+        service = EgisService(driver=driver, matcher=FakeMatcher())
+        self.addCleanup(service.close)
+        service.start_verify("testuser", "right-index-finger")
+        original = service._active_operation
+        service.suspend()
+        self.assertIs(service._suspended_operation, original)
+        service.resume()
+        old_recovery = service._resume_recovery_thread
+        service.suspend()
+        old_recovery.join(timeout=1)
+        self.assertFalse(old_recovery.is_alive())
+        self.assertFalse(service._resume_ready.is_set())
+        self.assertFalse(service._sensor_ready.is_set())
+        self.assertIs(service._suspended_operation, original)
+        self.assertIsNone(service._active_operation)
+        with mock.patch("egis_driver.services.RESUME_USB_SETTLE_SECONDS", 0):
+            service.resume()
+            self.assertTrue(self._wait_until(
+                lambda: service._active_operation is not None))
+        self.assertEqual(service._active_operation.args, original.args)
+
+    def test_stale_warmup_cannot_restore_readiness_after_suspend(self):
+        service = EgisService(driver=FakeDriver(), matcher=FakeMatcher())
+        self.addCleanup(service.close)
+        session = service._sensor.session()
+        service.suspend()
+        from egis_driver.sensor_controller import SensorCanceled
+        with self.assertRaises(SensorCanceled):
+            service._set_sensor_readiness(session, True)
+        self.assertFalse(service._sensor_ready.is_set())
+
+    def test_suspend_releases_sensor_while_matcher_remains_blocked(self):
+        entered = threading.Event()
+        unblock = threading.Event()
+
+        class SlowMatcher(AlwaysMatchMatcher):
+            def verify_finger_multiframe(self, *args, **kwargs):
+                entered.set()
+                if not unblock.wait(5):
+                    raise TimeoutError("test matcher was not unblocked")
+                return super().verify_finger_multiframe(*args, **kwargs)
+
+        driver = CountingPresentDriver()
+        statuses = []
+        service = EgisService(
+            driver=driver, matcher=SlowMatcher(),
+            on_verify_status=lambda *status: statuses.append(status))
+        self.addCleanup(service.close)
+
+        def verify(operation, mode, username, finger):
+            service._handle_verify_continuous(operation, username, finger)
+
+        operation = service._start_scan(
+            verify, ("verify", "testuser", "right-index-finger"))
+        try:
+            self.assertTrue(entered.wait(1))
+            reads_when_matching_started = driver.reads
+            self.assertTrue(self._wait_until(
+                lambda: driver.reads >= reads_when_matching_started + 5))
+            with mock.patch("egis_driver.services.SCAN_STOP_TIMEOUT_SECONDS", 0.03):
+                service.suspend()
+            self.assertEqual(driver.release_count, 1)
+            stopped_at = driver.reads
+            time.sleep(0.04)
+            self.assertEqual(driver.reads, stopped_at)
+            self.assertIs(service._suspended_operation, operation)
+            unblock.set()
+            operation.thread.join(timeout=1)
+            self.assertFalse(operation.thread.is_alive())
+            self.assertEqual(statuses, [])
+        finally:
+            unblock.set()
 
 
 if __name__ == "__main__":

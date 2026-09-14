@@ -194,6 +194,9 @@ def cmd_record_sequence(args):
         ).start()
         complete = pump.wait(timeout=args.max_seconds)
         pump.stop()
+        complete = complete and any(
+            message.status.value == "contact_end"
+            for message in pump.stream.drain())
         recorder.close(complete=complete)
         recorder = None
         _chown_tree(destination, account.pw_uid, account.pw_gid)

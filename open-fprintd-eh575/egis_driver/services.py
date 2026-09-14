@@ -8,13 +8,13 @@ from egis_driver import egis_driver, fingerprint_matcher
 from egis_driver.capture import CaptureCoordinator, CaptureOutcome
 from egis_driver.persistence import Persistence
 from egis_driver.runtime_config import RuntimePaths
+from egis_driver.sensor_controller import SensorCanceled, SensorController
 from egis_driver.streaming import (
     CapturePump,
     DirectMatcherWorker,
     FrameStatus,
     MatcherWorker,
 )
-from egis_matcher.frame import FrameSpec
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 
 logger = logging.getLogger("SERVICE")
@@ -28,6 +28,7 @@ PRODUCTION_CONFIRMATION_POLICY = ConfirmationPolicy(
 )
 RESUME_RECOVERY_WAIT_SECONDS = 3.0
 RESUME_RECOVERY_WARMUP_FRAMES = 4
+RESUME_USB_SETTLE_SECONDS = 2.0
 VERIFY_IDLE_LOG_INTERVAL_SECONDS = 10.0
 VERIFY_PRESENCE_THRESHOLD = 24.0
 VERIFY_PRESENCE_DELTA = 8.0
@@ -43,6 +44,7 @@ class ScanOperation:
         self.cancel_event = threading.Event()
         self.thread = None
         self.terminal = False
+        self.sensor = None
 
 
 class EgisService:
@@ -58,22 +60,27 @@ class EgisService:
                  capture_coordinator=None, confirmation_policy=None,
                  matcher_worker=None):
         runtime_paths = runtime_paths or RuntimePaths.from_environment()
-        self._driver = driver or egis_driver.EgisDriver()
         self._persistence = persistence or Persistence(str(runtime_paths.data_root))
-        self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
-            persistence=self._persistence,
-            frame_spec=self._driver.frame_spec)
-        if matcher_worker is not None:
-            self._matcher_worker = matcher_worker
-        elif matcher is not None:
-            self._matcher_worker = DirectMatcherWorker(self._matcher)
-        else:
-            self._matcher_worker = MatcherWorker(
-                self._persistence.root_dir,
-                self._driver.frame_spec,
-                self._matcher.matcher_config,
-            )
-        self._capture = capture_coordinator or CaptureCoordinator(self._driver)
+        self._sensor = (SensorController(backend=driver) if driver is not None
+                        else SensorController(backend_factory=egis_driver.EgisDriver))
+        try:
+            self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
+                persistence=self._persistence,
+                frame_spec=self._sensor.frame_spec)
+            if matcher_worker is not None:
+                self._matcher_worker = matcher_worker
+            elif matcher is not None:
+                self._matcher_worker = DirectMatcherWorker(self._matcher)
+            else:
+                self._matcher_worker = MatcherWorker(
+                    self._persistence.root_dir,
+                    self._sensor.frame_spec,
+                    self._matcher.matcher_config,
+                )
+        except BaseException:
+            self._sensor.close()
+            raise
+        self._capture = capture_coordinator or CaptureCoordinator(self._sensor.session())
         self._confirmation_policy = (
             confirmation_policy or PRODUCTION_CONFIRMATION_POLICY)
 
@@ -92,6 +99,8 @@ class EgisService:
         self._resume_recovery_thread = None
         self._resume_recovery_running = False
         self._resume_generation = 0
+        self._resume_cancel = threading.Event()
+        self._closed = False
         self._verify_session_id = 0
         self._capture_epoch = 0
         self._match_outcomes = Counter()
@@ -105,40 +114,48 @@ class EgisService:
     #  Sensor lifecycle
     # ------------------------------------------------------------------
 
-    def prepare_sensor(self, reason, force=False):
+    def prepare_sensor(self, reason, force=False, sensor=None):
+        sensor = sensor if sensor is not None else self._sensor.session()
         try:
             if force:
                 logger.info("Preparing sensor (%s): forced reconnect", reason)
-                ok = self._driver.force_reconnect(reset=reason.startswith("resume"))
+                ok = sensor.force_reconnect(reset=reason.startswith("resume"))
                 if ok:
-                    ready = self._warm_sensor(reason)
-                    if ready:
-                        self._sensor_ready.set()
-                    else:
-                        self._sensor_ready.clear()
+                    ready = self._warm_sensor(reason, sensor)
+                    self._set_sensor_readiness(sensor, ready)
                     return ready
-                self._sensor_ready.clear()
+                self._set_sensor_readiness(sensor, False)
                 return False
 
             resume_ready = self._wait_for_resume_recovery(reason)
-            logger.info("Preparing sensor (%s)", reason)
-            if not self._driver.ensure_connected(force=not resume_ready):
-                self._sensor_ready.clear()
+            if not resume_ready:
                 return False
-            ok = self._driver.refresh_after_idle()
+            logger.info("Preparing sensor (%s)", reason)
+            if not sensor.ensure_connected():
+                self._set_sensor_readiness(sensor, False)
+                return False
+            ok = sensor.refresh_after_idle()
             if ok:
-                ready = self._warm_sensor(reason)
-                if ready:
-                    self._sensor_ready.set()
-                else:
-                    self._sensor_ready.clear()
+                ready = self._warm_sensor(reason, sensor)
+                self._set_sensor_readiness(sensor, ready)
                 return ready
-            self._sensor_ready.clear()
+            self._set_sensor_readiness(sensor, False)
             return False
+        except SensorCanceled:
+            raise
         except Exception as e:
-            self._sensor_ready.clear()
+            self._set_sensor_readiness(sensor, False)
             logger.error("Sensor prepare failed (%s): %s", reason, e)
             return False
+
+    def _set_sensor_readiness(self, sensor, ready):
+        with self._operation_lock:
+            if not sensor.active or self._closed:
+                raise SensorCanceled("discarding stale sensor readiness")
+            if ready:
+                self._sensor_ready.set()
+            else:
+                self._sensor_ready.clear()
 
     def _wait_for_resume_recovery(self, reason):
         if self._resume_ready.is_set():
@@ -153,11 +170,13 @@ class EgisService:
             logger.info("Resume recovery completed before %s", reason)
             return True
 
-        logger.warning("Resume recovery still pending before %s; continuing with prepare", reason)
+        logger.warning("Resume recovery still pending before %s; deferring prepare", reason)
         return False
 
-    def _warm_sensor(self, reason):
-        result = self._capture.warm(RESUME_RECOVERY_WARMUP_FRAMES, read_timeout=250)
+    def _warm_sensor(self, reason, sensor=None):
+        result = self._capture.warm(
+            RESUME_RECOVERY_WARMUP_FRAMES, read_timeout=250,
+            backend=sensor if sensor is not None else self._sensor.session())
         logger.info(
             "[METRIC] component=readiness outcome=%s elapsed_ms=%.0f read_failures=%d",
             result.outcome.value,
@@ -251,16 +270,20 @@ class EgisService:
 
     def close(self):
         """Stop active work and release the out-of-process matcher."""
+        self._closed = True
+        self._resume_cancel.set()
         self._discard_suspended_operation()
         self._stop_scan("service-close")
+        self._sensor.close()
         self._matcher_worker.close()
 
     def suspend(self):
-        operation = self._stop_scan("suspend")
+        with self._resume_lock:
+            self._resume_cancel.set()
+            self._resume_generation += 1
+        operation = self._stop_scan("suspend", suspend_sensor=True)
         scan_mode = operation.mode if operation else None
         logger.info("Service suspend: active_mode=%s", scan_mode)
-        self._resume_ready.clear()
-        self._sensor_ready.clear()
         if operation and scan_mode == "verify" and not operation.terminal:
             with self._operation_lock:
                 self._suspended_operation = operation
@@ -269,10 +292,12 @@ class EgisService:
         elif scan_mode == "enroll":
             logger.info("Enroll interrupted by suspend; emitting terminal failure")
             self._emit_enroll("enroll-failed", True, operation, allow_inactive=True)
-        self._driver.release_for_sleep()
+        if not self._sensor.suspend(timeout=SCAN_STOP_TIMEOUT_SECONDS):
+            logger.warning("USB release is pending behind an in-flight sensor command")
 
     def resume(self):
         logger.info("Service resume: starting recovery")
+        self._sensor.resume()
         self._start_resume_recovery()
         with self._operation_lock:
             suspended_operation = self._suspended_operation
@@ -280,46 +305,49 @@ class EgisService:
             logger.info("Scheduling suspended verify resume after recovery")
             threading.Thread(
                 target=self._resume_suspended_scan_after_recovery,
-                args=(suspended_operation,),
+                args=(suspended_operation, self._sensor.session()),
                 name="egis-resume-scan",
                 daemon=True,
             ).start()
 
-    def _resume_suspended_scan_after_recovery(self, suspended_operation):
-        if not self._resume_ready.wait(timeout=RESUME_RECOVERY_WAIT_SECONDS + 5.0):
-            logger.warning("Resume recovery did not finish before suspended scan restart")
+    def _resume_suspended_scan_after_recovery(self, suspended_operation, sensor):
+        while not self._resume_ready.wait(timeout=0.1):
+            if not sensor.active or self._closed:
+                return
 
         with self._operation_lock:
-            if self._suspended_operation is not suspended_operation:
+            if (self._suspended_operation is not suspended_operation or
+                    not sensor.active or self._closed):
                 logger.info("Suspended scan resume superseded")
                 return
             self._suspended_operation = None
-
-        scan_args = suspended_operation.args
-        if scan_args and scan_args[0] == "verify":
-            logger.info("Resuming suspended verify loop")
-            self._start_scan(self._scan_loop, scan_args)
+            scan_args = suspended_operation.args
+            if scan_args and scan_args[0] == "verify":
+                logger.info("Resuming suspended verify loop")
+                self._start_scan(self._scan_loop, scan_args)
 
     def _start_resume_recovery(self):
         with self._resume_lock:
             self._resume_ready.clear()
 
-            if self._resume_recovery_running:
+            if self._resume_recovery_running and not self._resume_cancel.is_set():
                 logger.info("Resume recovery already running")
                 return
 
             self._resume_generation += 1
             generation = self._resume_generation
+            self._resume_cancel = threading.Event()
+            sensor = self._sensor.session(self._resume_cancel)
             self._resume_recovery_running = True
             self._resume_recovery_thread = threading.Thread(
                 target=self._resume_recovery_loop,
-                args=(generation,),
+                args=(generation, sensor, self._resume_cancel),
                 name="egis-resume-recovery",
                 daemon=True,
             )
             self._resume_recovery_thread.start()
 
-    def _resume_recovery_loop(self, generation):
+    def _resume_recovery_loop(self, generation, sensor, cancel_event):
         start = time.time()
         ok = False
         try:
@@ -330,23 +358,29 @@ class EgisService:
             # Let the USB subsystem stabilize before attempting reconnect.
             # After a long sleep the bus and device may need a few seconds to
             # re-enumerate fully.
-            delay = 2.0
+            delay = RESUME_USB_SETTLE_SECONDS
             logger.info("Resume recovery: waiting %.1fs for USB stabilization", delay)
-            time.sleep(delay)
+            if cancel_event.wait(delay):
+                return
 
             if generation != self._resume_generation:
                 logger.info("Superseding stale resume recovery generation %d", generation)
                 return
 
             logger.info("Resume recovery: reconnecting sensor")
-            ok = self.prepare_sensor("resume-recovery", force=True)
+            ok = self.prepare_sensor("resume-recovery", force=True, sensor=sensor)
+        except SensorCanceled:
+            logger.info("Resume recovery canceled")
         finally:
             elapsed_ms = (time.time() - start) * 1000.0
             with self._resume_lock:
-                self._resume_recovery_running = False
-                self._resume_ready.set()
+                if generation == self._resume_generation and not self._closed:
+                    self._resume_recovery_running = False
+                    self._resume_ready.set()
 
-            if ok:
+            if cancel_event.is_set() or generation != self._resume_generation:
+                logger.info("Resume recovery superseded")
+            elif ok:
                 logger.info("Resume recovery ready in %.0fms", elapsed_ms)
             else:
                 logger.warning("Resume recovery failed after %.0fms", elapsed_ms)
@@ -355,7 +389,9 @@ class EgisService:
         return self._matcher.get_enrolled_fingers(username)
 
     def delete_enrolled_fingers(self, username):
+        self.cancel()
         self._matcher.delete_user_fingers(username)
+        self._matcher_worker.reload()
 
     def diagnostics_snapshot(self):
         """Return aggregate reliability counters without biometric content."""
@@ -394,9 +430,13 @@ class EgisService:
             if self._active_operation is operation:
                 self._active_operation = None
 
-    def _stop_scan(self, reason="stop"):
+    def _stop_scan(self, reason="stop", suspend_sensor=False):
         with self._operation_lock:
             operation = self._active_operation
+            if suspend_sensor:
+                self._resume_ready.clear()
+                self._sensor_ready.clear()
+                self._sensor.suspend(timeout=0)
             if operation is None:
                 return None
             logger.info(
@@ -423,11 +463,14 @@ class EgisService:
     def _start_scan(self, target_func, args):
         self._stop_scan("replacement")
         with self._operation_lock:
+            if self._closed:
+                raise RuntimeError("service is closed")
             self._operation_generation += 1
             operation = ScanOperation(self._operation_generation, args)
+            operation.sensor = self._sensor.session(operation.cancel_event)
             thread = threading.Thread(
-                target=target_func,
-                args=(operation, *args),
+                target=self._run_scan,
+                args=(target_func, operation, args),
                 name=f"egis-{operation.mode}-{operation.generation}",
                 daemon=True,
             )
@@ -436,6 +479,19 @@ class EgisService:
             self._scan_thread = thread
             thread.start()
         return operation
+
+    def _run_scan(self, target, operation, args):
+        try:
+            target(operation, *args)
+        except SensorCanceled:
+            logger.info("Sensor session canceled for scan generation %d", operation.generation)
+        finally:
+            self._finish_operation(operation)
+
+    def _operation_sensor(self, operation):
+        if operation.sensor is None:
+            operation.sensor = self._sensor.session(operation.cancel_event)
+        return operation.sensor
 
     def _format_float(self, value):
         if value is None:
@@ -459,7 +515,11 @@ class EgisService:
         time.sleep(0.3)
         consecutive_clears = 0
         while self._is_operation_active(operation):
-            _, _, is_present = self._driver.capture_presence_frame()
+            frame, _, is_present = self._operation_sensor(operation).capture_presence_frame()
+            if frame is None:
+                consecutive_clears = 0
+                operation.cancel_event.wait(0.1)
+                continue
             if not is_present:
                 consecutive_clears += 1
                 if consecutive_clears >= 2:
@@ -481,7 +541,11 @@ class EgisService:
             prepare_before_loop,
         )
         if prepare_before_loop:
-            self.prepare_sensor(f"{mode}-loop")
+            while self._is_operation_active(operation):
+                if self.prepare_sensor(
+                        f"{mode}-loop", sensor=self._operation_sensor(operation)):
+                    break
+                operation.cancel_event.wait(0.25)
         if not self._is_operation_active(operation):
             return
         self._wait_for_finger_release(operation)
@@ -493,7 +557,8 @@ class EgisService:
         baseline_contrast = None
 
         while self._is_operation_active(operation):
-            img, contrast, is_present = self._driver.capture_presence_frame()
+            sensor = self._operation_sensor(operation)
+            img, contrast, is_present = sensor.capture_presence_frame()
             touch_reason = "driver-threshold" if is_present else "none"
             if mode == "verify" and img is not None:
                 if baseline_contrast is None:
@@ -507,7 +572,7 @@ class EgisService:
                             baseline_contrast,
                             len(baseline_samples),
                             session_label,
-                            self._driver.touch_threshold,
+                            sensor.touch_threshold,
                             VERIFY_PRESENCE_THRESHOLD,
                             VERIFY_PRESENCE_DELTA,
                         )
@@ -518,7 +583,7 @@ class EgisService:
                 empty_frames += 1
                 if empty_frames >= 10:
                     logger.warning("No sensor frames; forcing USB recovery...")
-                    self._driver.force_reconnect(reset=True)
+                    sensor.force_reconnect(reset=True)
                     empty_frames = 0
             else:
                 empty_frames = 0
@@ -568,7 +633,7 @@ class EgisService:
                             sum(no_touch_contrasts) / len(no_touch_contrasts),
                             max(no_touch_contrasts),
                             len(no_touch_contrasts),
-                            self._driver.touch_threshold,
+                            sensor.touch_threshold,
                             session_label,
                         )
                     else:
@@ -592,7 +657,8 @@ class EgisService:
     def _handle_enroll(self, operation, img, username, finger_name):
         time.sleep(0.05)
         capture = self._capture.collect_touch(
-            lambda: self._is_operation_active(operation), img)
+            lambda: self._is_operation_active(operation), img,
+            backend=self._operation_sensor(operation))
         logger.info(
             "[METRIC] component=enrollment_capture outcome=%s frames=%d "
             "elapsed_ms=%.0f read_failures=%d",
@@ -677,9 +743,10 @@ class EgisService:
         confirmation = ConfirmationTracker(self._confirmation_policy)
         self._capture_epoch += 1
         capture_epoch = self._capture_epoch
-        frame_spec = getattr(self._driver, "frame_spec", FrameSpec(103, 52))
+        sensor = self._operation_sensor(operation)
+        frame_spec = sensor.frame_spec
         pump = CapturePump(
-            self._driver,
+            sensor,
             frame_spec,
             operation.generation,
             capture_epoch,
@@ -704,6 +771,11 @@ class EgisService:
                         message.capture_epoch != capture_epoch):
                     continue
                 if message.dropped_before:
+                    self._stream_capture_outcomes["dropped_frames"] += message.dropped_before
+                    logger.info(
+                        "[METRIC] component=verification_capture "
+                        "outcome=queue_overflow dropped_frames=%d",
+                        message.dropped_before)
                     logger.warning(
                         "Capture queue dropped %d frame(s); resetting evidence",
                         message.dropped_before,
@@ -713,7 +785,17 @@ class EgisService:
                     confirmation.reset()
                 if message.status is FrameStatus.CONTACT_END:
                     break
+                if message.status is FrameStatus.DEVICE_UNAVAILABLE:
+                    self._stream_capture_outcomes["device_unavailable"] += 1
+                    self._set_sensor_readiness(sensor, False)
+                    logger.info(
+                        "[METRIC] component=verification_capture "
+                        "outcome=device_unavailable frames=0")
+                    break
                 if message.status is FrameStatus.IO_ERROR:
+                    frames = []
+                    window_started = None
+                    confirmation.reset()
                     self._stream_capture_outcomes["io_error"] += 1
                     logger.info(
                         "[METRIC] component=verification_capture outcome=io_error "
@@ -731,6 +813,8 @@ class EgisService:
 
                 attempt += 1
                 match_start = time.monotonic()
+                queue_age_ms = max(
+                    0.0, (match_start - message.captured_finished) * 1000.0)
                 decision = self._matcher_worker.evaluate(
                     frames,
                     username,
@@ -742,10 +826,11 @@ class EgisService:
                     message.captured_finished - window_started) * 1000.0
                 logger.info(
                     "[METRIC] component=verification_capture outcome=captured "
-                    "frames=%d elapsed_ms=%.0f dropped_before=%d",
+                    "frames=%d elapsed_ms=%.0f dropped_before=%d queue_age_ms=%.0f",
                     len(frames),
                     capture_ms,
                     message.dropped_before,
+                    queue_age_ms,
                 )
                 self._stream_capture_outcomes["captured"] += 1
                 frames = []

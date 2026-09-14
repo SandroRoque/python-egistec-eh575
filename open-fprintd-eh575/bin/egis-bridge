@@ -4,6 +4,7 @@ import dbus
 import dbus.service
 import dbus.mainloop.glib
 import logging
+import signal
 from gi.repository import GLib
 
 from egis_driver.services import EgisService
@@ -146,4 +147,9 @@ if __name__ == '__main__':
     name = dbus.service.BusName("io.github.uunicorn.Fprint.Device.Egis", bus)
     device = EgisBridge(bus)
     loop = GLib.MainLoop()
-    loop.run()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, loop.quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, loop.quit)
+    try:
+        loop.run()
+    finally:
+        device._service.close()

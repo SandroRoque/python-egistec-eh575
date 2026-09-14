@@ -90,6 +90,21 @@ The summary counts readiness, enrollment capture, verification capture, and
 matching outcomes independently. Metric events contain counts, durations, and
 reasons; they do not contain frames, templates, usernames, or finger names.
 
+Verification capture metrics also report `queue_age_ms` (the age of the last
+frame in a window when matching starts) and `queue_overflow` events with dropped
+frame counts. Use these alongside matcher durations to distinguish consumer lag
+from slow sensor acquisition. A recording terminated by repeated USB failures
+is marked incomplete even when its capture thread exits normally.
+
+The service uses one sensor owner across verification, enrollment, and recovery.
+After installing controller changes, exercise ordinary verification, cancel and
+immediate retry, enrollment, and repeated suspend/resume with verification armed.
+Expected behavior is no result from the canceled operation, no reads after sleep
+release, and recovery before new acquisition. Automated tests simulate blocked
+reads and matching, but physical USB release and desktop behavior still require
+this live check. A log reporting pending USB release means the owner is still
+waiting for an already-dispatched backend call.
+
 When progress depends on a new enrollment format, stage it fail-closed with one
 privileged command:
 
