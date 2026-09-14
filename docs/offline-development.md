@@ -231,6 +231,13 @@ startup. Progressive replay rejects a candidate if any impostor prefix crosses
 the derived threshold or fewer than 90 percent of genuine touches settle on the
 correct identity through the remainder of the swipe.
 
+Windows driver investigation and the private USB capture procedure are recorded
+in `windows-pipeline.md` and `windows-capture.md`. Corrected NBIS or SourceAFIS
+replay accepts `--calibration-profile` only after the profile contains a fully
+recovered difference conversion and no unresolved bad-pixel operation. An
+incomplete profile fails closed instead of silently applying guessed image
+enhancement.
+
 Replay those probes against each of the four atlases before recalibrating
 production thresholds. A candidate must reject every pinky probe and must also
 require the same identity on consecutive confirmation attempts.

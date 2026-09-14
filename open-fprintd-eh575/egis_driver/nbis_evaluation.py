@@ -18,7 +18,7 @@ def _percentile(values, percentile):
     return float(ordered[index])
 
 
-def stitch_sequence(directory, blend="weighted"):
+def stitch_sequence(directory, blend="weighted", preprocessor=None):
     manifest, messages, spec = read_touch(directory)
     stitcher = TouchStitcher(spec, blend=blend)
     stitcher.begin_touch()
@@ -27,19 +27,22 @@ def stitch_sequence(directory, blend="weighted"):
         if message.dropped_before:
             stitcher.discontinuity()
         if message.status is FrameStatus.VALID:
-            stitcher.observe(message.pixels, message.sequence)
+            pixels = (preprocessor.correct(message.pixels).tobytes()
+                      if preprocessor is not None else message.pixels)
+            stitcher.observe(pixels, message.sequence)
         elif message.status is FrameStatus.IO_ERROR:
             stitcher.discontinuity()
     stitched = stitcher.snapshot(force=True)
     return manifest, stitched, (time.perf_counter() - started) * 1000.0
 
 
-def evaluate_nbis(sequences, bin_dir=None):
+def evaluate_nbis(sequences, bin_dir=None, preprocessor=None):
     prepared_by_blend = {}
     for blend in ("weighted", "winner", "median"):
         prepared = []
         for directory in sequences:
-            manifest, stitched, stitching_ms = stitch_sequence(directory, blend)
+            manifest, stitched, stitching_ms = stitch_sequence(
+                directory, blend, preprocessor=preprocessor)
             metadata = manifest.get("metadata", {})
             prepared.append({
                 "finger": metadata.get("finger"),
@@ -172,6 +175,7 @@ def evaluate_nbis(sequences, bin_dir=None):
         "promotable": False,
         "sequence_count": len(next(iter(prepared_by_blend.values()), [])),
         "gate_passed": bool(ranked and ranked[0]["gate_passed"]),
+        "calibration_digest": (preprocessor.profile.digest if preprocessor else None),
         "winner": ranked[0] if ranked else None,
         "configurations": results,
     }

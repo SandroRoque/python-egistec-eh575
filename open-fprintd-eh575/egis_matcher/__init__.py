@@ -20,6 +20,9 @@ _EXPORTS = {
     "Minutia": ("egis_matcher.fingerprint_features", "Minutia"),
     "SourceAfisEngine": ("egis_matcher.sourceafis", "SourceAfisEngine"),
     "SourceAfisTemplate": ("egis_matcher.sourceafis", "SourceAfisTemplate"),
+    "CalibrationProfile": ("egis_matcher.calibration", "CalibrationProfile"),
+    "FramePreprocessor": ("egis_matcher.calibration", "FramePreprocessor"),
+    "UnsupportedCorrection": ("egis_matcher.calibration", "UnsupportedCorrection"),
 }
 
 __all__ = (
@@ -42,6 +45,9 @@ __all__ = (
     "Minutia",
     "SourceAfisEngine",
     "SourceAfisTemplate",
+    "CalibrationProfile",
+    "FramePreprocessor",
+    "UnsupportedCorrection",
 )
 
 

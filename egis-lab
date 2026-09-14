@@ -34,6 +34,8 @@ from egis_driver.sequence_evaluation import read_touch
 from egis_driver.streaming import FrameStatus
 from egis_driver.nbis_evaluation import evaluate_nbis
 from egis_driver.sourceafis_evaluation import evaluate_sourceafis
+from egis_driver.windows_capture import write_capture_analysis, compare_raw_captures
+from egis_matcher.calibration import CalibrationProfile, FramePreprocessor
 
 
 LAB_ROOT = ROOT / ".egis-lab"
@@ -781,7 +783,8 @@ def cmd_evaluate_nbis(args):
     output = _private_lab_path(args.output)
     output.mkdir(parents=True, mode=0o700, exist_ok=False)
     output.chmod(0o700)
-    report = evaluate_nbis(selected, bin_dir=args.nbis_bin)
+    preprocessor = _load_preprocessor(args.calibration_profile)
+    report = evaluate_nbis(selected, bin_dir=args.nbis_bin, preprocessor=preprocessor)
     write_private_json(output / "report.json", report)
     winner = report["winner"] or {}
     summary = {
@@ -841,7 +844,9 @@ def cmd_evaluate_sourceafis(args):
     output = _private_lab_path(args.output)
     output.mkdir(parents=True, mode=0o700, exist_ok=False)
     output.chmod(0o700)
-    report = evaluate_sourceafis(selected, home=args.sourceafis_home)
+    preprocessor = _load_preprocessor(args.calibration_profile)
+    report = evaluate_sourceafis(
+        selected, home=args.sourceafis_home, preprocessor=preprocessor)
     write_private_json(output / "report.json", report)
     winner = report["winner"] or {}
     progressive = report["progressive"]
@@ -869,6 +874,49 @@ def cmd_evaluate_sourceafis(args):
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(output / "report.json")
     return 0 if report["gate_passed"] else 2
+
+
+def cmd_analyze_windows_capture(args):
+    capture_root = _private_lab_path(args.capture_dir)
+    captures = sorted(capture_root.glob("*.pcapng")) + sorted(capture_root.glob("*.pcap"))
+    if not captures:
+        raise ValueError("no PCAP/PCAPNG files found in private capture directory")
+    output = _private_lab_path(args.output)
+    report = write_capture_analysis(captures, output, tshark=args.tshark)
+    summary = {
+        "phase_count": len(report["phases"]),
+        "phases": [{"phase": item["phase"], "packet_count": item["packet_count"],
+                    "candidate_frame_count": item["candidate_frame_count"],
+                    "candidate_boundary_confirmed": item["candidate_boundary_confirmed"]}
+                   for item in report["phases"]],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(output / "analysis.json")
+
+
+def cmd_compare_windows_linux(args):
+    windows = _private_lab_path(args.windows_analysis)
+    output = _private_lab_path(args.output)
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    report = compare_raw_captures(windows, args.linux_sequences)
+    write_private_json(output, report)
+    print(json.dumps({"comparison_kind": report["comparison_kind"],
+                      "windows_phases": report["windows_phases"],
+                      "linux": report["linux"],
+                      "limitations": report["limitations"]}, indent=2, sort_keys=True))
+    print(output)
+
+
+def _load_preprocessor(value):
+    if not value:
+        return None
+    path = _private_lab_path(value)
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("calibration profile exceeds size budget")
+    profile = CalibrationProfile.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    if not profile.correction_supported:
+        raise ValueError("calibration profile contains unresolved correction operations")
+    return FramePreprocessor(profile)
 
 
 def _resolve_dataset(value):
@@ -1113,6 +1161,7 @@ def build_parser():
     nbis_evaluate.add_argument("--session", required=True)
     nbis_evaluate.add_argument("--include-development-probes", action="store_true")
     nbis_evaluate.add_argument("--nbis-bin")
+    nbis_evaluate.add_argument("--calibration-profile")
     nbis_evaluate.add_argument("--output", required=True)
     nbis_evaluate.set_defaults(func=cmd_evaluate_nbis)
 
@@ -1123,8 +1172,27 @@ def build_parser():
     sourceafis_evaluate.add_argument("--session", required=True)
     sourceafis_evaluate.add_argument("--include-development-probes", action="store_true")
     sourceafis_evaluate.add_argument("--sourceafis-home")
+    sourceafis_evaluate.add_argument("--calibration-profile")
     sourceafis_evaluate.add_argument("--output", required=True)
     sourceafis_evaluate.set_defaults(func=cmd_evaluate_sourceafis)
+
+    windows_capture = sub.add_parser(
+        "analyze-windows-capture",
+        help="Decode private Windows USBPcap phases without publishing payloads",
+    )
+    windows_capture.add_argument("capture_dir")
+    windows_capture.add_argument("--output", required=True)
+    windows_capture.add_argument("--tshark", default="tshark")
+    windows_capture.set_defaults(func=cmd_analyze_windows_capture)
+
+    compare_platforms = sub.add_parser(
+        "compare-windows-linux",
+        help="Compare aggregate raw-frame statistics from private Windows and Linux captures",
+    )
+    compare_platforms.add_argument("--windows-analysis", required=True)
+    compare_platforms.add_argument("--linux-sequences", nargs="+", required=True)
+    compare_platforms.add_argument("--output", required=True)
+    compare_platforms.set_defaults(func=cmd_compare_windows_linux)
 
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")

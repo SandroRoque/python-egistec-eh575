@@ -27,7 +27,8 @@ def _identity_scores(engine, template, enrollment, excluded=None):
     return scores, timings
 
 
-def _progressive_probe(engine, directory, enrollment, threshold, excluded=None, step=10):
+def _progressive_probe(engine, directory, enrollment, threshold, excluded=None,
+                       step=10, preprocessor=None):
     manifest, messages, spec = read_touch(directory)
     stitcher = TouchStitcher(spec, blend="median")
     stitcher.begin_touch()
@@ -41,7 +42,9 @@ def _progressive_probe(engine, directory, enrollment, threshold, excluded=None, 
             continue
         if message.status is not FrameStatus.VALID:
             continue
-        stitcher.observe(message.pixels, message.sequence)
+        pixels = (preprocessor.correct(message.pixels).tobytes()
+                  if preprocessor is not None else message.pixels)
+        stitcher.observe(pixels, message.sequence)
         valid += 1
         if valid < step or valid % step:
             continue
@@ -79,12 +82,13 @@ def _progressive_probe(engine, directory, enrollment, threshold, excluded=None, 
     }
 
 
-def evaluate_sourceafis(sequences, home=None):
+def evaluate_sourceafis(sequences, home=None, preprocessor=None):
     prepared_by_blend = {}
     for blend in ("weighted", "winner", "median"):
         prepared = []
         for directory in sequences:
-            manifest, stitched, stitching_ms = stitch_sequence(directory, blend)
+            manifest, stitched, stitching_ms = stitch_sequence(
+                directory, blend, preprocessor=preprocessor)
             metadata = manifest.get("metadata", {})
             prepared.append({
                 "directory": directory, "finger": metadata.get("finger"),
@@ -177,7 +181,8 @@ def evaluate_sourceafis(sequences, home=None):
             threshold = float(winner["maximum_impostor_score"] or 0)
             progressive = [_progressive_probe(
                 engine, item["directory"], enrollment, threshold,
-                excluded=index if item["role"] == "enrollment" else None)
+                excluded=index if item["role"] == "enrollment" else None,
+                preprocessor=preprocessor)
                 for index, item in enumerate(prepared)]
     genuine_prefixes = [item for item in progressive if item["role"] == "enrollment"]
     impostor_prefixes = [item for item in progressive if item["role"] == "development"]
@@ -193,5 +198,6 @@ def evaluate_sourceafis(sequences, home=None):
         "full_touch_gate_passed": bool(winner and winner["gate_passed"]),
         "prefix_gate_passed": prefix_passed,
         "gate_passed": bool(winner and winner["gate_passed"] and prefix_passed),
+        "calibration_digest": (preprocessor.profile.digest if preprocessor else None),
         "winner": winner, "progressive": progressive, "configurations": results,
     }
