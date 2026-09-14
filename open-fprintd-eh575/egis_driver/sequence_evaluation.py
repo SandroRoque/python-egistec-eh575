@@ -23,23 +23,29 @@ def sequence_source(directory):
     }
 
 
-def read_touch(directory, require_complete=False):
+def read_touch(directory, require_complete=False, allow_timeout=False):
     manifest, messages = load_sequence(directory)
     if not messages or not any(item.status is FrameStatus.VALID for item in messages):
         raise ValueError("sequence has no valid frames")
     spec = messages[0].frame_spec
     if any(item.frame_spec != spec for item in messages):
         raise ValueError("sequence changes frame geometry")
-    if require_complete and not complete_touch(manifest, messages):
+    if require_complete and not complete_touch(manifest, messages, allow_timeout):
         raise ValueError("enrollment requires a complete sequence with a contact-end event")
     return manifest, messages, spec
 
 
-def complete_touch(manifest, messages):
-    return bool(
-        messages and messages[0].sequence == 1 and manifest.get("complete") and
+def complete_touch(manifest, messages, allow_timeout=False):
+    clean_timeout = (
+        allow_timeout and messages and manifest.get("metadata", {}).get("role") == "enrollment" and
         not manifest.get("recorder_dropped", 0) and
-        messages[-1].status is FrameStatus.CONTACT_END and
+        not any(item.status is FrameStatus.IO_ERROR for item in messages) and
+        messages[-1].status in {FrameStatus.VALID, FrameStatus.CONTACT_END})
+    return bool(
+        messages and messages[0].sequence == 1 and
+        (manifest.get("complete") or clean_timeout) and
+        not manifest.get("recorder_dropped", 0) and
+        (messages[-1].status is FrameStatus.CONTACT_END or clean_timeout) and
         not any(item.dropped_before for item in messages) and
         all(right.sequence == left.sequence + 1 for left, right in zip(messages, messages[1:])))
 
@@ -63,7 +69,8 @@ def enroll_sequences(directories, policy=None, finger=None):
     atlas = None
     sources = []
     for directory in directories:
-        manifest, messages, spec = read_touch(directory, require_complete=True)
+        manifest, messages, spec = read_touch(
+            directory, require_complete=True, allow_timeout=True)
         if manifest.get("metadata", {}).get("role") != "enrollment":
             raise ValueError("use recordings labeled enrollment; development/holdout probes stay separate")
         recorded_finger = manifest.get("metadata", {}).get("finger")

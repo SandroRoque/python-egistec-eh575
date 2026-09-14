@@ -104,7 +104,7 @@ def load_atlas(directory):
         raise ValueError("invalid atlas frame geometry")
     policy = AtlasPolicy(**manifest["policy"])
     frames = manifest["frames"]
-    if not 0 < len(frames) <= min(policy.max_keyframes, 64):
+    if not 0 < len(frames) <= min(policy.max_keyframes, 512):
         raise ValueError("invalid atlas keyframe count")
     with zipfile.ZipFile(payload) as archive:
         if sum(member.file_size for member in archive.infolist()) > MAX_ATLAS_BYTES:

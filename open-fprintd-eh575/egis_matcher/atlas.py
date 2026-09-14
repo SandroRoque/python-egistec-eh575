@@ -27,11 +27,13 @@ class AtlasPolicy:
     min_evidence_frames: int = 2
     min_motion_pixels: float = 8.0
     max_pose_error_pixels: float = 6.0
-    max_keyframes: int = 64
+    max_keyframes: int = 256
+    max_keyframes_per_component: int = 2
 
     def __post_init__(self):
         for name in ("cell_size", "min_features", "min_new_cells",
-                     "min_evidence_cells", "min_evidence_frames", "max_keyframes"):
+                     "min_evidence_cells", "min_evidence_frames", "max_keyframes",
+                     "max_keyframes_per_component"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -99,6 +101,11 @@ class FeatureAtlas:
             keyframe = AtlasKeyframe(touch, observation)
             cells = feature_cells(observation, self.policy.cell_size)
             previous = coverage.setdefault(keyframe.component, set())
+            selected_component_count = sum(
+                item.component == keyframe.component for item in selected)
+            if selected_component_count >= self.policy.max_keyframes_per_component:
+                redundant += 1
+                continue
             if previous and len(cells - previous) < self.policy.min_new_cells:
                 redundant += 1
                 continue

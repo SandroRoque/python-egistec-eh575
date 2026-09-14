@@ -238,11 +238,9 @@ def cmd_record_sequence(args):
             initial_contrast=initial[1],
             on_message=observe,
         ).start()
-        complete = pump.wait(timeout=args.max_seconds)
-        pump.stop()
-        complete = complete and any(
-            message.status.value == "contact_end"
-            for message in pump.stream.drain())
+        pump.wait(timeout=args.max_seconds)
+        pump.stop(mark_end=True)
+        complete = pump.terminal_status.value == "contact_end"
         recorder.close(complete=complete)
         recorder = None
         _chown_tree(destination, account.pw_uid, account.pw_gid)

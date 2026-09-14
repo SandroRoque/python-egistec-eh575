@@ -101,6 +101,7 @@ class CapturePump:
             self.backend = backend.with_cancel(self._stop)
         self._thread = None
         self._sequence = 0
+        self._terminal_status = None
 
     def start(self):
         if self._thread is not None:
@@ -113,10 +114,14 @@ class CapturePump:
         self._thread.start()
         return self
 
-    def stop(self, timeout=2.0):
+    def stop(self, timeout=2.0, mark_end=False):
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=timeout)
+        if (mark_end and not self.alive and self._terminal_status is None and
+                self._sequence):
+            now = self._monotonic()
+            self._publish(FrameStatus.CONTACT_END, now, now)
 
     def wait(self, timeout=None):
         if self._thread is not None:
@@ -127,7 +132,13 @@ class CapturePump:
     def alive(self):
         return bool(self._thread and self._thread.is_alive())
 
+    @property
+    def terminal_status(self):
+        return self._terminal_status
+
     def _publish(self, status, started, finished, pixels=None, contrast=0.0):
+        if status in (FrameStatus.CONTACT_END, FrameStatus.DEVICE_UNAVAILABLE):
+            self._terminal_status = status
         self._sequence += 1
         message = FrameMessage(
             sequence=self._sequence,

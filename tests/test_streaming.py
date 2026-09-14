@@ -124,6 +124,14 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual([item.sequence for item in observed], [1, 2, 3, 4])
         self.assertIsNotNone(observed[1].pixels)
 
+    def test_stop_can_close_a_clean_time_limited_recording(self):
+        observed = []
+        backend = FakeBackend([(bytes(range(SPEC.byte_count)), 20.0)])
+        pump = CapturePump(backend, SPEC, 1, 1, on_message=observed.append).start()
+        pump.stop(mark_end=True)
+        self.assertEqual(pump.terminal_status, FrameStatus.CONTACT_END)
+        self.assertEqual(observed[-1].status, FrameStatus.CONTACT_END)
+
     def test_private_recorder_round_trips_ordered_events(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "touch"

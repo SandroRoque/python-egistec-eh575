@@ -180,6 +180,18 @@ class AtlasTests(unittest.TestCase):
             self.assertFalse(report["valid_trial"])
             self.assertIsNone(report["candidate_correct"])
 
+    def test_clean_timeout_enrollment_is_replayable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record(root / "enrollment", self.frames)
+            path = root / "enrollment" / "manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["complete"] = False
+            path.write_text(json.dumps(manifest))
+            atlas, sources = enroll_sequences(
+                [root / "enrollment"], finger="right-index-finger")
+            self.assertTrue(atlas.keyframes)
+
     def test_probe_finger_metadata_enforces_genuine_and_impostor_labels(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
