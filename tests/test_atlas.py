@@ -11,7 +11,7 @@ from egis_driver.atlas_storage import load_atlas, save_atlas
 from egis_driver.sequence_evaluation import enroll_sequences, evaluate_sequence
 from egis_driver.sequence_recording import SequenceRecorder, load_sequence
 from egis_driver.streaming import FrameMessage, FrameStatus
-from egis_matcher.atlas import FeatureAtlas, StreamingAtlasMatcher
+from egis_matcher.atlas import FeatureAtlas, StreamingAtlasMatcher, TouchIdentityMatcher
 from egis_matcher.frame import FrameSpec
 from egis_matcher.sequence import TouchTracker
 
@@ -90,6 +90,36 @@ class AtlasTests(unittest.TestCase):
         with mock.patch.object(features, "detect_features", wraps=features.detect_features) as detect:
             matcher.observe(self.frames[0])
         self.assertEqual(detect.call_count, 1)
+
+    def test_identity_matcher_extracts_once_for_multiple_atlases(self):
+        identity = TouchIdentityMatcher({
+            "right-index": build_atlas(self.frames),
+            "right-thumb": build_atlas(synthetic_sweep(99)),
+        }, min_identity_margin=0.0)
+        features = identity.tracker.features
+        with mock.patch.object(features, "detect_features",
+                               wraps=features.detect_features) as detect:
+            identity.observe(self.frames[0], 1)
+        self.assertEqual(detect.call_count, 1)
+
+    def test_identity_matcher_accumulates_one_touch_and_selects_identity(self):
+        identity = TouchIdentityMatcher({
+            "right-index": build_atlas(self.frames),
+            "right-thumb": build_atlas(synthetic_sweep(99)),
+        }, min_identity_margin=0.0)
+        decisions = [identity.observe(frame, index + 1)
+                     for index, frame in enumerate(self.frames)]
+        self.assertTrue(decisions[-1].accepted)
+        self.assertEqual(decisions[-1].identity, "right-index")
+
+    def test_identity_ambiguity_fails_closed(self):
+        atlas = build_atlas(self.frames)
+        identity = TouchIdentityMatcher({"one": atlas, "two": atlas})
+        decision = None
+        for index, frame in enumerate(self.frames):
+            decision = identity.observe(frame, index + 1)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason, "identity_ambiguous")
 
     def test_inconsistent_atlas_pose_cannot_add_apparent_new_region(self):
         atlas = build_atlas(self.frames)

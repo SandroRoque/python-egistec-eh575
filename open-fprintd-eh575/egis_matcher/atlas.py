@@ -178,6 +178,14 @@ class StreamingAtlasMatcher:
 
     def observe(self, raw_frame, sequence=None):
         observation = self.tracker.observe(raw_frame, sequence)
+        return self.observe_observation(observation)
+
+    def observe_observation(self, observation, candidate_indices=None):
+        """Consume an already-extracted observation.
+
+        Identity matching uses this seam to extract each live frame once and
+        fan the immutable observation out to several enrolled atlases.
+        """
         self.frames_seen += 1
         if observation.registration.component != self._live_component:
             self._reset_evidence()
@@ -186,7 +194,10 @@ class StreamingAtlasMatcher:
             self._reset_evidence()
             return self._result(observation, "weak_frame")
         candidates = []
-        for index, keyframe in enumerate(self.atlas.keyframes):
+        indices = (range(len(self.atlas.keyframes)) if candidate_indices is None
+                   else candidate_indices)
+        for index in indices:
+            keyframe = self.atlas.keyframes[index]
             registration = self.tracker.register(
                 observation, keyframe.observation, index)
             if registration.accepted:
@@ -232,8 +243,123 @@ class StreamingAtlasMatcher:
             "component": list(self._component) if self._component is not None else None,
             "inliers": registration.inliers if registration is not None else 0,
             "ridge_score": registration.ridge_score if registration is not None else 0.0,
+            "confidence": registration.confidence if registration is not None else 0.0,
             "evidence_sufficient": (
                 self._admitted >= self.policy.min_evidence_frames and
                 len(self._cells) >= self.policy.min_evidence_cells),
             "calibrated": False,
         }
+
+
+@dataclass(frozen=True)
+class TouchDecision:
+    identity: str | None
+    accepted: bool
+    reason: str
+    score: float
+    margin: float
+    metrics: dict
+
+
+class TouchIdentityMatcher:
+    """One touch tracker feeding independent per-identity atlas evidence."""
+
+    def __init__(self, atlases, min_identity_margin=0.08, tracker=None,
+                 max_candidates_per_identity=6):
+        if not atlases:
+            raise ValueError("touch identity matcher requires enrolled atlases")
+        specs = {atlas.frame_spec for atlas in atlases.values()}
+        if len(specs) != 1:
+            raise ValueError("enrolled atlases use different frame geometry")
+        self.frame_spec = next(iter(specs))
+        self.tracker = tracker or TouchTracker(self.frame_spec)
+        self.matchers = {
+            identity: StreamingAtlasMatcher(atlas)
+            for identity, atlas in atlases.items()
+        }
+        self.min_identity_margin = float(min_identity_margin)
+        self.max_candidates_per_identity = int(max_candidates_per_identity)
+        self._identity_descriptors = {}
+        self._identity_descriptor_frames = {}
+        for identity, atlas in atlases.items():
+            descriptors = []
+            owners = []
+            for index, keyframe in enumerate(atlas.keyframes):
+                for descriptor in keyframe.observation.descriptors:
+                    descriptors.append(descriptor)
+                    owners.append(index)
+            self._identity_descriptors[identity] = np.asarray(
+                descriptors, dtype=np.float32)
+            self._identity_descriptor_frames[identity] = tuple(owners)
+        self._proposal_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    def begin_touch(self):
+        self.tracker.begin_touch()
+        for matcher in self.matchers.values():
+            matcher.begin_touch()
+
+    def discontinuity(self):
+        self.tracker.discontinuity()
+        for matcher in self.matchers.values():
+            matcher.discontinuity()
+
+    def observe(self, raw_frame, sequence=None):
+        observation = self.tracker.observe(raw_frame, sequence)
+        proposals = self._candidate_keyframes(observation)
+        results = {
+            identity: matcher.observe_observation(
+                observation, proposals.get(identity, ()))
+            for identity, matcher in self.matchers.items()
+        }
+        ranked = sorted(
+            results.items(),
+            key=lambda item: (
+                item[1]["evidence_sufficient"],
+                item[1]["supported_cells"],
+                item[1]["admitted_frames"],
+                item[1]["confidence"],
+            ), reverse=True)
+        identity, best = ranked[0]
+        score = self._score(best)
+        runner_score = self._score(ranked[1][1]) if len(ranked) > 1 else 0.0
+        margin = score - runner_score
+        accepted = bool(best["evidence_sufficient"] and
+                        margin >= self.min_identity_margin)
+        reason = ("accepted" if accepted else
+                  "identity_ambiguous" if best["evidence_sufficient"] else
+                  "insufficient_evidence")
+        return TouchDecision(identity if accepted else None, accepted, reason,
+                             score, margin, {
+                                 "best_identity": identity,
+                                 "best": best,
+                                 "runner_up": ranked[1][0] if len(ranked) > 1 else None,
+                                 "runner_up_score": runner_score,
+                                 "identities": results,
+                             })
+
+    def _candidate_keyframes(self, observation):
+        if observation.descriptors is None:
+            return {}
+        selected = {}
+        for identity, descriptors in self._identity_descriptors.items():
+            votes = {}
+            if len(descriptors) >= 2:
+                for pair in self._proposal_matcher.knnMatch(
+                        observation.descriptors, descriptors, k=2):
+                    if (len(pair) == 2 and
+                            pair[0].distance < 0.75 * pair[1].distance):
+                        frame = self._identity_descriptor_frames[identity][pair[0].trainIdx]
+                        votes[frame] = votes.get(frame, 0) + 1
+            ranked = sorted((count, index) for index, count in votes.items())
+            ranked.reverse()
+            selected[identity] = tuple(
+                index for _, index in ranked[:self.max_candidates_per_identity])
+        return selected
+
+    @staticmethod
+    def _score(result):
+        return float(
+            min(1.0, result["supported_cells"] / 18.0) * 0.45 +
+            min(1.0, result["admitted_frames"] / 3.0) * 0.30 +
+            result["confidence"] * 0.25
+        )

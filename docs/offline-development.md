@@ -167,6 +167,18 @@ authentication decision:
 The SIFT matcher remains the baseline. Compare false accepts, false rejects, and
 processing time on the same replay set before considering production integration.
 
+Replay a complete touch once against every enrolled experimental atlas with
+shared feature extraction and identity-margin rejection:
+
+```bash
+./egis-lab match-touch-identity \
+  .egis-lab/sequences/PROBE \
+  --atlas-root .egis-lab/atlases/SESSION_ID
+```
+
+The result is still shadow evidence. It cannot unlock the system until the
+production persistence, worker protocol, replay gates, and live holdout are complete.
+
 For unenrolled-finger impostor coverage, capture both pinkies with the guided
 private workflow. These recordings are development probes only and are never
 added to an atlas:

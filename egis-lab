@@ -28,6 +28,7 @@ from egis_driver.streaming import CapturePump
 from egis_driver.atlas_storage import load_atlas, save_atlas, write_private_json
 from egis_driver.sequence_evaluation import enroll_sequences, evaluate_sequence, sequence_events
 from egis_matcher.sequence import TouchTracker
+from egis_matcher.atlas import TouchIdentityMatcher
 from egis_matcher.fingerprint_matcher import FingerprintMatcher, FINGERPRINT_MATCHER_VERSION
 from egis_driver.sequence_evaluation import read_touch
 from egis_driver.streaming import FrameStatus
@@ -667,6 +668,61 @@ def cmd_match_fingerprint_sequences(args):
     print(output)
 
 
+def cmd_match_touch_identity(args):
+    atlas_root = _private_lab_path(args.atlas_root)
+    atlases = {}
+    for directory in sorted(atlas_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        atlas, manifest = load_atlas(directory)
+        identity = manifest.get("finger") or directory.name
+        atlases[identity] = atlas
+    matcher = TouchIdentityMatcher(atlases)
+    manifest, messages, _ = read_touch(args.sequence)
+    updates = []
+    decision = None
+    started = time.perf_counter()
+    for message, boundary in sequence_events(messages):
+        if boundary:
+            matcher.discontinuity()
+        if message.status is not FrameStatus.VALID:
+            continue
+        decision = matcher.observe(message.pixels, message.sequence)
+        updates.append({
+            "sequence": message.sequence,
+            "identity": decision.identity,
+            "accepted": decision.accepted,
+            "reason": decision.reason,
+            "score": decision.score,
+            "margin": decision.margin,
+            "best_identity": decision.metrics["best_identity"],
+            "supported_cells": decision.metrics["best"]["supported_cells"],
+            "admitted_frames": decision.metrics["best"]["admitted_frames"],
+        })
+        if decision.accepted:
+            break
+    report = {
+        "schema_version": 1,
+        "experimental": True,
+        "promotable": False,
+        "probe_finger": manifest.get("metadata", {}).get("finger"),
+        "accepted": bool(decision and decision.accepted),
+        "identity": decision.identity if decision else None,
+        "reason": decision.reason if decision else "no_valid_frames",
+        "processing_ms": (time.perf_counter() - started) * 1000.0,
+        "frames_processed": len(updates),
+        "updates": updates,
+    }
+    output = _private_lab_path(args.output or LAB_ROOT / "results" /
+                               f"touch-identity-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json")
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    write_private_json(output, report)
+    print(json.dumps({key: report[key] for key in (
+        "probe_finger", "accepted", "identity", "reason",
+        "frames_processed", "processing_ms")}, indent=2, sort_keys=True))
+    print(output)
+
+
 def _resolve_dataset(value):
     path = Path(value) if value else LAB_ROOT / "current"
     path = path.resolve()
@@ -892,6 +948,15 @@ def build_parser():
     fingerprint_match.add_argument("--probe", required=True)
     fingerprint_match.add_argument("--output")
     fingerprint_match.set_defaults(func=cmd_match_fingerprint_sequences)
+
+    touch_identity = sub.add_parser(
+        "match-touch-identity",
+        help="Replay one continuous touch against all experimental atlases",
+    )
+    touch_identity.add_argument("sequence")
+    touch_identity.add_argument("--atlas-root", required=True)
+    touch_identity.add_argument("--output")
+    touch_identity.set_defaults(func=cmd_match_touch_identity)
 
     evaluate_p = sub.add_parser("evaluate", help="Replay an offline dataset")
     evaluate_p.add_argument("--dataset", help="Snapshot root; defaults to .egis-lab/current")
