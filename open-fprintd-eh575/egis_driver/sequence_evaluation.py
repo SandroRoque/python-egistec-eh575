@@ -59,13 +59,18 @@ def sequence_events(messages):
         previous = message
 
 
-def enroll_sequences(directories, policy=None):
+def enroll_sequences(directories, policy=None, finger=None):
     atlas = None
     sources = []
     for directory in directories:
         manifest, messages, spec = read_touch(directory, require_complete=True)
         if manifest.get("metadata", {}).get("role") != "enrollment":
             raise ValueError("use recordings labeled enrollment; development/holdout probes stay separate")
+        recorded_finger = manifest.get("metadata", {}).get("finger")
+        if finger is None:
+            finger = recorded_finger
+        if not recorded_finger or recorded_finger != finger:
+            raise ValueError("enrollment recording finger does not match --finger")
         source = sequence_source(directory)
         if any(source["frames_sha256"] == old["frames_sha256"] for old in sources):
             raise ValueError("duplicate enrollment recording")
@@ -92,6 +97,13 @@ def evaluate_sequence(atlas, atlas_manifest, directory, expected):
     manifest, messages, spec = read_touch(directory)
     if spec != atlas.frame_spec:
         raise ValueError("probe geometry differs from enrollment")
+    atlas_finger = atlas_manifest.get("finger")
+    probe_finger = manifest.get("metadata", {}).get("finger")
+    if atlas_finger and probe_finger:
+        if expected == "genuine" and probe_finger != atlas_finger:
+            raise ValueError("genuine probe finger does not match atlas finger")
+        if expected == "impostor" and probe_finger == atlas_finger:
+            raise ValueError("impostor probe must use a different finger")
     source = sequence_source(directory)
     if any(source["frames_sha256"] == old["frames_sha256"]
            for old in atlas_manifest["sources"]):
@@ -137,6 +149,8 @@ def evaluate_sequence(atlas, atlas_manifest, directory, expected):
         "source": source,
         "source_complete": bool(manifest.get("complete")),
         "source_role": manifest.get("metadata", {}).get("role"),
+        "atlas_finger": atlas_finger,
+        "probe_finger": probe_finger,
         "atlas_payload_sha256": atlas_manifest["payload_sha256"],
         "atlas_summary": atlas.summary(),
         "atlas_policy": asdict(atlas.policy),

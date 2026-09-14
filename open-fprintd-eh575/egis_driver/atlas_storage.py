@@ -41,7 +41,7 @@ def write_private_json(path, data):
         stream.write("\n")
 
 
-def save_atlas(atlas, directory, sources):
+def save_atlas(atlas, directory, sources, finger=None):
     if not atlas.keyframes:
         raise ValueError("enrollment produced no usable keyframes")
     directory = Path(directory)
@@ -78,6 +78,7 @@ def save_atlas(atlas, directory, sources):
         "policy": asdict(atlas.policy),
         "summary": atlas.summary(),
         "sources": sources,
+        "finger": finger,
         "frames": frames,
         "payload_sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
     }

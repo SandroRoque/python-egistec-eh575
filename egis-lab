@@ -125,12 +125,12 @@ def cmd_holdout(args):
 
     calibrate = ROOT / "open-fprintd-eh575" / "bin" / "egis-calibrate"
     env = {**os.environ, "PYTHONPATH": str(ROOT / "open-fprintd-eh575")}
-    matrix = (
-        (args.index_finger, args.index_finger, "genuine"),
-        (args.index_finger, args.thumb_finger, "impostor"),
-        (args.thumb_finger, args.thumb_finger, "genuine"),
-        (args.thumb_finger, args.index_finger, "impostor"),
+    fingers = tuple(dict.fromkeys(args.fingers))
+    matrix = tuple(
+        (target, actual, "genuine" if target == actual else "impostor")
+        for target in fingers for actual in fingers
     )
+    print(f"Collecting {len(fingers)} genuine and {len(matrix) - len(fingers)} impostor pairs.", flush=True)
     subprocess.run(["systemctl", "stop", "egis-bridge"], check=True)
     try:
         for target, actual, label in matrix:
@@ -177,6 +177,7 @@ def cmd_record_sequence(args):
         recorder = SequenceRecorder(destination, metadata={
             "role": args.role,
             "label": args.label,
+            "finger": args.finger,
             "source_commit": commit,
             "sensor_profile": driver.profile.name,
         }).start()
@@ -333,8 +334,8 @@ def _private_lab_path(value):
 
 def cmd_enroll_sequences(args):
     output = _private_lab_path(args.output)
-    atlas, sources = enroll_sequences(args.sequences)
-    manifest = save_atlas(atlas, output, sources)
+    atlas, sources = enroll_sequences(args.sequences, finger=args.finger)
+    manifest = save_atlas(atlas, output, sources, finger=args.finger)
     print(json.dumps(manifest["summary"], indent=2, sort_keys=True))
     print(output)
 
@@ -350,7 +351,8 @@ def cmd_match_sequence(args):
     print("Experimental spatial evidence; not a calibrated authentication result.")
     print(json.dumps({key: report[key] for key in (
         "candidate_match", "candidate_correct", "time_to_evidence_capture_ms",
-        "processing_p95_ms", "source_complete")}, indent=2, sort_keys=True))
+        "processing_p95_ms", "source_complete", "atlas_finger", "probe_finger")},
+        indent=2, sort_keys=True))
     print(output)
 
 
@@ -460,8 +462,14 @@ def build_parser():
         help="Collect the fixed physical holdout matrix and snapshot it",
     )
     holdout.add_argument("--username")
-    holdout.add_argument("--index-finger", default="right-index-finger")
-    holdout.add_argument("--thumb-finger", default="right-thumb")
+    holdout.add_argument(
+        "--fingers", nargs="+",
+        choices=("right-index-finger", "left-index-finger",
+                 "right-thumb", "left-thumb"),
+        default=("right-index-finger", "left-index-finger",
+                 "right-thumb", "left-thumb"),
+        help="Fingers used for the genuine/impostor matrix",
+    )
     holdout.add_argument("--samples", type=int, default=8)
     holdout.add_argument("--frames", type=int, default=9)
     holdout.set_defaults(func=cmd_holdout)
@@ -471,6 +479,11 @@ def build_parser():
         help="Privately record one ordered touch sequence",
     )
     record.add_argument("--label", required=True)
+    record.add_argument(
+        "--finger", required=True,
+        choices=("right-index-finger", "left-index-finger",
+                 "right-thumb", "left-thumb"),
+    )
     record.add_argument(
         "--role",
         choices=("enrollment", "development", "holdout"),
@@ -490,6 +503,11 @@ def build_parser():
     enroll_sequence = sub.add_parser(
         "enroll-sequences", help="Build a private experimental atlas from enrollment touches")
     enroll_sequence.add_argument("sequences", nargs="+")
+    enroll_sequence.add_argument(
+        "--finger", required=True,
+        choices=("right-index-finger", "left-index-finger",
+                 "right-thumb", "left-thumb"),
+    )
     enroll_sequence.add_argument("--output", required=True)
     enroll_sequence.set_defaults(func=cmd_enroll_sequences)
 

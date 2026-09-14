@@ -52,7 +52,8 @@ Record a complete contact, including low-contrast observations and its explicit
 end marker:
 
 ```bash
-sudo ./egis-lab record-sequence --label right-index-sweep --role development
+sudo ./egis-lab record-sequence --label right-index-sweep \
+  --finger right-index-finger --role development
 ```
 
 The bridge is stopped only while this command owns the sensor and is restarted in
@@ -85,19 +86,33 @@ change may deliberately require fresh enrollment; there is no migration gate.
 Collect enrollment touches separately from development and holdout probes:
 
 ```bash
-sudo ./egis-lab record-sequence --label index-enrollment --role enrollment
-sudo ./egis-lab record-sequence --label index-probe --role development
-sudo ./egis-lab record-sequence --label thumb-probe --role development
+sudo ./egis-lab record-sequence --label right-index-enrollment \
+  --finger right-index-finger --role enrollment
+sudo ./egis-lab record-sequence --label left-index-enrollment \
+  --finger left-index-finger --role enrollment
+sudo ./egis-lab record-sequence --label right-thumb-enrollment \
+  --finger right-thumb --role enrollment
+sudo ./egis-lab record-sequence --label left-thumb-enrollment \
+  --finger left-thumb --role enrollment
+
+Record separate development probes for each enrolled finger and for cross-finger
+impostors. The probe metadata is checked against the atlas, so a genuine replay
+must use the atlas finger and an impostor replay must use a different one.
 ```
 
 Move the finger to expose complementary overlapping regions during each touch.
+For each of the four fingers, record at least three separate enrollment touches
+with different placements. Use labels such as
+`right-index-enrollment-1`, `right-index-enrollment-2`, and
+`right-index-enrollment-3`, then build one atlas per finger. This supplies
+multiple enrollment keys and preserves separate touches for replay validation.
 Build an atlas from one or more enrollment recordings:
 
 ```bash
 ./egis-lab enroll-sequences \
   .egis-lab/sequences/ENROLLMENT-TOUCH-1 \
   .egis-lab/sequences/ENROLLMENT-TOUCH-2 \
-  --output .egis-lab/atlases/index-v1
+  --finger right-index-finger --output .egis-lab/atlases/right-index-v1
 ```
 
 Enrollment requires complete recordings labeled `enrollment`. It retains quality
@@ -179,9 +194,10 @@ sudo ./egis-lab holdout
 ```
 
 This single privileged command archives previous live samples, stops the bridge
-once, collects 8 genuine and 8 cross-finger impostor touches for both the right
-index and right thumb, with three verification windows per touch, always restarts
-the bridge, and creates a snapshot labeled `holdout`. Development snapshots
+once, collects 8 genuine touches for each selected finger and 8 samples for every
+cross-finger target/actual pair, with three verification windows per touch, always
+restarts the bridge, and creates a snapshot labeled `holdout`. The default
+selection is right and left index plus right and left thumb. Development snapshots
 cannot be packaged for promotion.
 
 Evaluate the baseline and candidate against the holdout snapshot. A candidate

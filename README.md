@@ -231,7 +231,14 @@ replay, benchmarking, comparison, and candidate construction without root:
 
 ```bash
 sudo ./egis-lab snapshot --role development
-sudo ./egis-lab record-sequence --label right-index-sweep
+sudo ./egis-lab record-sequence --label right-index-enrollment \
+  --finger right-index-finger --role enrollment
+sudo ./egis-lab record-sequence --label left-index-enrollment \
+  --finger left-index-finger --role enrollment
+sudo ./egis-lab record-sequence --label right-thumb-enrollment \
+  --finger right-thumb --role enrollment
+sudo ./egis-lab record-sequence --label left-thumb-enrollment \
+  --finger left-thumb --role enrollment
 ./egis-lab analyze-sequence .egis-lab/sequences/TIMESTAMP-LABEL
 ./egis-lab evaluate --config lab-configs/baseline.json
 ./egis-lab evaluate --config lab-configs/username-index.json

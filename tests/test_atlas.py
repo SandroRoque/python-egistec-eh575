@@ -33,8 +33,9 @@ def build_atlas(frames):
     return atlas
 
 
-def record(directory, frames, role="enrollment"):
-    recorder = SequenceRecorder(directory, {"role": role}).start()
+def record(directory, frames, role="enrollment", finger="right-index-finger"):
+    recorder = SequenceRecorder(
+        directory, {"role": role, "finger": finger}).start()
     try:
         for index, pixels in enumerate([*frames, None], 1):
             recorder.observe(FrameMessage(
@@ -178,6 +179,20 @@ class AtlasTests(unittest.TestCase):
             report = evaluate_sequence(atlas, saved, root / "probe", "genuine")
             self.assertFalse(report["valid_trial"])
             self.assertIsNone(report["candidate_correct"])
+
+    def test_probe_finger_metadata_enforces_genuine_and_impostor_labels(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record(root / "enrollment", self.frames, finger="right-index-finger")
+            record(root / "probe", synthetic_sweep(99), "development", "right-thumb")
+            atlas, sources = enroll_sequences(
+                [root / "enrollment"], finger="right-index-finger")
+            saved = save_atlas(
+                atlas, root / "atlas", sources, finger="right-index-finger")
+            with self.assertRaisesRegex(ValueError, "genuine probe"):
+                evaluate_sequence(atlas, saved, root / "probe", "genuine")
+            report = evaluate_sequence(atlas, saved, root / "probe", "impostor")
+            self.assertEqual(report["probe_finger"], "right-thumb")
 
 
 if __name__ == "__main__":
