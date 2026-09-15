@@ -68,6 +68,11 @@ class UsernameResolutionTests(unittest.TestCase):
 
 
 class DeviceOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def _run_authorized(sender, action, success, failure, operation):
+        operation()
+        success()
+
     def test_claim_and_release_are_bound_to_sender(self):
         device = DeviceHarness()
         with mock.patch("openfprintd.device.users.resolve_username", return_value="alice"):
@@ -105,6 +110,34 @@ class DeviceOwnershipTests(unittest.TestCase):
         device.Resume()
         self.assertFalse(device.suspended)
         device.target.Resume.assert_called_once_with()
+
+    def test_delete_enrolled_fingers2_uses_claimed_user(self):
+        device = DeviceHarness()
+        device.owner_watcher = FakeWatcher()
+        device.claimed_by = "alice"
+        device.claim_sender = ":1.5"
+        device._run_with_auth = self._run_authorized
+        success = mock.Mock()
+
+        device.DeleteEnrolledFingers2(
+            sender=":1.5", connection=None,
+            success_cb=success, error_cb=mock.Mock())
+
+        device.target.DeleteEnrolledFingers.assert_called_once_with(
+            "alice", signature="s")
+        success.assert_called_once_with()
+
+    def test_delete_enrolled_fingers2_rejects_non_owner(self):
+        device = DeviceHarness()
+        device.owner_watcher = FakeWatcher()
+        device.claimed_by = "alice"
+        device.claim_sender = ":1.5"
+        device._run_with_auth = self._run_authorized
+
+        with self.assertRaises(ClaimDevice):
+            device.DeleteEnrolledFingers2(
+                sender=":1.6", connection=None,
+                success_cb=mock.Mock(), error_cb=mock.Mock())
 
 
 class ManagerRegistrationTests(unittest.TestCase):

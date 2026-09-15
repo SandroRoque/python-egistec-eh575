@@ -162,8 +162,12 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
             )
 
     def test_enrollment_succeeds_when_optional_gallery_engine_is_absent(self):
+        class UnavailableEngine:
+            available = False
+
         with tempfile.TemporaryDirectory() as tmp:
             matcher = self._matcher(tmp)
+            matcher.gallery_engine = UnavailableEngine()
             scene = np.random.default_rng(12).integers(
                 0, 256, size=(60, 150), dtype=np.uint8)
             frames = [scene[:52, x:x + 103].tobytes() for x in (0, 12, 24, 36)]

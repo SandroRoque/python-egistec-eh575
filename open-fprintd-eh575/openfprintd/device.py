@@ -145,6 +145,29 @@ class Device(dbus.service.Object):
 
         self._run_with_auth(sender, "net.reactivated.fprint.device.enroll", success_cb, error_cb, op)
 
+    @dbus.service.method(dbus_interface=INTERFACE_NAME,
+                         in_signature='',
+                         out_signature='',
+                         connection_keyword='connection',
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def DeleteEnrolledFingers2(self, sender, connection, success_cb, error_cb):
+        logging.debug('DeleteEnrolledFingers2')
+
+        def op():
+            if self.owner_watcher is None or self.claim_sender != sender:
+                raise ClaimDevice()
+            return self.target.DeleteEnrolledFingers(
+                self.claimed_by, signature='s')
+
+        self._run_with_auth(
+            sender,
+            "net.reactivated.fprint.device.enroll",
+            success_cb,
+            error_cb,
+            op,
+        )
+
     # ------------------ Claim/Release --------------------------
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
