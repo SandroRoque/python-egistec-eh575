@@ -60,6 +60,28 @@ rearm/trigger/read/drain cycles. Fresh USBPcap evidence is required to correlate
 these high-level Windows operations with exact wire commands and response
 boundaries.
 
+## USB Capture Findings
+
+The first root-wide Windows capture corroborates the following initialization
+transaction on bus 1, device address 3:
+
+1. host sends `EGIS 73 14 ec` on endpoint `0x01`;
+2. host sends exactly 5,356 payload bytes on endpoint `0x01`;
+3. device returns `SIGE 14 ec 01` on endpoint `0x82`.
+
+The uploaded bytes have mean 31.09 and standard deviation 2.31. Their size and
+low contrast are consistent with a sensor background/calibration map, but the
+buffer's producer has not yet been recovered, so that identity remains
+unresolved. `FUN_18001925c` constructs opcode `0x73`, passes the caller's buffer
+and length through the transport object, and validates the seven-byte EGIS
+acknowledgement. Its wrapper is `FUN_180019514`; its indirect caller remains to
+be identified.
+
+The sensor re-enumerated from address 3 to address 5. Later capture files
+contained the address-5 descriptor but bulk traffic only for unrelated address
+1. They contain no Windows verification or enrollment sensor stream and must
+not be used to infer matcher behavior.
+
 ## Enrollment Engine
 
 The engine reads Windows' `Minimum Fingerprint Samples`. Values from 8 through

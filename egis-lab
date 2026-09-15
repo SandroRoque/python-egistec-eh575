@@ -886,8 +886,18 @@ def cmd_analyze_windows_capture(args):
     summary = {
         "phase_count": len(report["phases"]),
         "phases": [{"phase": item["phase"], "packet_count": item["packet_count"],
+                    "sensor_descriptor_found": item["sensor_descriptor_found"],
+                    "sensor_packet_count": item["sensor_packet_count"],
+                    "sensor_addresses": item["sensor_addresses"],
+                    "calibration_upload_count": item["calibration_upload_count"],
                     "candidate_frame_count": item["candidate_frame_count"],
-                    "candidate_boundary_confirmed": item["candidate_boundary_confirmed"]}
+                    "candidate_boundary_confirmed": item["candidate_boundary_confirmed"],
+                    "timeline_phases": [
+                        {"phase": phase["phase"],
+                         "sensor_packet_count": phase["sensor_packet_count"],
+                         "calibration_upload_count": phase["calibration_upload_count"],
+                         "candidate_frame_count": phase["candidate_frame_count"]}
+                        for phase in item["timeline_phases"]]}
                    for item in report["phases"]],
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

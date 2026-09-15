@@ -11,22 +11,24 @@ biometric data.
 2. Copy `tools/windows-capture.ps1` to Windows.
 3. Open an elevated PowerShell window.
 4. Run `USBPcapCMD.exe` once without capture arguments to display the USBPcap
-   root hubs and attached devices. Find `1c7a:0575`, then record its control
-   device (for example `\\.\USBPcap2`) and numeric device address.
-5. Do not select a root hub or address by guesswork. USB addresses can change
-   after reboot or device restart.
+   root hubs and attached devices. Find `1c7a:0575` and record its control
+   device (for example `\\.\USBPcap2`). The wizard follows changing device
+   addresses within that root.
 
 Run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\windows-capture.ps1 -UsbPcapDevice "\\.\USBPcap2" -DeviceAddress 2
+.\windows-capture.ps1 -UsbPcapDevice "\\.\USBPcap2"
 ```
 
-The wizard exports the installed driver, hashes its files, records device and
-WinBio configuration, and explains one physical action at a time. Read every
-prompt before pressing Enter. The temporary enrollment requested by the wizard
-must be deleted afterward.
+The wizard first records and validates a device reinitialization. It then keeps
+one root-wide capture open across all verification actions, validates that it
+contains EH575 commands and full-size transfers, and only then records the
+temporary enrollment. It exports the installed driver, hashes its files,
+records device and WinBio configuration, and writes exact action times to
+`timeline.jsonl`. Read every prompt before pressing Enter. Delete the temporary
+enrollment afterward.
 
 ## Return to Linux
 
@@ -37,7 +39,8 @@ mkdir -p .egis-lab/windows-driver/fresh
 chmod 700 .egis-lab/windows-driver/fresh
 ```
 
-Place the Windows files there, install `tshark`, and decode them privately:
+Place the Windows files there and decode them privately. Classic `.pcap` files
+use the built-in decoder; `.pcapng` requires `tshark`:
 
 ```bash
 ./egis-lab analyze-windows-capture \
@@ -45,9 +48,9 @@ Place the Windows files there, install `tshark`, and decode them privately:
   --output .egis-lab/windows-driver/analysis
 ```
 
-The decoder keeps extracted candidate frames separate from its JSON report and
-marks their boundary as unconfirmed until packet sizes and command transitions
-are consistent across the repeated phases.
+The decoder identifies EH575 addresses from injected descriptors, filters other
+USB devices, pairs protocol payloads with EGIS commands, and segments continuous
+captures using `timeline.jsonl`. Raw frames stay separate from the JSON report.
 
 After recording paired Linux sequences, compare raw transport statistics with:
 
