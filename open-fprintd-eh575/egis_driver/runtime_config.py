@@ -10,8 +10,8 @@ class RuntimePaths:
     match_mode: str = "shadow"
 
     def __post_init__(self):
-        if self.match_mode not in {"window", "shadow", "touch"}:
-            raise ValueError("EGIS_MATCH_MODE must be window, shadow, or touch")
+        if self.match_mode not in {"window", "shadow"}:
+            raise ValueError("EGIS_MATCH_MODE must be window or shadow")
 
     @classmethod
     def from_environment(cls):
@@ -28,3 +28,7 @@ class RuntimePaths:
     @property
     def calibration_dir(self):
         return self.data_root / "egis-calibration"
+
+    @property
+    def gallery_dir(self):
+        return self.data_root / "egis-gallery"

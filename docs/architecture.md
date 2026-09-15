@@ -90,12 +90,10 @@ Ordered sequences retain every sensor observation and its timing. The independen
 as separate components, and can render experimental mosaics. A discontinuity
 permanently excludes older frames from subsequent registration references.
 
-`FeatureAtlas` selects enrollment keyframes for their additional spatial feature
-support, retaining their raw pixels, preprocessed images, descriptors, transforms,
-and source touch identities. Coverage counts refer to occupied feature-grid cells;
-they are not a measurement of total fingerprint area. Separate enrollment touches
-and disconnected components retain separate coordinate systems. Source recordings
-remain intact when redundant frames are omitted from the derived atlas.
+`FeatureAtlas` remains an offline spatial experiment. Production enrollment no
+longer creates one as a candidate identity representation: its largest-component
+model discarded most of the validated Windows enrollment, and SIFT/ridge evidence
+is not permitted to become authentication authority.
 
 `StreamingAtlasMatcher.observe` extracts features once, tracks the live frame, and
 aligns it against atlas keyframes. A frame adds evidence only when it supplies new
@@ -104,30 +102,40 @@ poses must agree with the live registration chain. Gaps, weak/unmatched frames,
 inconsistent poses, and component changes reset evidence. Repeated views do not
 increase the admitted-frame count.
 
-This path reports experimental evidence sufficiency, never a calibrated
-authentication acceptance. Its separate schema and matcher version are rejected
-on mismatch; no migration is required. Numeric artifacts load without pickle and
-retain checksummed source provenance. Production verification still uses the
-existing matcher. Private replay and untouched holdout validation must precede
-integration of atlas evidence into the live worker and enrollment callbacks.
+Presentation galleries retain separate enrollment touches and disconnected
+motion components. SIFT registration and image similarity select complementary
+views and reject duplicates, while identity scores come only from an external
+fingerprint engine. Gallery files contain checksummed opaque feature records and
+metadata, never raw pixels. Engine configuration and schema mismatches fail
+closed; re-enrollment replaces migration.
+
+The live gallery worker consumes the ordered stream one frame at a time and
+reports per-identity scores, margins, extraction failures, and timing as shadow
+telemetry. Queue loss, capture discontinuities, and worker restarts clear its
+trajectory. `EGIS_MATCH_MODE` deliberately exposes only `window` and `shadow`;
+an uncalibrated gallery cannot emit a D-Bus match.
 
 `TouchStitcher` is the engine-independent swipe-to-image boundary. It uses SIFT
 only to estimate relationships between ordered frames, excludes the physical
 sensor edge, never joins disconnected coordinate systems, and emits a grayscale
 composite plus its validity mask. It contains no identity or acceptance logic.
 
-External fingerprint engines consume immutable stitched images through an
-extract/compare contract. The NBIS candidate executes `cwsq`, `mindtct`, and
+External fingerprint engines consume immutable masked grayscale images through
+an extract/compare contract and return opaque records. A coherent component
+stitch is one possible representation, not the enrollment container. The NBIS
+candidate executes `cwsq`, `mindtct`, and
 `bozorth3` in owner-private temporary directories with fixed arguments,
 timeouts, bounded parsing, and fail-closed results. Production authority is
 unchanged until a candidate passes private replay and fresh live holdout gates.
 
 The SourceAFIS candidate uses the same boundary through a long-lived, pinned
-Java worker. Python sends grayscale composites and receives opaque templates
+Java worker. Python sends grayscale images and receives opaque templates
 and numeric scores; it implements no minutiae extraction or identity scoring.
 Evaluation includes complete-touch leave-one-touch-out comparisons and
 progressive swipe prefixes. Candidate engines and their templates remain
-strictly outside production until both replay modes pass.
+strictly outside production until both replay modes pass. Presentation galleries
+pin SourceAFIS scale 3 and remain optional; a missing worker disables only shadow
+evidence.
 
 ## Security Boundaries
 

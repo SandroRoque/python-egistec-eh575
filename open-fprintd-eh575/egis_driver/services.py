@@ -562,14 +562,14 @@ class EgisService:
     def _record_touch_decision(self, decision):
         logger.info(
             "[SHADOW] component=touch_matching accepted=%s identity=%s "
-            "reason=%s score=%.3f margin=%.3f cells=%d frames=%d",
+            "reason=%s score=%.3f margin=%.3f frames=%d extraction_failures=%d",
             decision.accepted,
             decision.identity or "none",
             decision.reason,
             decision.score,
             decision.margin,
-            decision.metrics["best"]["supported_cells"],
-            decision.metrics["best"]["admitted_frames"],
+            decision.metrics["best"]["frames_seen"],
+            decision.metrics["best"]["extraction_failures"],
         )
         self._match_outcomes[
             "touch:accept" if decision.accepted
@@ -898,16 +898,6 @@ class EgisService:
                     self._observe_touch(message) if touch_available else None)
                 if touch_decision is not None:
                     self._record_touch_decision(touch_decision)
-                if self._match_mode == "touch":
-                    if (touch_decision is not None and touch_decision.accepted and
-                            touch_decision.identity and
-                            touch_decision.identity.startswith(username + "_")):
-                        logger.info("AUTHENTICATED by touch evidence")
-                        self._emit_verify("verify-match", True, operation)
-                        self._finish_operation(operation)
-                        return
-                    continue
-
                 if not frames:
                     window_started = message.captured_started
                 frames.append(message.pixels)

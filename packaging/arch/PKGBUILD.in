@@ -28,6 +28,7 @@ package() {
     "$project/egis_matcher" "$optdir/"
 
   install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis"
+  install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis-gallery"
   install -d -m 0700 "$pkgdir/var/lib/open-fprintd/egis-calibration"
   install -D -m 0644 "$project/open-fprintd.service" \
     "$pkgdir/usr/lib/systemd/system/open-fprintd.service"

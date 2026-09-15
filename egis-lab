@@ -34,6 +34,8 @@ from egis_driver.sequence_evaluation import read_touch
 from egis_driver.streaming import FrameStatus
 from egis_driver.nbis_evaluation import evaluate_nbis
 from egis_driver.sourceafis_evaluation import evaluate_sourceafis
+from egis_driver.gallery_evaluation import evaluate_feature_gallery
+from egis_matcher.sourceafis import SourceAfisEngine
 from egis_driver.windows_capture import write_capture_analysis, compare_raw_captures
 from egis_matcher.calibration import CalibrationProfile, FramePreprocessor
 
@@ -876,6 +878,48 @@ def cmd_evaluate_sourceafis(args):
     return 0 if report["gate_passed"] else 2
 
 
+def cmd_evaluate_feature_gallery(args):
+    sequence_root = _private_lab_path(args.sequence_root)
+    selected = []
+    for manifest_path in sorted(sequence_root.glob("*/manifest.json")):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        metadata = manifest.get("metadata", {})
+        if (manifest.get("complete") and
+                not manifest.get("recorder_dropped", 0) and
+                metadata.get("session_id") == args.session and
+                metadata.get("role") in {"enrollment", "development"}):
+            selected.append(manifest_path.parent)
+    if not selected:
+        raise ValueError("no complete sequences found for gallery session")
+    _, _, spec = read_touch(selected[0])
+    output = _private_lab_path(args.output)
+    output.mkdir(parents=True, mode=0o700, exist_ok=False)
+    output.chmod(0o700)
+    with SourceAfisEngine(home=args.sourceafis_home, scale=args.scale) as engine:
+        if not engine.available:
+            raise ValueError("SourceAFIS worker is unavailable")
+        report = evaluate_feature_gallery(selected, engine, spec)
+    write_private_json(output / "report.json", report)
+    summary = {
+        "gate_passed": report["gate_passed"],
+        "engine": report["engine"],
+        "galleries": report["galleries"],
+        "trial_count": report["trial_count"],
+        "genuine_trials": report["genuine_trials"],
+        "impostor_trials": report["impostor_trials"],
+        "probe_extraction_rate": report["probe_extraction_rate"],
+        "p50_extraction_ms": report["p50_extraction_ms"],
+        "p95_extraction_ms": report["p95_extraction_ms"],
+        "p50_comparison_ms": report["p50_comparison_ms"],
+        "p95_comparison_ms": report["p95_comparison_ms"],
+        "winner": report["winner"],
+    }
+    write_private_json(output / "summary.json", summary)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(output / "report.json")
+    return 0 if report["gate_passed"] else 2
+
+
 def cmd_analyze_windows_capture(args):
     capture_root = _private_lab_path(args.capture_dir)
     captures = sorted(capture_root.glob("*.pcapng")) + sorted(capture_root.glob("*.pcap"))
@@ -1189,6 +1233,17 @@ def build_parser():
     sourceafis_evaluate.add_argument("--calibration-profile")
     sourceafis_evaluate.add_argument("--output", required=True)
     sourceafis_evaluate.set_defaults(func=cmd_evaluate_sourceafis)
+
+    gallery_evaluate = sub.add_parser(
+        "evaluate-feature-gallery",
+        help="Build presentation galleries and replay every labeled probe",
+    )
+    gallery_evaluate.add_argument("--sequence-root", required=True)
+    gallery_evaluate.add_argument("--session", required=True)
+    gallery_evaluate.add_argument("--sourceafis-home")
+    gallery_evaluate.add_argument("--scale", type=float, default=3.0)
+    gallery_evaluate.add_argument("--output", required=True)
+    gallery_evaluate.set_defaults(func=cmd_evaluate_feature_gallery)
 
     windows_capture = sub.add_parser(
         "analyze-windows-capture",

@@ -186,9 +186,26 @@ biometric payloads:
 sudo journalctl -u egis-bridge -f -o short-precise | rg '\[SHADOW\]'
 ```
 
-Shadow mode is the default. `EGIS_MATCH_MODE=touch` is reserved for promotion
-after replay and the six-touch physical holdout pass; missing atlases, worker
-failure, ambiguity, and discontinuity always fail closed.
+Shadow mode is the default. `EGIS_MATCH_MODE` accepts only `window` and `shadow`;
+the uncalibrated gallery has no runtime promotion switch. Missing galleries,
+worker failure, queue loss, and discontinuities leave production verification
+unchanged.
+
+Build presentation galleries and replay every labeled development probe without
+writing per-finger shell loops:
+
+```bash
+./egis-lab evaluate-feature-gallery \
+  --sequence-root .egis-lab/windows-driver/replay-v4 \
+  --session windows-v4 \
+  --sourceafis-home .egis-lab/tools/sourceafis-3.18.1 \
+  --scale 3 \
+  --output .egis-lab/results/gallery-windows-v4
+```
+
+The command evaluates score, identity-margin, and consecutive-frame policies
+and writes full trajectories only below `.egis-lab`. Status 2 means the candidate
+remains correctly blocked from promotion.
 
 For unenrolled-finger impostor coverage, capture both pinkies with the guided
 private workflow. These recordings are development probes only and are never

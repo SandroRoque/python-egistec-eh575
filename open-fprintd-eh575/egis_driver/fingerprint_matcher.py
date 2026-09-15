@@ -9,9 +9,9 @@ from egis_matcher.matcher_config import MatcherConfig
 from egis_matcher.policy import THRESHOLD_KEYS
 from egis_driver.persistence import Persistence
 from egis_matcher.template_builder import TemplateBuilder
-from egis_matcher.atlas import AtlasPolicy, FeatureAtlas, TouchIdentityMatcher
-from egis_matcher.sequence import TouchTracker
-from egis_driver.atlas_storage import load_atlas, save_atlas
+from egis_matcher.gallery import GalleryBuilder, StreamingGalleryMatcher
+from egis_matcher.sourceafis import SourceAfisEngine
+from egis_driver.gallery_storage import load_gallery, save_gallery
 
 logger = logging.getLogger("MATCHER")
 
@@ -49,7 +49,8 @@ class FingerprintMatcher:
         self.threshold_source = None
         self.legacy_templates = []
         self.thresholds_by_target = {}
-        self.touch_atlases = {}
+        self.feature_galleries = {}
+        self.gallery_engine = SourceAfisEngine(scale=3.0)
         self._load_thresholds()
 
         self.rebuild_index()
@@ -155,7 +156,7 @@ class FingerprintMatcher:
         self.cached_templates = {}
         self.legacy_templates = []
         self._scoped_indexes = {}
-        self.touch_atlases = {}
+        self.feature_galleries = {}
 
         current_idx_offset = 0
 
@@ -248,16 +249,19 @@ class FingerprintMatcher:
 
             if unpacked_templates:
                 self.cached_templates[filename] = unpacked_templates
-                atlas_path = os.path.join(
-                    self.persistence.atlas_dir, filename.removesuffix(".npz"))
+                gallery_path = os.path.join(
+                    self.persistence.gallery_dir, filename.removesuffix(".npz"))
                 try:
-                    atlas, atlas_manifest = load_atlas(
-                        atlas_path, require_experimental=False)
-                    if atlas_manifest.get("finger") != filename.removesuffix(".npz"):
-                        raise ValueError("atlas identity does not match template")
-                    self.touch_atlases[filename] = atlas
+                    gallery, _ = load_gallery(gallery_path)
+                    if gallery.identity != filename.removesuffix(".npz"):
+                        raise ValueError("gallery identity does not match template")
+                    if (gallery.engine != "sourceafis" or
+                            gallery.engine_version != self.gallery_engine.VERSION or
+                            gallery.engine_config != self.gallery_engine.config()):
+                        raise ValueError("gallery engine is incompatible")
+                    self.feature_galleries[filename] = gallery
                 except (OSError, KeyError, TypeError, ValueError) as error:
-                    logger.warning("Touch atlas unavailable for %s: %s", filename, error)
+                    logger.info("Feature gallery unavailable for %s: %s", filename, error)
 
         if all_descriptors:
             self.train_descriptors = np.vstack(all_descriptors)
@@ -332,29 +336,26 @@ class FingerprintMatcher:
 
         safe_name = name.replace("/", "_")
         self.persistence.save_template(safe_name, save_data, meta)
-        atlas = FeatureAtlas(
-            self.features.frame_spec,
-            AtlasPolicy(max_keyframes=256, max_keyframes_per_component=1),
-        )
-        for group in self.template_builder._normalize_touch_groups(raw_frames):
-            if len(group) > 24:
-                indices = np.linspace(0, len(group) - 1, 24, dtype=int)
-                group = [group[index] for index in indices]
-            tracker = TouchTracker(self.features.frame_spec, features=self.features)
-            for sequence, raw in enumerate(group, 1):
-                tracker.observe(raw, sequence)
-            atlas.add_touch(tracker.observations)
-        if not atlas.keyframes:
-            logger.error("Enrollment produced no touch-atlas keyframes")
-            self.persistence.delete_template_files([safe_name + ".npz"])
-            return False
-        self.persistence.replace_atlas(
-            safe_name,
-            atlas,
-            lambda value, path: save_atlas(
-                value, path, [], finger=safe_name,
-                experimental=False, include_raw=False),
-        )
+        self.persistence.delete_atlases({safe_name})
+        self.persistence.delete_galleries({safe_name})
+        if self.gallery_engine.available:
+            try:
+                groups = self.template_builder._normalize_touch_groups(raw_frames)
+                gallery = GalleryBuilder(
+                    self.gallery_engine, self.features.frame_spec,
+                    features=self.features).build(safe_name, groups)
+                if gallery.entries:
+                    self.persistence.replace_gallery(
+                        safe_name, gallery, save_gallery)
+                    logger.info(
+                        "Saved shadow feature gallery with %d opaque records",
+                        len(gallery.entries))
+            except Exception as error:
+                logger.warning(
+                    "Shadow feature gallery unavailable; enrollment remains valid: %s",
+                    type(error).__name__)
+        else:
+            logger.info("SourceAFIS unavailable; skipping shadow feature gallery")
         logger.info("Saved %d templates for %s", template_count, name)
         self.rebuild_index()
         return True
@@ -446,17 +447,18 @@ class FingerprintMatcher:
     def new_touch_identity_matcher(self, username, finger_name=None):
         finger_name = self._normalize_verify_finger(finger_name)
         prefix = f"{username}_"
-        atlases = {}
-        for filename, atlas in self.touch_atlases.items():
+        galleries = {}
+        for filename, gallery in self.feature_galleries.items():
             if not filename.startswith(prefix) or not filename.endswith(".npz"):
                 continue
             identity = filename[len(prefix):-4]
             if "_" in identity or (finger_name and identity != finger_name):
                 continue
-            atlases[f"{username}_{identity}"] = atlas
-        if not atlases:
+            galleries[f"{username}_{identity}"] = gallery
+        if not galleries or not self.gallery_engine.available:
             return None
-        return TouchIdentityMatcher(atlases)
+        return StreamingGalleryMatcher(
+            self.gallery_engine, galleries, self.features.frame_spec)
 
     def delete_user_fingers(self, username):
         """Wipes all fingers for a user"""
@@ -474,6 +476,9 @@ class FingerprintMatcher:
         if to_delete:
             self.persistence.delete_template_files(to_delete)
             self.persistence.delete_atlases({
+                filename.rsplit(".", 1)[0] for filename in to_delete
+            })
+            self.persistence.delete_galleries({
                 filename.rsplit(".", 1)[0] for filename in to_delete
             })
             self.rebuild_index()

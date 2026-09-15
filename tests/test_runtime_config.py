@@ -14,6 +14,9 @@ class RuntimeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EGIS_MATCH_MODE"):
             RuntimePaths(match_mode="unsafe-fallback")
 
+        with self.assertRaisesRegex(ValueError, "EGIS_MATCH_MODE"):
+            RuntimePaths(match_mode="touch")
+
 
 if __name__ == "__main__":
     unittest.main()

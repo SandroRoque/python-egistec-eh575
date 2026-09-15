@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from egis_matcher.stitching import StitchedPrint
+from egis_matcher.feature_engine import FeatureRecord, FingerprintImage
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,10 @@ class SourceAfisEngine:
             "dpi": self.dpi,
         }
 
+    @property
+    def available(self):
+        return (self.home / "bin" / "egis-sourceafis-worker").is_file()
+
     def _start(self):
         if self._process is not None and self._process.poll() is None:
             return
@@ -102,8 +107,8 @@ class SourceAfisEngine:
 
     def extract(self, stitched):
         started = time.perf_counter()
-        if not isinstance(stitched, StitchedPrint):
-            raise TypeError("SourceAFIS extraction requires a StitchedPrint")
+        if not isinstance(stitched, (StitchedPrint, FingerprintImage)):
+            raise TypeError("SourceAFIS extraction requires a fingerprint image")
         image = stitched.image
         if self.scale != 1.0:
             image = cv2.resize(
@@ -143,6 +148,20 @@ class SourceAfisEngine:
         if kind != "SCORE":
             raise RuntimeError(f"unexpected comparison response: {kind}")
         return float(value)
+
+    def extract_record(self, fingerprint):
+        result = self.extract(fingerprint)
+        record = (FeatureRecord("sourceafis", self.VERSION, result.template.data)
+                  if result.template is not None else None)
+        return record, result.reason, result.elapsed_ms
+
+    def compare_records(self, probe, enrolled):
+        for record in (probe, enrolled):
+            if (not isinstance(record, FeatureRecord) or
+                    record.engine != "sourceafis" or record.version != self.VERSION):
+                raise ValueError("incompatible SourceAFIS feature record")
+        return self.compare(
+            SourceAfisTemplate(probe.data), SourceAfisTemplate(enrolled.data))
 
     def close(self):
         process, self._process = self._process, None

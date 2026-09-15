@@ -79,6 +79,17 @@ class TouchStitcher:
         self._last_snapshot_coverage = result.coverage_pixels
         return result
 
+    def component_snapshots(self):
+        """Render every coherent component without joining coordinate systems."""
+        components = {}
+        for item in self.tracker.observations:
+            components.setdefault(item.registration.component, []).append(item)
+        return tuple(
+            result for component, observations in sorted(components.items())
+            for result in (self._render(component, observations),)
+            if result is not None
+        )
+
     def _render(self, component, observations):
         corners = np.float32([
             [self.border, self.border],

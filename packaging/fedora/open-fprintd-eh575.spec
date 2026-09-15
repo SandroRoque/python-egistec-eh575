@@ -47,6 +47,7 @@ install -D -m 0644 "$project/io.github.uunicorn.Fprint.Device.Egis.conf" \
 install -D -m 0644 "$project/70-egis-eh575.rules" \
   %{buildroot}%{_udevrulesdir}/70-egis-eh575.rules
 install -d -m 0700 %{buildroot}%{_sharedstatedir}/open-fprintd/egis
+install -d -m 0700 %{buildroot}%{_sharedstatedir}/open-fprintd/egis-gallery
 install -d -m 0700 %{buildroot}%{_sharedstatedir}/open-fprintd/egis-calibration
 
 %post
@@ -70,6 +71,7 @@ udevadm control --reload-rules && udevadm trigger || :
 %{_udevrulesdir}/70-egis-eh575.rules
 %dir %{_sharedstatedir}/open-fprintd
 %dir %{_sharedstatedir}/open-fprintd/egis
+%dir %{_sharedstatedir}/open-fprintd/egis-gallery
 %dir %{_sharedstatedir}/open-fprintd/egis-calibration
 
 %changelog

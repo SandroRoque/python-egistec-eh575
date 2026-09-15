@@ -19,6 +19,7 @@ class Persistence:
         self.root_dir = root_dir
         self.enroll_dir = os.path.join(root_dir, "egis")
         self.atlas_dir = os.path.join(root_dir, "egis-atlas")
+        self.gallery_dir = os.path.join(root_dir, "egis-gallery")
         self.calibration_dir = os.path.join(root_dir, "egis-calibration")
         self.sample_dir = os.path.join(self.calibration_dir, "samples")
         self._threshold_file = os.path.join(self.calibration_dir, "thresholds.json")
@@ -31,6 +32,7 @@ class Persistence:
     def ensure_dirs(self):
         os.makedirs(self.enroll_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.atlas_dir, mode=0o700, exist_ok=True)
+        os.makedirs(self.gallery_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.calibration_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.sample_dir, mode=0o700, exist_ok=True)
 
@@ -112,6 +114,43 @@ class Persistence:
 
     def delete_atlases(self, safe_names):
         root = Path(self.atlas_dir).resolve()
+        for safe_name in safe_names:
+            target = (root / safe_name).resolve()
+            if target.parent == root and target.is_dir():
+                shutil.rmtree(target)
+
+    def replace_gallery(self, safe_name, gallery, save):
+        self._replace_directory(Path(self.gallery_dir), safe_name, gallery, save)
+
+    def gallery_paths(self):
+        root = Path(self.gallery_dir)
+        return sorted(path for path in root.iterdir() if path.is_dir() and
+                      not path.name.startswith("."))
+
+    def delete_galleries(self, safe_names):
+        self._delete_directories(Path(self.gallery_dir), safe_names)
+
+    def _replace_directory(self, root, safe_name, value, save):
+        target = root / safe_name
+        temporary = root / f".{safe_name}.tmp-{os.getpid()}"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        save(value, temporary)
+        old = root / f".{safe_name}.old-{os.getpid()}"
+        if target.exists():
+            os.replace(target, old)
+        try:
+            os.replace(temporary, target)
+        except BaseException:
+            if old.exists():
+                os.replace(old, target)
+            raise
+        if old.exists():
+            shutil.rmtree(old)
+
+    @staticmethod
+    def _delete_directories(root, safe_names):
+        root = root.resolve()
         for safe_name in safe_names:
             target = (root / safe_name).resolve()
             if target.parent == root and target.is_dir():
