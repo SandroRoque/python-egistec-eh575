@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""Guided fprintd enrollment with explicit lift-and-replace feedback."""
+
+import argparse
+import os
+import pwd
+import sys
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+
+FINGERS = (
+    "left-thumb", "left-index-finger", "left-middle-finger",
+    "left-ring-finger", "left-little-finger", "right-thumb",
+    "right-index-finger", "right-middle-finger", "right-ring-finger",
+    "right-little-finger",
+)
+ENROLL_STAGES = 10
+
+
+def confirm_release(stage, *, accepted=True, input_fn=input, output=print):
+    output("")
+    output("=" * 68)
+    if accepted:
+        output(f"STAGE {stage}/{ENROLL_STAGES} ACCEPTED")
+    else:
+        output(f"STAGE {stage + 1}/{ENROLL_STAGES} NEEDS ANOTHER PRESENTATION")
+    output("LIFT YOUR FINGER COMPLETELY OFF THE SENSOR.")
+    input_fn("Press Enter only after the finger is lifted: ")
+    output("PLACE THE SAME FINGER AGAIN using a different position or angle.")
+    output("=" * 68)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Enroll one EH575 finger with explicit presentation prompts.")
+    parser.add_argument("-f", "--finger", required=True, choices=FINGERS)
+    parser.add_argument(
+        "username", nargs="?", default=pwd.getpwuid(os.getuid()).pw_name)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    manager = dbus.Interface(
+        bus.get_object(
+            "net.reactivated.Fprint", "/net/reactivated/Fprint/Manager"),
+        "net.reactivated.Fprint.Manager",
+    )
+    device_path = manager.GetDefaultDevice()
+    device_object = bus.get_object("net.reactivated.Fprint", device_path)
+    device = dbus.Interface(device_object, "net.reactivated.Fprint.Device")
+    loop = GLib.MainLoop()
+    state = {"stage": 0, "done": False, "result": 1}
+
+    def on_status(result, done):
+        result = str(result)
+        print(f"Enrollment status: {result}", flush=True)
+        if result == "enroll-stage-passed":
+            state["stage"] += 1
+            confirm_release(state["stage"])
+        elif result.startswith("enroll-retry"):
+            print("That presentation was not accepted.", flush=True)
+            confirm_release(state["stage"], accepted=False)
+        if done:
+            state["done"] = True
+            state["result"] = 0 if result == "enroll-completed" else 1
+            loop.quit()
+
+    device_object.connect_to_signal(
+        "EnrollStatus", on_status,
+        dbus_interface="net.reactivated.Fprint.Device")
+    device.Claim(args.username)
+    try:
+        print(f"Ready to enroll {args.finger} for {args.username}.", flush=True)
+        input("Press Enter when ready, then place that finger on the sensor: ")
+        device.EnrollStart(args.finger)
+        loop.run()
+    except KeyboardInterrupt:
+        print("\nEnrollment canceled.", file=sys.stderr)
+    finally:
+        if not state["done"]:
+            try:
+                device.EnrollStop()
+            except dbus.DBusException:
+                pass
+        try:
+            device.Release()
+        except dbus.DBusException:
+            pass
+    return state["result"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

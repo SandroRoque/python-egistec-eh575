@@ -179,12 +179,9 @@ sudo ./egis-lab install-enrollment-session SESSION_ID --username USERNAME
 ## Usage
 
 ```bash
-# Enroll the default finger (right index)
-fprintd-enroll
-
-# Enroll a specific finger
-fprintd-enroll -f right-thumb
-fprintd-enroll -f left-index-finger
+# Guided enrollment explicitly confirms lift-and-replace between all ten stages
+/opt/egis-driver/egis-enroll -f right-index-finger
+/opt/egis-driver/egis-enroll -f right-thumb
 
 # Verify
 fprintd-verify

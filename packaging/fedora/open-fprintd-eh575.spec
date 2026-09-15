@@ -33,9 +33,11 @@ install -d %{buildroot}/opt/egis-driver
 install -m 0755 "$project/bin/open-fprintd" %{buildroot}/opt/egis-driver/open-fprintd
 install -m 0755 "$project/bin/egis-bridge" %{buildroot}/opt/egis-driver/egis-bridge
 install -m 0755 "$project/bin/egis-calibrate" %{buildroot}/opt/egis-driver/egis-calibrate
+install -m 0755 "$project/bin/egis-enroll" %{buildroot}/opt/egis-driver/egis-enroll
 install -m 0755 %{_builddir}/%{name}-%{version}/egis-doctor %{buildroot}/opt/egis-driver/egis-doctor
 install -d %{buildroot}%{_bindir}
 ln -s ../../opt/egis-driver/egis-doctor %{buildroot}%{_bindir}/egis-doctor
+ln -s ../../opt/egis-driver/egis-enroll %{buildroot}%{_bindir}/egis-enroll
 cp -r "$project/openfprintd" "$project/egis_driver" "$project/egis_matcher" \
   %{buildroot}/opt/egis-driver/
 install -D -m 0644 "$project/open-fprintd.service" %{buildroot}%{_unitdir}/open-fprintd.service
@@ -64,6 +66,7 @@ udevadm control --reload-rules && udevadm trigger || :
 %license LICENSE open-fprintd-eh575/openfprintd/COPYING
 /opt/egis-driver/
 %{_bindir}/egis-doctor
+%{_bindir}/egis-enroll
 %{_unitdir}/open-fprintd.service
 %{_unitdir}/egis-bridge.service
 %{_datadir}/polkit-1/actions/net.reactivated.fprint.policy

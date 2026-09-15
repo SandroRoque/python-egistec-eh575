@@ -115,6 +115,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             "io.github.uunicorn.Fprint.Device.Egis.conf",
             "70-egis-eh575.rules",
             "egis-doctor",
+            "egis-enroll",
         ):
             self.assertIn(source, arch)
             self.assertIn(source, fedora)

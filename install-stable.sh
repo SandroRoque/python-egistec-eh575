@@ -12,7 +12,7 @@ CONFIG_BACKUP=""
 INSTALLED=0
 COMMITTED=0
 
-PAYLOAD=(open-fprintd egis-bridge egis-calibrate)
+PAYLOAD=(open-fprintd egis-bridge egis-calibrate egis-enroll)
 CONFIG_SOURCES=(
   "70-egis-eh575.rules"
   "io.github.uunicorn.Fprint.Device.Egis.conf"
