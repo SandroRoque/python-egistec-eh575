@@ -105,6 +105,17 @@ class PresentDriver(FakeDriver):
         return bytes(103 * 52), 30.0
 
 
+class PresentUntilReleasedDriver(FakeDriver):
+    def __init__(self):
+        super().__init__()
+        self.released = threading.Event()
+
+    def capture_presence_frame(self, read_timeout=1500):
+        self.capture_count += 1
+        present = not self.released.is_set()
+        return bytes(103 * 52), 35.0 if present else 0.0, present
+
+
 class CountingPresentDriver(PresentDriver):
     def __init__(self):
         super().__init__()
@@ -123,7 +134,7 @@ class ControlledRecoveryService(EgisService):
     def prepare_sensor(self, reason, force=False, sensor=None):
         return True
 
-    def _wait_for_finger_release(self, operation):
+    def _wait_for_finger_release(self, operation, **kwargs):
         return
 
     def _start_resume_recovery(self):
@@ -242,7 +253,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         )
         service._active_operation = operation
 
-        with mock.patch("egis_driver.services.time.sleep"):
+        with mock.patch.object(service, "_wait_for_finger_release") as wait_release:
             for value in range(10):
                 frame = bytes([value]) * (103 * 52)
                 service._handle_enroll(
@@ -257,6 +268,31 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(len(touch_groups), 10)
         self.assertEqual([len(group) for group in touch_groups], [1] * 10)
         self.assertEqual([group[0][0] for group in touch_groups], list(range(10)))
+        self.assertEqual(wait_release.call_count, 9)
+        wait_release.assert_called_with(
+            operation, clear_frames=4, clear_seconds=0.3)
+
+    def test_enrollment_does_not_advance_while_finger_remains_present(self):
+        matcher = EnrollmentMatcher()
+        driver = PresentUntilReleasedDriver()
+        service = EgisService(driver=driver, matcher=matcher)
+        self.addCleanup(service.close)
+        operation = ScanOperation(
+            1, ("enroll", "testuser", "right-index-finger", True))
+        service._active_operation = operation
+        worker = threading.Thread(
+            target=service._handle_enroll,
+            args=(operation, bytes(103 * 52), "testuser", "right-index-finger"),
+        )
+        worker.start()
+        time.sleep(0.45)
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(service._enroll_touch_count, 1)
+        self.assertIsNone(matcher.enrollment)
+
+        driver.released.set()
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
 
     def test_verification_requires_three_consecutive_matches(self):
         matcher = AlwaysMatchMatcher()

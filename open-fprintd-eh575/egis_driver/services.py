@@ -21,6 +21,8 @@ from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 logger = logging.getLogger("SERVICE")
 
 ENROLL_STAGES = 10
+ENROLL_RELEASE_CLEAR_FRAMES = 4
+ENROLL_RELEASE_MIN_SECONDS = 0.3
 VERIFY_FRAME_COUNT = 3
 VERIFY_CONFIRMATION_ATTEMPTS = 3
 PRODUCTION_CONFIRMATION_POLICY = ConfirmationPolicy(
@@ -589,23 +591,31 @@ class EgisService:
     #  Scan loop
     # ------------------------------------------------------------------
 
-    def _wait_for_finger_release(self, operation):
+    def _wait_for_finger_release(self, operation, *, clear_frames=2,
+                                 clear_seconds=0.0):
         logger.info("Waiting for finger release...")
         time.sleep(0.3)
         consecutive_clears = 0
+        clear_since = None
         while self._is_operation_active(operation):
             frame, _, is_present = self._operation_sensor(operation).capture_presence_frame()
             if frame is None:
                 consecutive_clears = 0
+                clear_since = None
                 operation.cancel_event.wait(0.1)
                 continue
             if not is_present:
+                if consecutive_clears == 0:
+                    clear_since = time.monotonic()
                 consecutive_clears += 1
-                if consecutive_clears >= 2:
+                clear_elapsed = time.monotonic() - clear_since
+                if (consecutive_clears >= clear_frames and
+                        clear_elapsed >= clear_seconds):
                     logger.info("Sensor clear. Ready.")
                     return
             else:
                 consecutive_clears = 0
+                clear_since = None
             time.sleep(0.1)
 
     def _scan_loop(self, operation, mode, username, finger_name,
@@ -791,6 +801,8 @@ class EgisService:
 
         if count < target:
             self._emit_enroll("enroll-stage-passed", False, operation)
+            logger.info(
+                "Enrollment stage accepted; lift finger before next presentation.")
         else:
             unique_name = f"{username}_{finger_name}"
             logger.info("Processing enrollment for %s (%d total frames)...",
@@ -809,7 +821,11 @@ class EgisService:
             self._enroll_touch_count = 0
 
         if self._is_operation_active(operation):
-            self._wait_for_finger_release(operation)
+            self._wait_for_finger_release(
+                operation,
+                clear_frames=ENROLL_RELEASE_CLEAR_FRAMES,
+                clear_seconds=ENROLL_RELEASE_MIN_SECONDS,
+            )
 
     # ------------------------------------------------------------------
     #  Verify logic

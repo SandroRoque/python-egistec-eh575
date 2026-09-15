@@ -109,6 +109,12 @@ fingerprint engine. Gallery files contain checksummed opaque feature records and
 metadata, never raw pixels. Engine configuration and schema mismatches fail
 closed; re-enrollment replaces migration.
 
+Production enrollment requires ten independent presentations. After each accepted
+stage, progress is reported to the client and capture remains blocked until the
+sensor observes four consecutive no-contact frames spanning at least 300 ms.
+Continuous contact can therefore contribute only one presentation, and every
+presentation remains a separate input to template and gallery construction.
+
 The live gallery worker consumes the ordered stream one frame at a time and
 reports per-identity scores, margins, extraction failures, and timing as shadow
 telemetry. Queue loss, capture discontinuities, and worker restarts clear its
