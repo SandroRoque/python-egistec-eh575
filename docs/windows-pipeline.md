@@ -91,6 +91,21 @@ sensor. The capture workflow now resets the sensor before capture, enables both
 flags defensively, and rejects each empty biometric timeline phase rather than
 validating aggregate session traffic.
 
+The validated v4 Windows session establishes the image transfer boundary. Each
+103 by 52 image arrives on endpoint `0x82` as a 5,120-byte prefix immediately
+followed by a 236-byte suffix. Across 756 images there were no missing,
+misordered, cross-device, or late fragment pairs. The private decoder therefore
+reassembles only same-device `5120 + 236` pairs separated by at most 100 ms and
+fails closed on replacement prefixes, intervening status payloads, or orphaned
+suffixes.
+
+The session produced 358 enrollment frames, genuine sequences of 47, 47, and
+48 frames, and right-pinky impostor sequences of 87, 63, and 64 frames. Both
+untouched controls produced zero frames. The same 5,356-byte `0x73` calibration
+upload (SHA-256 `183c3fad...fb676`) recurred byte-for-byte across independent
+processes and touches, which establishes that it is stable device calibration
+state rather than touch image data.
+
 ## Enrollment Engine
 
 The engine reads Windows' `Minimum Fingerprint Samples`. Values from 8 through

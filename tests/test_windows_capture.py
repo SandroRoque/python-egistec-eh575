@@ -10,6 +10,57 @@ from egis_driver.windows_capture import (
 
 
 class WindowsCaptureTests(unittest.TestCase):
+    def fragmented_packets(self, middle=(), suffix_time=1.02, suffix_device=3):
+        return [
+            UsbPacket(1, 1.0, 0x01, "3", b"EGIS\x64\x14\xec", bus=2, device=3),
+            UsbPacket(2, 1.01, 0x82, "3", bytes([17]) * 5120, bus=2, device=3),
+            *middle,
+            UsbPacket(9, suffix_time, 0x82, "3", bytes([23]) * 236,
+                      bus=2, device=suffix_device),
+        ]
+
+    def test_windows_fragment_pair_is_reassembled_as_one_frame(self):
+        report, frames = analyze_packets(self.fragmented_packets())
+        self.assertEqual(frames, [bytes([17]) * 5120 + bytes([23]) * 236])
+        self.assertEqual(report["fragmented_frame_count"], 1)
+        self.assertEqual(report["orphan_frame_prefix_count"], 0)
+        self.assertEqual(report["orphan_frame_suffix_count"], 0)
+
+    def test_windows_fragment_missing_suffix_is_not_a_frame(self):
+        report, frames = analyze_packets(self.fragmented_packets()[:-1])
+        self.assertEqual(frames, [])
+        self.assertEqual(report["orphan_frame_prefix_count"], 1)
+
+    def test_windows_fragments_from_different_addresses_do_not_mix(self):
+        other_device = UsbPacket(3, 1.015, 0x01, "3", b"EGIS\x64\x14\xec",
+                                 bus=2, device=4)
+        report, frames = analyze_packets(self.fragmented_packets(
+            middle=[other_device], suffix_device=4))
+        self.assertEqual(frames, [])
+        self.assertEqual(report["orphan_frame_prefix_count"], 1)
+        self.assertEqual(report["orphan_frame_suffix_count"], 1)
+
+    def test_windows_fragment_pair_over_timeout_is_not_a_frame(self):
+        report, frames = analyze_packets(self.fragmented_packets(suffix_time=1.2))
+        self.assertEqual(frames, [])
+        self.assertEqual(report["orphan_frame_prefix_count"], 1)
+        self.assertEqual(report["orphan_frame_suffix_count"], 1)
+
+    def test_short_status_between_fragments_invalidates_prefix(self):
+        status = UsbPacket(3, 1.015, 0x82, "3", b"SIGE\x00\x00\x01",
+                           bus=2, device=3)
+        report, frames = analyze_packets(self.fragmented_packets(middle=[status]))
+        self.assertEqual(frames, [])
+        self.assertEqual(report["orphan_frame_prefix_count"], 1)
+        self.assertEqual(report["orphan_frame_suffix_count"], 1)
+
+    def test_repeated_windows_prefix_replaces_incomplete_frame(self):
+        replacement = UsbPacket(3, 1.015, 0x82, "3", bytes([19]) * 5120,
+                                bus=2, device=3)
+        report, frames = analyze_packets(self.fragmented_packets(middle=[replacement]))
+        self.assertEqual(frames, [bytes([19]) * 5120 + bytes([23]) * 236])
+        self.assertEqual(report["orphan_frame_prefix_count"], 1)
+
     def test_windows_wizard_automates_capture_lifecycle_and_reenumeration(self):
         script = (Path(__file__).parents[1] / "tools" / "windows-capture.ps1").read_text()
         self.assertIn('"--capture-from-all-devices"', script)

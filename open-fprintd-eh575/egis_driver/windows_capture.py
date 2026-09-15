@@ -17,6 +17,9 @@ from egis_driver.streaming import FrameStatus
 
 
 FRAME_BYTES = 103 * 52
+WINDOWS_FRAME_PREFIX_BYTES = 5120
+WINDOWS_FRAME_SUFFIX_BYTES = FRAME_BYTES - WINDOWS_FRAME_PREFIX_BYTES
+WINDOWS_FRAME_FRAGMENT_TIMEOUT_SECONDS = 0.100
 MAX_CAPTURE_BYTES = 1024 * 1024 * 1024
 
 
@@ -229,6 +232,9 @@ def analyze_packets(packets, vendor_id=0x1C7A, product_id=0x0575):
     traffic_runs = []
     origin = sensor_packets[0].time_epoch if sensor_packets else 0.0
     pending = {}
+    frame_prefixes = {}
+    orphan_frame_prefixes = 0
+    orphan_frame_suffixes = 0
 
     def record_run(packet, kind):
         offset_ms = round((packet.time_epoch - origin) * 1000, 3)
@@ -246,10 +252,49 @@ def analyze_packets(packets, vendor_id=0x1C7A, product_id=0x0575):
     for packet in sensor_packets:
         address = (packet.bus, packet.device)
         payload = packet.payload
+        expired = [key for key, (prefix_packet, _) in frame_prefixes.items()
+                   if packet.time_epoch - prefix_packet.time_epoch
+                   > WINDOWS_FRAME_FRAGMENT_TIMEOUT_SECONDS]
+        orphan_frame_prefixes += len(expired)
+        for key in expired:
+            frame_prefixes.pop(key)
         if not payload:
             if packet.status:
                 record_run(packet, f"usb-error:0x{packet.status:08x}")
             continue
+        if packet.endpoint == 0x82 and len(payload) == WINDOWS_FRAME_PREFIX_BYTES:
+            if address in frame_prefixes:
+                orphan_frame_prefixes += 1
+            frame_prefixes[address] = (packet, payload)
+            record_run(packet, f"raw-frame-prefix:in:{len(payload)}")
+            continue
+        if packet.endpoint == 0x82 and len(payload) == WINDOWS_FRAME_SUFFIX_BYTES:
+            prefix = frame_prefixes.pop(address, None)
+            if (prefix is not None and
+                    packet.time_epoch - prefix[0].time_epoch
+                    <= WINDOWS_FRAME_FRAGMENT_TIMEOUT_SECONDS):
+                frame = prefix[1] + payload
+                frames.append(frame)
+                protocol_events.append({
+                    "kind": "raw-frame",
+                    "offset_ms": round((prefix[0].time_epoch - origin) * 1000, 3),
+                    "bus": packet.bus, "device": packet.device,
+                    "endpoint": "0x82", "direction": "in",
+                    "length": len(frame), "fragment_lengths": [
+                        WINDOWS_FRAME_PREFIX_BYTES, WINDOWS_FRAME_SUFFIX_BYTES],
+                    "fragment_gap_ms": round(
+                        (packet.time_epoch - prefix[0].time_epoch) * 1000, 3),
+                    "sha256": hashlib.sha256(frame).hexdigest(),
+                    "linked_opcode": None,
+                })
+                record_run(packet, f"raw-frame-fragmented:in:{len(frame)}")
+            else:
+                orphan_frame_suffixes += 1
+                record_run(packet, f"orphan-frame-suffix:in:{len(payload)}")
+            continue
+        if packet.endpoint == 0x82 and address in frame_prefixes:
+            frame_prefixes.pop(address)
+            orphan_frame_prefixes += 1
         if payload.startswith(b"EGIS") and len(payload) >= 5:
             signature = packet.payload[:32].hex()
             commands[signature] += 1
@@ -307,6 +352,7 @@ def analyze_packets(packets, vendor_id=0x1C7A, product_id=0x0575):
         warnings.append("EH575 descriptor found but no EGIS protocol traffic was captured")
     if commands and not (frames or calibration):
         warnings.append("EGIS traffic found but no linked full-size transfer was captured")
+    orphan_frame_prefixes += len(frame_prefixes)
     return {
         "packet_count": len(packets),
         "sensor_packet_count": len(sensor_packets),
@@ -321,6 +367,11 @@ def analyze_packets(packets, vendor_id=0x1C7A, product_id=0x0575):
         "in_payload_lengths": {str(key): value for key, value in sorted(response_lengths.items())},
         "candidate_frame_count": len(frames),
         "candidate_boundary_confirmed": bool(frames),
+        "fragmented_frame_count": sum(
+            event["kind"] == "raw-frame" and "fragment_lengths" in event
+            for event in protocol_events),
+        "orphan_frame_prefix_count": orphan_frame_prefixes,
+        "orphan_frame_suffix_count": orphan_frame_suffixes,
         "calibration_upload_count": len(calibration),
         "calibration_uploads": [_payload_summary(payload) for payload in calibration],
         "unlinked_large_transfer_count": len(unlinked_large),
