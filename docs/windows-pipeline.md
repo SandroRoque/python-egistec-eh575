@@ -82,6 +82,15 @@ contained the address-5 descriptor but bulk traffic only for unrelated address
 1. They contain no Windows verification or enrollment sensor stream and must
 not be used to infer matcher behavior.
 
+A subsequent continuous capture isolated the capture failure: EH575 traffic
+ended exactly when the device was disabled during initialization, while the
+PCAP continued for another 189 seconds. USBPcap's upstream command interface
+distinguishes `--capture-from-all-devices` from
+`--capture-from-new-devices`; both are required to retain a re-enumerated
+sensor. The capture workflow now resets the sensor before capture, enables both
+flags defensively, and rejects each empty biometric timeline phase rather than
+validating aggregate session traffic.
+
 ## Enrollment Engine
 
 The engine reads Windows' `Minimum Fingerprint Samples`. Values from 8 through

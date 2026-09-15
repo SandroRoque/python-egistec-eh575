@@ -892,16 +892,20 @@ def cmd_analyze_windows_capture(args):
                     "calibration_upload_count": item["calibration_upload_count"],
                     "candidate_frame_count": item["candidate_frame_count"],
                     "candidate_boundary_confirmed": item["candidate_boundary_confirmed"],
+                    "timeline_capture_valid": item["timeline_capture_valid"],
+                    "failed_timeline_phases": item["failed_timeline_phases"],
                     "timeline_phases": [
                         {"phase": phase["phase"],
                          "sensor_packet_count": phase["sensor_packet_count"],
                          "calibration_upload_count": phase["calibration_upload_count"],
-                         "candidate_frame_count": phase["candidate_frame_count"]}
+                         "candidate_frame_count": phase["candidate_frame_count"],
+                         "phase_capture_valid": phase["phase_capture_valid"]}
                         for phase in item["timeline_phases"]]}
                    for item in report["phases"]],
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(output / "analysis.json")
+    return 0 if all(item["timeline_capture_valid"] for item in report["phases"]) else 2
 
 
 def cmd_compare_windows_linux(args):

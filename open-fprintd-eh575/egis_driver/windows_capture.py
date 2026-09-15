@@ -380,15 +380,30 @@ def write_capture_analysis(captures, output, tshark="tshark"):
             phase_file = output / f"{capture.stem}.{item['phase']}.frames.bin"
             phase_file.write_bytes(b"".join(phase_frames))
             phase_file.chmod(0o600)
+            expects_biometric_traffic = item["phase"].startswith(
+                ("genuine-", "impostor-", "temporary-enrollment"))
+            phase_capture_valid = (
+                phase_report["protocol_traffic_present"]
+                and bool(phase_frames or phase_report["unlinked_large_transfer_count"])
+            ) if expects_biometric_traffic else True
             timed_phases.append({
                 "phase": item["phase"], "instruction": item["instruction"],
-                "frames_file": phase_file.name, **phase_report,
+                "frames_file": phase_file.name,
+                "expects_biometric_traffic": expects_biometric_traffic,
+                "phase_capture_valid": phase_capture_valid,
+                **phase_report,
             })
+        failed_timeline_phases = [
+            phase["phase"] for phase in timed_phases
+            if phase["expects_biometric_traffic"] and not phase["phase_capture_valid"]
+        ]
         phases.append({
             "phase": Path(capture).stem,
             "capture_sha256": hashlib.sha256(Path(capture).read_bytes()).hexdigest(),
             "frames_file": frame_file.name,
             "timeline_phases": timed_phases,
+            "timeline_capture_valid": not failed_timeline_phases,
+            "failed_timeline_phases": failed_timeline_phases,
             **report,
         })
     result = {"schema_version": 2, "private": True, "frame_geometry": [103, 52], "phases": phases}

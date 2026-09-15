@@ -9,26 +9,28 @@ biometric data.
 
 1. Install Wireshark with USBPcap from the official installer.
 2. Copy `tools/windows-capture.ps1` to Windows.
-3. Open an elevated PowerShell window.
-4. Run `USBPcapCMD.exe` once without capture arguments to display the USBPcap
-   root hubs and attached devices. Find `1c7a:0575` and record its control
-   device (for example `\\.\USBPcap2`). The wizard follows changing device
-   addresses within that root.
+3. Insert the handoff USB drive as `D:` and open an elevated PowerShell window.
 
 Run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\windows-capture.ps1 -UsbPcapDevice "\\.\USBPcap2"
+.\windows-capture.ps1
 ```
 
-The wizard first records and validates a device reinitialization. It then keeps
-one root-wide capture open across all verification actions, validates that it
-contains EH575 commands and full-size transfers, and only then records the
-temporary enrollment. It exports the installed driver, hashes its files,
-records device and WinBio configuration, and writes exact action times to
-`timeline.jsonl`. Read every prompt before pressing Enter. Delete the temporary
-enrollment afterward.
+`USBPcap2` is the root established for this machine. Override it only if the
+hardware moves to another controller: `-UsbPcapDevice "\\.\USBPcapN"`.
+
+The wizard resets and waits for the EH575, starts USBPcap with both
+`--capture-from-all-devices` and `--capture-from-new-devices`, records the
+baselines, locks Windows for each verification attempt, detects return from the
+lock screen, opens enrollment settings, timestamps phases, validates every
+biometric phase separately, and copies the validated result to `D:`. The user
+only presents the named finger, enters the PIN after an expected rejection, and
+completes/closes the Windows enrollment UI.
+
+The per-phase gate is intentional: initialization commands or calibration data
+cannot make an otherwise empty verification capture pass.
 
 ## Return to Linux
 

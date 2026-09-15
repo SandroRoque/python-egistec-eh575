@@ -10,6 +10,16 @@ from egis_driver.windows_capture import (
 
 
 class WindowsCaptureTests(unittest.TestCase):
+    def test_windows_wizard_automates_capture_lifecycle_and_reenumeration(self):
+        script = (Path(__file__).parents[1] / "tools" / "windows-capture.ps1").read_text()
+        self.assertIn('"--capture-from-all-devices"', script)
+        self.assertIn('"--capture-from-new-devices"', script)
+        self.assertIn("Disable-PnpDevice", script)
+        self.assertIn("Enable-PnpDevice", script)
+        self.assertIn("LockWorkStation", script)
+        self.assertIn("Copy-Item", script)
+        self.assertNotIn("Read-Host", script)
+
     def test_packet_analysis_never_copies_image_payload_into_report(self):
         frame = bytes(range(256)) * 20 + bytes(236)
         report, frames = analyze_packets([
@@ -146,6 +156,36 @@ class WindowsCaptureTests(unittest.TestCase):
             phase = report["phases"][0]["timeline_phases"][0]
             self.assertEqual(phase["phase"], "genuine-1")
             self.assertEqual(phase["candidate_frame_count"], 1)
+            self.assertTrue(phase["phase_capture_valid"])
+            self.assertTrue(report["phases"][0]["timeline_capture_valid"])
+
+    def test_capture_analysis_rejects_empty_biometric_timeline_phase(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "verification.pcap"
+            capture.write_bytes(b"capture")
+            (root / "timeline.jsonl").write_text(
+                json.dumps({
+                    "capture": "verification", "phase": "impostor-right-pinky-1",
+                    "started": "1970-01-01T00:00:10+00:00",
+                    "stopped": "1970-01-01T00:00:12+00:00",
+                    "instruction": "right pinky",
+                }) + "\n", encoding="utf-8")
+            output = root / "result"
+            import egis_driver.windows_capture as module
+            original = module.decode_usbpcap
+            module.decode_usbpcap = lambda *args, **kwargs: [
+                UsbPacket(1, 11.0, 0x01, "3", b"unrelated", bus=1, device=1),
+            ]
+            try:
+                report = write_capture_analysis([capture], output)
+            finally:
+                module.decode_usbpcap = original
+            phase = report["phases"][0]["timeline_phases"][0]
+            self.assertFalse(phase["phase_capture_valid"])
+            self.assertFalse(report["phases"][0]["timeline_capture_valid"])
+            self.assertEqual(report["phases"][0]["failed_timeline_phases"],
+                             ["impostor-right-pinky-1"])
 
 
 if __name__ == "__main__":

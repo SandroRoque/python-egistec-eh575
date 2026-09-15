@@ -1,159 +1,228 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][string]$UsbPcapDevice,
+    [string]$UsbPcapDevice = "\\.\USBPcap2",
     [string]$OutputDirectory,
-    [string]$UsbPcapCmd = "USBPcapCMD.exe",
-    [string]$Tshark = "tshark.exe"
+    [string]$UsbPcapCmd = "C:\Program Files\USBPcap\USBPcapCMD.exe",
+    [string]$Tshark = "C:\Program Files\Wireshark\tshark.exe",
+    [string]$UsbDestinationRoot = "D:\"
 )
 
 $ErrorActionPreference = "Stop"
+$SensorId = "USB\VID_1C7A&PID_0575*"
+$ActivePhasePattern = "^(genuine-|impostor-|temporary-enrollment)"
+
+function Resolve-Tool([string]$Value, [string]$Label) {
+    if (Test-Path -LiteralPath $Value -PathType Leaf) { return (Resolve-Path -LiteralPath $Value).Path }
+    $command = Get-Command $Value -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    throw "$Label was not found: $Value"
+}
+
+function Get-Eh575 {
+    Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like $SensorId } |
+        Select-Object -First 1
+}
+
+function Reset-Eh575 {
+    $device = Get-Eh575
+    if (-not $device) { throw "EH575 USB device 1c7a:0575 was not found." }
+    Write-Host "Resetting EH575 before capture..."
+    Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
+    Start-Sleep -Seconds 2
+    Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
+    $deadline = (Get-Date).AddSeconds(30)
+    do { Start-Sleep -Milliseconds 500; $device = Get-Eh575 }
+    until (($device -and $device.Status -eq "OK") -or (Get-Date) -ge $deadline)
+    if (-not $device -or $device.Status -ne "OK") {
+        throw "EH575 did not return to status OK after its automated reset."
+    }
+    Start-Sleep -Seconds 3
+    return $device
+}
+
+function Add-TimelineEntry {
+    param([string]$Capture, [string]$Phase, [string]$Instruction,
+          [datetime]$Started, [datetime]$Stopped)
+    [pscustomobject]@{
+        capture=$Capture; phase=$Phase; started=$Started.ToString("o")
+        stopped=$Stopped.ToString("o"); instruction=$Instruction
+    } | ConvertTo-Json -Compress | Out-File -LiteralPath $script:Timeline `
+        -Append -Encoding utf8
+}
+
+function Start-RootCapture([string]$Name) {
+    $path = Join-Path $OutputDirectory "$Name.pcap"
+    $arguments = @(
+        "-d", $UsbPcapDevice, "-o", $path, "-s", "65535",
+        "-b", "33554432", "--capture-from-all-devices",
+        "--capture-from-new-devices", "--inject-descriptors"
+    )
+    Write-Host "Starting automated root capture on $UsbPcapDevice..."
+    $process = Start-Process -FilePath $UsbPcapCmd -ArgumentList $arguments `
+        -PassThru -NoNewWindow
+    Start-Sleep -Seconds 2
+    $process.Refresh()
+    if ($process.HasExited) { throw "USBPcap exited during startup with code $($process.ExitCode)." }
+    [pscustomobject]@{Name=$Name; Path=$path; Process=$process}
+}
+
+function Stop-RootCapture($Capture) {
+    # USBPcapCMD exposes no programmatic stop option. Terminating its controller
+    # closes its driver/file handles; tshark rejects a truncated result below.
+    Stop-Process -Id $Capture.Process.Id -ErrorAction Stop
+    $Capture.Process.WaitForExit(5000) | Out-Null
+    Start-Sleep -Seconds 1
+    if (-not (Test-Path -LiteralPath $Capture.Path -PathType Leaf)) {
+        throw "Capture file was not created: $($Capture.Path)"
+    }
+    & $Tshark -r $Capture.Path -q 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "tshark rejected the stopped capture as malformed." }
+}
+
+function Show-Countdown([string]$Message, [int]$Seconds = 4) {
+    Write-Host ""; Write-Host ("=" * 68) -ForegroundColor Cyan
+    Write-Host $Message -ForegroundColor Yellow
+    for ($remaining = $Seconds; $remaining -gt 0; $remaining--) {
+        Write-Host "Starting in $remaining..."; Start-Sleep -Seconds 1
+    }
+}
+
+function Wait-ForProcessState([string]$Name, [bool]$Present, [int]$TimeoutSeconds) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $found = [bool](Get-Process $Name -ErrorAction SilentlyContinue)
+        if ($found -eq $Present) { return }
+        Start-Sleep -Milliseconds 250
+    } until ((Get-Date) -ge $deadline)
+    throw "Timed out waiting for process '$Name' present=$Present."
+}
+
+function Record-LockAttempt([string]$Phase, [string]$Finger, [bool]$ExpectMatch) {
+    $outcome = if ($ExpectMatch) { "unlock" } else { "reject, then use your PIN" }
+    $instruction = "Use only your $Finger; expect $outcome. Lift it completely afterward."
+    Show-Countdown "NEXT: $instruction"
+    $started = Get-Date
+    Start-Process rundll32.exe -ArgumentList "user32.dll,LockWorkStation"
+    Wait-ForProcessState "LogonUI" $true 15
+    Wait-ForProcessState "LogonUI" $false 120
+    Add-TimelineEntry $script:Session.Name $Phase $instruction $started (Get-Date)
+    Write-Host "$Phase completed; keep the sensor clear." -ForegroundColor Green
+    Start-Sleep -Seconds 4
+}
+
+function Record-Enrollment {
+    $instruction = "Enroll one currently unenrolled finger, then close the Settings window."
+    Show-Countdown "NEXT: $instruction"
+    $started = Get-Date
+    Start-Process "ms-settings:signinoptions"
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        Start-Sleep -Milliseconds 500
+        $settings = Get-Process SystemSettings -ErrorAction SilentlyContinue
+    } until (($settings -and ($settings | Where-Object MainWindowHandle -ne 0)) -or
+             (Get-Date) -ge $deadline)
+    if (-not $settings) { throw "Windows Settings did not open." }
+    $deadline = (Get-Date).AddMinutes(5)
+    do {
+        Start-Sleep -Milliseconds 500
+        $visible = Get-Process SystemSettings -ErrorAction SilentlyContinue |
+            Where-Object MainWindowHandle -ne 0
+    } until ((-not $visible) -or (Get-Date) -ge $deadline)
+    if ($visible) { throw "Timed out waiting for the enrollment Settings window to close." }
+    Add-TimelineEntry $script:Session.Name "temporary-enrollment" $instruction $started (Get-Date)
+    Start-Sleep -Seconds 4
+}
+
+function Get-PhaseSummary($Capture, $Phase) {
+    $start = [datetimeoffset]::Parse($Phase.started).ToUnixTimeMilliseconds() / 1000.0
+    $stop = [datetimeoffset]::Parse($Phase.stopped).ToUnixTimeMilliseconds() / 1000.0
+    $timeFilter = "frame.time_epoch >= $start && frame.time_epoch <= $stop"
+    $egis = @(& $Tshark -r $Capture.Path -Y `
+        "$timeFilter && usb.capdata contains 45:47:49:53" `
+        -T fields -e frame.number 2>$null | Where-Object { $_ })
+    $largeIn = @(& $Tshark -r $Capture.Path -Y `
+        "$timeFilter && usb.endpoint_address == 0x82 && usb.data_len >= 5356" `
+        -T fields -e frame.number 2>$null | Where-Object { $_ })
+    [pscustomobject]@{
+        phase=$Phase.phase; egis_packets=$egis.Count; large_in_transfers=$largeIn.Count
+        valid=($egis.Count -gt 0 -and $largeIn.Count -gt 0)
+    }
+}
+
+$UsbPcapCmd = Resolve-Tool $UsbPcapCmd "USBPcapCMD.exe"
+$Tshark = Resolve-Tool $Tshark "tshark.exe"
+if (Get-Process USBPcapCMD -ErrorAction SilentlyContinue) {
+    throw "USBPcapCMD.exe is already running. Close it before starting."
+}
+$stamp = Get-Date -Format "yyyyMMddTHHmmss"
 if (-not $OutputDirectory) {
-    $stamp = Get-Date -Format "yyyyMMddTHHmmss"
-    $OutputDirectory = Join-Path $env:USERPROFILE "Desktop\eh575-private-capture-$stamp"
+    $OutputDirectory = Join-Path $env:USERPROFILE "Desktop\eh575-private-capture-v3-$stamp"
 }
-
-$device = Get-PnpDevice -PresentOnly | Where-Object {
-    $_.InstanceId -like "USB\VID_1C7A&PID_0575*"
-} | Select-Object -First 1
-if (-not $device) { throw "EH575 USB device 1c7a:0575 was not found." }
-if (-not (Get-Command $UsbPcapCmd -ErrorAction SilentlyContinue)) {
-    throw "USBPcapCMD.exe was not found. Install USBPcap and reopen elevated PowerShell."
-}
-if (-not (Get-Command $Tshark -ErrorAction SilentlyContinue)) {
-    throw "tshark.exe was not found. Install Wireshark with USBPcap and reopen elevated PowerShell."
-}
-
 New-Item -ItemType Directory -Path $OutputDirectory -ErrorAction Stop | Out-Null
+$OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $principal = "$env:USERDOMAIN\$env:USERNAME"
 & icacls.exe $OutputDirectory /inheritance:r /grant:r "${principal}:(OI)(CI)F" | Out-Null
-$timeline = Join-Path $OutputDirectory "timeline.jsonl"
-$driverDirectory = Join-Path $OutputDirectory "driver"
-New-Item -ItemType Directory -Path $driverDirectory -ErrorAction Stop | Out-Null
+$script:Timeline = Join-Path $OutputDirectory "timeline.jsonl"
 
-$signed = Get-CimInstance Win32_PnPSignedDriver | Where-Object {
-    $_.DeviceID -eq $device.InstanceId
-} | Select-Object -First 1
-if ($signed -and $signed.InfName) {
-    & pnputil.exe /export-driver $signed.InfName $driverDirectory |
-        Out-File (Join-Path $OutputDirectory "driver-export.txt") -Encoding utf8
+$device = Reset-Eh575
+Write-Host "EH575 ready: $($device.InstanceId)"
+Write-Host "Only finger presentation and completing Windows UI remain manual." -ForegroundColor Green
+Write-Host "Biometric output remains private; do not upload or commit it." -ForegroundColor Red
+
+$script:Session = Start-RootCapture "01-session"
+try {
+    $started = Get-Date
+    Write-Host "Recording untouched baseline for 10 seconds..."
+    Start-Sleep -Seconds 10
+    Add-TimelineEntry $script:Session.Name "empty-baseline" "Sensor untouched." $started (Get-Date)
+    foreach ($attempt in 1..3) {
+        Record-LockAttempt "genuine-right-index-$attempt" "right index finger" $true
+    }
+    foreach ($attempt in 1..3) {
+        Record-LockAttempt "impostor-right-pinky-$attempt" "right pinky" $false
+    }
+    Record-Enrollment
+    $started = Get-Date
+    Write-Host "Recording final untouched baseline for 10 seconds..."
+    Start-Sleep -Seconds 10
+    Add-TimelineEntry $script:Session.Name "post-enrollment-empty" `
+        "Sensor untouched after enrollment." $started (Get-Date)
 }
+finally {
+    if (-not $script:Session.Process.HasExited) { Stop-RootCapture $script:Session }
+}
+
+$timelineRecords = @(Get-Content -LiteralPath $script:Timeline -Encoding utf8 |
+    ForEach-Object { $_ | ConvertFrom-Json })
+$phaseResults = @($timelineRecords | Where-Object phase -Match $ActivePhasePattern |
+    ForEach-Object { Get-PhaseSummary $script:Session $_ })
+$validation = [pscustomobject]@{
+    capture=$script:Session.Name; usbpcap_device=$UsbPcapDevice; phases=$phaseResults
+    valid=($phaseResults.Count -eq 7 -and
+        @($phaseResults | Where-Object { -not $_.valid }).Count -eq 0)
+}
+$validation | ConvertTo-Json -Depth 4 | Out-File `
+    (Join-Path $OutputDirectory "01-session-validation.json") -Encoding utf8
+$phaseResults | Format-Table -AutoSize
+if (-not $validation.valid) {
+    throw "A biometric phase lacked EH575 commands or full-size IN transfers. Preserve the directory; do not repeat blindly."
+}
+
 Get-PnpDeviceProperty -InstanceId $device.InstanceId | ConvertTo-Json -Depth 4 |
     Out-File (Join-Path $OutputDirectory "device-properties.json") -Encoding utf8
 & reg.exe export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WinBio" `
     (Join-Path $OutputDirectory "winbio.reg") /y | Out-Null
-$driverFiles = @(Get-ChildItem $driverDirectory -File -Recurse)
-if ($driverFiles.Count) {
-    Get-FileHash -Algorithm SHA256 $driverFiles | ConvertTo-Json |
-        Out-File (Join-Path $OutputDirectory "driver-hashes.json") -Encoding utf8
+Get-Item -LiteralPath $UsbPcapCmd, "C:\Windows\System32\drivers\USBPcap.sys" |
+    Select-Object FullName,@{Name="Version";Expression={$_.VersionInfo.FileVersion}} |
+    ConvertTo-Json | Out-File (Join-Path $OutputDirectory "usbpcap-versions.json") -Encoding utf8
+
+if (-not (Test-Path -LiteralPath $UsbDestinationRoot -PathType Container)) {
+    throw "USB destination root is unavailable: $UsbDestinationRoot"
 }
-
-function Start-RootCapture([string]$Name) {
-    $capture = Join-Path $OutputDirectory "$Name.pcap"
-    $arguments = @(
-        "-d", $UsbPcapDevice, "-o", $capture, "-s", "65535",
-        "-b", "33554432", "--capture-from-all-devices", "--inject-descriptors"
-    )
-    $process = Start-Process -FilePath $UsbPcapCmd -ArgumentList $arguments `
-        -PassThru -NoNewWindow
-    Start-Sleep -Seconds 2
-    return [pscustomobject]@{Name=$Name; Path=$capture; Process=$process}
+$destination = Join-Path $UsbDestinationRoot (Split-Path -Leaf $OutputDirectory)
+if (Test-Path -LiteralPath $destination) {
+    throw "USB destination already exists; refusing to overwrite it: $destination"
 }
-
-function Stop-RootCapture($Capture) {
-    Stop-Process -Id $Capture.Process.Id -ErrorAction SilentlyContinue
-    $Capture.Process.WaitForExit(5000) | Out-Null
-    Start-Sleep -Milliseconds 500
-    if (-not (Test-Path $Capture.Path)) { throw "Capture file was not created: $($Capture.Path)" }
-}
-
-function Write-Phase([string]$CaptureName, [string]$Phase, [string]$Instruction) {
-    Write-Host ""
-    Write-Host ("=" * 68) -ForegroundColor Cyan
-    Write-Host "NEXT PHASE: $Phase" -ForegroundColor Yellow
-    Write-Host $Instruction
-    Read-Host "Press Enter when you have read this and are ready"
-    $started = Get-Date -Format o
-    Read-Host "Perform the action now, then press Enter when it is complete"
-    [pscustomobject]@{
-        capture=$CaptureName; phase=$Phase; started=$started
-        stopped=(Get-Date -Format o); instruction=$Instruction
-    } | ConvertTo-Json -Compress | Add-Content $timeline
-}
-
-function Get-CaptureSummary([string]$CapturePath) {
-    $addressLines = @(& $Tshark -r $CapturePath `
-        -Y "usb.idVendor == 0x1c7a && usb.idProduct == 0x0575" `
-        -T fields -e usb.device_address 2>$null)
-    $addresses = @($addressLines | Where-Object { $_ -match '^\d+$' } |
-        Sort-Object -Unique)
-    if (-not $addresses.Count) {
-        return [pscustomobject]@{addresses=@(); egis=0; large=0; valid=$false}
-    }
-    $addressTerms = @($addresses | ForEach-Object { "usb.device_address == $_" })
-    $deviceFilter = "(" + ($addressTerms -join " || ") + ")"
-    $egisLines = @(& $Tshark -r $CapturePath `
-        -Y "$deviceFilter && usb.capdata contains 45:47:49:53" `
-        -T fields -e frame.number 2>$null | Where-Object { $_ })
-    $largeLines = @(& $Tshark -r $CapturePath `
-        -Y "$deviceFilter && usb.data_len >= 5356" `
-        -T fields -e frame.number 2>$null | Where-Object { $_ })
-    return [pscustomobject]@{
-        addresses=$addresses; egis=$egisLines.Count; large=$largeLines.Count
-        valid=($egisLines.Count -gt 0 -and $largeLines.Count -gt 0)
-    }
-}
-
-function Assert-Capture([string]$Label, $Capture) {
-    $summary = Get-CaptureSummary $Capture.Path
-    [pscustomobject]@{
-        capture=$Capture.Name; addresses=$summary.addresses
-        egis_packets=$summary.egis; large_transfers=$summary.large
-        valid=$summary.valid
-    } | ConvertTo-Json -Depth 3 | Out-File `
-        (Join-Path $OutputDirectory "$($Capture.Name)-validation.json") -Encoding utf8
-    Write-Host "$Label addresses: $($summary.addresses -join ', ')"
-    Write-Host "$Label EGIS packets: $($summary.egis); large transfers: $($summary.large)"
-    if (-not $summary.valid) {
-        throw "$Label did not capture usable EH575 traffic. Stop here and keep this directory for diagnosis."
-    }
-    Write-Host "$Label capture validated." -ForegroundColor Green
-}
-
-Write-Host "EH575 instance: $($device.InstanceId)"
-Write-Host "Capturing every device on $UsbPcapDevice so EH575 address changes are retained."
-Write-Host "All output is biometric/private. Do not upload or commit this directory." -ForegroundColor Red
-
-$preflight = Start-RootCapture "01-preflight"
-Write-Phase $preflight.Name "initialize" `
-    "In Device Manager, disable and re-enable the EH575, then wait until it reports ready."
-Stop-RootCapture $preflight
-Assert-Capture "Preflight" $preflight
-
-$verification = Start-RootCapture "02-verification"
-Write-Phase $verification.Name "empty-baseline" `
-    "Leave the fingerprint sensor completely untouched for ten seconds."
-foreach ($attempt in 1..3) {
-    Write-Phase $verification.Name ("genuine-right-index-{0}" -f $attempt) `
-        "Lock Windows and unlock once using only your right index finger. Lift it completely afterward."
-}
-foreach ($attempt in 1..3) {
-    Write-Phase $verification.Name ("impostor-right-pinky-{0}" -f $attempt) `
-        "At Windows Hello verification, touch only your unenrolled right pinky until it rejects. Lift it completely afterward."
-}
-Stop-RootCapture $verification
-Assert-Capture "Verification" $verification
-
-$enrollment = Start-RootCapture "03-enrollment"
-Write-Phase $enrollment.Name "temporary-enrollment" `
-    "In Settings > Accounts > Sign-in options, completely enroll one temporary finger."
-Write-Phase $enrollment.Name "post-enrollment-empty" `
-    "Lift the temporary finger completely and leave the sensor untouched for ten seconds."
-Stop-RootCapture $enrollment
-Assert-Capture "Enrollment" $enrollment
-
-Write-Host ""
-Write-Host "Capture complete and validated." -ForegroundColor Green
-Write-Host "Delete the temporary Windows enrollment now."
-Write-Host "Copy this whole directory to .egis-lab/windows-driver/fresh-v2/:"
-Write-Host $OutputDirectory
+Copy-Item -LiteralPath $OutputDirectory -Destination $destination -Recurse
+Write-Host "Validated capture copied automatically to $destination" -ForegroundColor Green
