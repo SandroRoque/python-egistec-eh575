@@ -120,6 +120,75 @@ skeleton is the authoritative template, a diagnostic representation, or an
 intermediate. Their call graph and mutation behavior must be resolved before
 implementing stream accumulation.
 
+The validated v4 capture and a narrower call-graph trace resolve part of that
+ambiguity. `CTouchSensor::EngineAdapterAcceptSampleData` first copies the input
+image into its original-image buffer, runs `FUN_180004540` to resample it to the
+sensor engine's configured dimensions, copies that result into a second image
+buffer, and passes the second buffer to `FUN_180007060`. The latter invokes the
+proprietary feature extractor, serializes its result, and writes that record to
+the skeleton buffer. Verification compares serialized feature records through
+`FUN_180006010`; it does not compare the debug image buffers directly.
+
+Enrollment calls `FUN_180005b10` once per accepted sample. Its state machine
+distinguishes accepted, redundant, completed, and failed samples and updates an
+enrollment object until the configured sample target is reached. On completion,
+`FUN_180006ed0` produces the final serialized enrollment record. This is direct
+evidence for feature-record accumulation across multiple presentations, not for
+building one photographic mosaic across the whole enrollment stream.
+
+These findings narrow, but do not eliminate, the unresolved work. The internal
+feature record layout, the sample redundancy test, the feature merge operation,
+and the final matcher score are proprietary routines and have not been ported.
+
+## Validated Authentication Timeline
+
+The v4 Windows Biometric Operational log independently confirms the labeled
+capture outcomes. Enrollment ran during the enrollment PCAP and completed with
+event 1010 at 16:31:34 UTC. Each right-index capture overlaps an event-1004
+success at 16:32:51, 16:33:15, and 16:33:38 UTC. The three pinky captures contain
+no corresponding success event; their later event-1005 records occur while the
+attempt remains unsuccessful. These correlations agree with the capture-session
+notes and rule out mislabeled successful probes as the explanation for the image
+evaluation results.
+
+## Matcher Diagnostics on the v4 Images
+
+Private offline evaluation tested SourceAFIS against all 358 enrollment frames,
+all 142 genuine frames, and all 214 pinky frames. Images were kept private; only
+aggregate conclusions are recorded here.
+
+At the best tested raw-frame scale, one genuine touch produced a continuous run
+of 35 frames above score 20 and a maximum score of 58.69. A second genuine touch
+produced weaker evidence (maximum 14.17), and the remaining genuine touch had no
+usable match (maximum 7.22), despite all three succeeding under Windows. Pinky
+trials produced isolated maxima up to 21.93, but no frame exceeded 20 in two of
+the three trials and no pinky produced a long run of strong scores.
+
+This establishes two separate facts:
+
+- coherent identity evidence exists in some individual 103 by 52 Windows
+  frames, so stitching is not a prerequisite for every useful comparison;
+- SourceAFIS extraction from raw strips is not sufficient to reproduce the
+  Windows decisions, even with exhaustive enrollment-frame comparison.
+
+The current largest-component stitch is also lossy for this capture: it retained
+only 48 of 358 enrollment frames because the Windows enrollment contains many
+separate presentations. Treating the entire enrollment as one coordinate system
+or selecting only its largest mosaic therefore discards most enrolled evidence.
+
+Naive transforms using the repeated 5,356-byte calibration upload—including
+offset background subtraction in both polarities, per-frame normalization, and
+CLAHE—did not recover the two weak genuine trials or create a safe separation.
+They remain diagnostics and must not be promoted into authentication.
+
+The implementation direction supported by current evidence is a gallery of
+per-presentation feature records with stream-level temporal evidence. SIFT can
+still estimate motion within a coherent swipe segment, but a single stitched
+image must not stand in for the full enrollment. Production integration remains
+blocked on either recovering the Windows correction/feature behavior or finding
+an extractor that works reliably on these narrow strips; merely lowering a
+SourceAFIS threshold would admit observed pinky scores.
+
 ## Evidence Rules
 
 - **Confirmed:** direct size, named-field, arithmetic, or call-order evidence.
