@@ -31,6 +31,7 @@ printf '%s  %s\n' "$SOURCEAFIS_SHA256" "$work/project/lib/sourceafis-$VERSION.ja
 install_parent=$(dirname "$PREFIX")
 mkdir -p "$install_parent"
 stage=$(mktemp -d "$install_parent/.sourceafis-$VERSION.XXXXXX")
+chmod 0755 "$stage"
 install -d -m 0755 "$stage/bin" "$stage/lib"
 install -m 0644 "$work/project/target/classes/EgisSourceAfisWorker.class" "$stage/lib/"
 install -m 0644 "$work/project/lib/"*.jar "$stage/lib/"
