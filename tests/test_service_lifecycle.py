@@ -219,6 +219,127 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["shadow_comparison_ms"], 45.0)
         self.assertEqual(summary["accepted_attempt_ms"], (100.0, 300.0, 480.0))
 
+    def test_unhandled_verify_scan_failure_emits_one_terminal_error(self):
+        statuses = []
+        service = EgisService(
+            driver=FakeDriver(),
+            matcher=FakeMatcher(),
+            on_verify_status=lambda result, done: statuses.append((result, done)),
+        )
+        self.addCleanup(service.close)
+
+        def fail(operation, *args):
+            raise RuntimeError("synthetic matcher failure")
+
+        operation = service._start_scan(fail, ("verify", "testuser", None))
+        operation.thread.join(timeout=1.0)
+
+        self.assertFalse(operation.thread.is_alive())
+        self.assertEqual(statuses, [("verify-unknown-error", True)])
+        self.assertIsNone(service._active_operation)
+
+    def test_unhandled_enroll_scan_failure_emits_terminal_failure(self):
+        statuses = []
+        service = EgisService(
+            driver=FakeDriver(),
+            matcher=FakeMatcher(),
+            on_enroll_status=lambda result, done: statuses.append((result, done)),
+        )
+        self.addCleanup(service.close)
+
+        def fail(operation, *args):
+            raise RuntimeError("synthetic sensor failure")
+
+        operation = service._start_scan(
+            fail, ("enroll", "testuser", "right-index-finger", True))
+        operation.thread.join(timeout=1.0)
+
+        self.assertFalse(operation.thread.is_alive())
+        self.assertEqual(statuses, [("enroll-failed", True)])
+        self.assertIsNone(service._active_operation)
+
+    def test_scan_failure_after_terminal_status_does_not_emit_duplicate(self):
+        statuses = []
+        service = EgisService(
+            driver=FakeDriver(),
+            matcher=FakeMatcher(),
+            on_verify_status=lambda result, done: statuses.append((result, done)),
+        )
+        self.addCleanup(service.close)
+
+        def finish_then_fail(operation, *args):
+            service._emit_verify("verify-no-match", True, operation)
+            raise RuntimeError("cleanup failure")
+
+        operation = service._start_scan(
+            finish_then_fail, ("verify", "testuser", None))
+        operation.thread.join(timeout=1.0)
+
+        self.assertEqual(statuses, [("verify-no-match", True)])
+        self.assertIsNone(service._active_operation)
+
+    def test_stale_scan_exception_cannot_emit_into_replacement(self):
+        statuses = []
+        stale_started = threading.Event()
+        release_stale = threading.Event()
+        replacement_ready = threading.Event()
+        service = EgisService(
+            driver=FakeDriver(),
+            matcher=FakeMatcher(),
+            on_verify_status=lambda result, done: statuses.append((result, done)),
+        )
+        self.addCleanup(service.close)
+
+        def stale_target(operation, *args):
+            stale_started.set()
+            release_stale.wait(timeout=1.0)
+            raise RuntimeError("stale worker failure")
+
+        def replacement_target(operation, *args):
+            replacement_ready.set()
+            operation.cancel_event.wait(timeout=1.0)
+
+        stale = service._start_scan(stale_target, ("verify", "alice", None))
+        self.assertTrue(stale_started.wait(timeout=1.0))
+        with mock.patch("egis_driver.services.SCAN_STOP_TIMEOUT_SECONDS", 0.01):
+            replacement = service._start_scan(
+                replacement_target, ("verify", "alice", "right-thumb"))
+        self.assertTrue(replacement_ready.wait(timeout=1.0))
+        release_stale.set()
+        stale.thread.join(timeout=1.0)
+
+        self.assertFalse(stale.thread.is_alive())
+        self.assertIs(service._active_operation, replacement)
+        self.assertEqual(statuses, [])
+
+    def test_new_scan_can_start_after_unhandled_failure(self):
+        statuses = []
+        service = EgisService(
+            driver=FakeDriver(),
+            matcher=FakeMatcher(),
+            on_verify_status=lambda result, done: statuses.append((result, done)),
+        )
+        self.addCleanup(service.close)
+
+        def fail(operation, *args):
+            raise RuntimeError("first scan failure")
+
+        first = service._start_scan(fail, ("verify", "alice", None))
+        first.thread.join(timeout=1.0)
+        self.assertEqual(statuses, [("verify-unknown-error", True)])
+
+        def succeed(operation, *args):
+            service._emit_verify("verify-no-match", True, operation)
+
+        second = service._start_scan(succeed, ("verify", "alice", None))
+        second.thread.join(timeout=1.0)
+
+        self.assertEqual(
+            statuses,
+            [("verify-unknown-error", True), ("verify-no-match", True)],
+        )
+        self.assertIsNone(service._active_operation)
+
     def _wait_until(self, predicate, timeout=1.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

@@ -3,6 +3,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -28,6 +29,10 @@ class FakeBackend(dbus.service.Object):
     @dbus.service.signal(INTERFACE, signature="sb")
     def EnrollStatus(self, result, done):
         pass
+
+    @dbus.service.method(INTERFACE, in_signature="ss", out_signature="")
+    def VerifyStart(self, username, finger_name):
+        return None
 
 
 @unittest.skipUnless(shutil.which("dbus-daemon"), "dbus-daemon is unavailable")
@@ -98,6 +103,55 @@ class DbusManagerIntegrationTests(unittest.TestCase):
                 str(client_interface.GetDefaultDevice()),
                 "/net/reactivated/Fprint/Device/0",
             )
+        finally:
+            loop.quit()
+            loop_thread.join(timeout=2)
+            backend.remove_from_connection()
+            manager.remove_from_connection()
+            server_bus.close()
+            backend_bus.close()
+            client_bus.close()
+
+    def test_terminal_verify_status_releases_busy_for_next_request(self):
+        server_bus = dbus.bus.BusConnection(self.address)
+        backend_bus = dbus.bus.BusConnection(self.address)
+        client_bus = dbus.bus.BusConnection(self.address)
+        server_name = dbus.service.BusName("net.reactivated.Fprint", server_bus)
+        backend_name = dbus.service.BusName(
+            "io.github.uunicorn.Fprint.Device.Egis",
+            backend_bus,
+        )
+        manager = Manager(server_name)
+        backend_path = "/org/reactivated/Fprint/Device/Egis"
+        backend = FakeBackend(backend_name, backend_path)
+        loop = GLib.MainLoop()
+        loop_thread = threading.Thread(target=loop.run, daemon=True)
+        loop_thread.start()
+        try:
+            manager_proxy = backend_bus.get_object(
+                "net.reactivated.Fprint",
+                "/net/reactivated/Fprint/Manager",
+            )
+            manager_interface = dbus.Interface(
+                manager_proxy,
+                "net.reactivated.Fprint.Manager",
+            )
+            with mock.patch("openfprintd.manager.polkit.check_privilege"):
+                manager_interface.RegisterDevice(dbus.ObjectPath(backend_path))
+
+            # The real bridge wrapper is connected to the backend signal above.
+            # Seed the same state that VerifyStart sets, then deliver the
+            # terminal status over D-Bus and observe the wrapper transition.
+            wrapper = next(iter(manager.devices.values()))
+            wrapper.busy = True
+            wrapper.busy_operation = "verify"
+            backend.VerifyStatus("verify-unknown-error", True)
+
+            deadline = time.monotonic() + 1.0
+            while wrapper.busy and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(wrapper.busy)
+            self.assertIsNone(wrapper.busy_operation)
         finally:
             loop.quit()
             loop_thread.join(timeout=2)

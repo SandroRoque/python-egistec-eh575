@@ -526,6 +526,24 @@ class EgisService:
             target(operation, *args)
         except SensorCanceled:
             logger.info("Sensor session canceled for scan generation %d", operation.generation)
+        except Exception as error:
+            # A worker exception must not strand the D-Bus caller in a busy
+            # state.  Emit exactly one terminal status while the operation is
+            # still active; _emit_* drops it if a replacement/cancel already
+            # made this generation stale or if the worker emitted success
+            # before failing during cleanup.
+            logger.error(
+                "Unhandled scan failure in %s generation %d: %s",
+                operation.mode,
+                operation.generation,
+                type(error).__name__,
+            )
+            if operation.mode == "verify":
+                if not operation.terminal:
+                    self._emit_verify("verify-unknown-error", True, operation)
+            elif operation.mode == "enroll":
+                if not operation.terminal:
+                    self._emit_enroll("enroll-failed", True, operation)
         finally:
             self._finish_operation(operation)
 
