@@ -10,8 +10,7 @@ import numpy as np
 PAIR = re.compile(r"([a-z_]+)=([^\s]+)")
 LATENCY_KEYS = (
     "request_to_touch_ms", "touch_to_first_frame_ms", "touch_to_decision_ms",
-    "capture_ms", "queue_ms", "matching_ms", "shadow_extraction_ms",
-    "shadow_comparison_ms",
+    "capture_ms", "queue_ms", "matching_ms",
 )
 
 
@@ -40,7 +39,6 @@ def summarize_latency_log(text):
                 value = fields.get(key)
                 record[key] = (float(value) if value not in (None, "none") else None)
             record["attempts"] = int(fields.get("attempts", 0))
-            record["shadow_frames"] = int(fields.get("shadow_frames", 0))
             record["max_consecutive_accepts"] = int(
                 fields.get("max_consecutive_accepts", 0))
             record["deadline_expired"] = fields.get(
@@ -103,6 +101,4 @@ def summarize_latency_log(text):
         ]),
         "deadline_expired": sum(
             item["deadline_expired"] for item in sessions),
-        "shadow_frames": distribution(
-            [item["shadow_frames"] for item in sessions]),
     }

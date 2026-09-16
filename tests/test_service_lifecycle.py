@@ -1,9 +1,25 @@
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from unittest import mock
 
 from egis_driver.services import EgisService, ScanOperation
+
+
+# This imports the live driver stack (including pyusb), so it must stay in the
+# full-install suite rather than MatcherLibraryBoundaryTests' minimal CI job.
+class LiveImportBoundaryTests(unittest.TestCase):
+    def test_live_imports_do_not_load_experimental_engines(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; import egis_driver.services; "
+             "assert all(name not in sys.modules for name in "
+             "('egis_matcher.sourceafis', 'egis_matcher.gallery', 'egis_matcher.atlas'))"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class FakeDriver:

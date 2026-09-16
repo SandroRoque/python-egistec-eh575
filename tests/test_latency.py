@@ -6,8 +6,8 @@ from egis_driver.latency import derive_contact_budget_ms, summarize_latency_log
 class LatencyReportTests(unittest.TestCase):
     def test_aggregates_sessions_without_identity_or_biometric_data(self):
         text = """
-[LATENCY] outcome=match request_to_touch_ms=100 touch_to_first_frame_ms=20 touch_to_decision_ms=400 capture_ms=90 queue_ms=10 matching_ms=200 shadow_extraction_ms=30 shadow_comparison_ms=40 shadow_frames=3 attempts=3 max_consecutive_accepts=3 accepted_attempt_ms=100,220,390 inter_frame_ms=30,35 deadline_expired=false
-[LATENCY] outcome=retry request_to_touch_ms=200 touch_to_first_frame_ms=40 touch_to_decision_ms=800 capture_ms=180 queue_ms=20 matching_ms=400 shadow_extraction_ms=60 shadow_comparison_ms=80 shadow_frames=6 attempts=6 max_consecutive_accepts=2 accepted_attempt_ms=500,700 inter_frame_ms=40,45 deadline_expired=true
+[LATENCY] outcome=match request_to_touch_ms=100 touch_to_first_frame_ms=20 touch_to_decision_ms=400 capture_ms=90 queue_ms=10 matching_ms=200 attempts=3 max_consecutive_accepts=3 accepted_attempt_ms=100,220,390 inter_frame_ms=30,35 deadline_expired=false
+[LATENCY] outcome=retry request_to_touch_ms=200 touch_to_first_frame_ms=40 touch_to_decision_ms=800 capture_ms=180 queue_ms=20 matching_ms=400 attempts=6 max_consecutive_accepts=2 accepted_attempt_ms=500,700 inter_frame_ms=40,45 deadline_expired=true
 [METRIC] component=dbus_verify_status result=verify-match done=True queue_ms=1.5
 """
         report = summarize_latency_log(text)
