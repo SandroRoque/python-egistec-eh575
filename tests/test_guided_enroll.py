@@ -16,21 +16,14 @@ def load_script():
 
 
 class GuidedEnrollTests(unittest.TestCase):
-    def test_stage_prompt_requires_acknowledgement_and_names_next_action(self):
+    def test_sensor_prompts_name_lift_and_detected_release(self):
         module = load_script()
         output = []
-        prompts = []
-
-        module.confirm_release(
-            3,
-            input_fn=lambda prompt: prompts.append(prompt),
-            output=output.append,
-        )
-
-        self.assertEqual(len(prompts), 1)
-        rendered = "\n".join(output + prompts)
-        self.assertIn("STAGE 3/10 ACCEPTED", rendered)
+        module.render_sensor_prompt("lift-finger", output=output.append)
+        module.render_sensor_prompt("place-finger", output=output.append)
+        rendered = "\n".join(output)
         self.assertIn("LIFT YOUR FINGER COMPLETELY", rendered)
+        self.assertIn("Release detected", rendered)
         self.assertIn("PLACE THE SAME FINGER AGAIN", rendered)
 
     def test_finger_name_is_required_and_validated(self):

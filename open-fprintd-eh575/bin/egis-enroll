@@ -20,17 +20,13 @@ FINGERS = (
 ENROLL_STAGES = 10
 
 
-def confirm_release(stage, *, accepted=True, input_fn=input, output=print):
-    output("")
-    output("=" * 68)
-    if accepted:
-        output(f"STAGE {stage}/{ENROLL_STAGES} ACCEPTED")
-    else:
-        output(f"STAGE {stage + 1}/{ENROLL_STAGES} NEEDS ANOTHER PRESENTATION")
-    output("LIFT YOUR FINGER COMPLETELY OFF THE SENSOR.")
-    input_fn("Press Enter only after the finger is lifted: ")
-    output("PLACE THE SAME FINGER AGAIN using a different position or angle.")
-    output("=" * 68)
+def render_sensor_prompt(prompt, *, output=print):
+    if prompt == "lift-finger":
+        output("LIFT YOUR FINGER COMPLETELY OFF THE SENSOR.")
+    elif prompt == "place-finger":
+        output("")
+        output("Release detected. PLACE THE SAME FINGER AGAIN using a different")
+        output("position or angle.")
 
 
 def parse_args(argv=None):
@@ -62,10 +58,12 @@ def main(argv=None):
         print(f"Enrollment status: {result}", flush=True)
         if result == "enroll-stage-passed":
             state["stage"] += 1
-            confirm_release(state["stage"])
+            print(
+                f"Image accepted: stage {state['stage']}/{ENROLL_STAGES} has "
+                "sufficient quality.", flush=True)
         elif result.startswith("enroll-retry"):
-            print("That presentation was not accepted.", flush=True)
-            confirm_release(state["stage"], accepted=False)
+            print("Image quality was insufficient; this stage will be repeated.",
+                  flush=True)
         if done:
             state["done"] = True
             state["result"] = 0 if result == "enroll-completed" else 1
@@ -73,6 +71,9 @@ def main(argv=None):
 
     device_object.connect_to_signal(
         "EnrollStatus", on_status,
+        dbus_interface="net.reactivated.Fprint.Device")
+    device_object.connect_to_signal(
+        "EnrollPrompt", lambda prompt: render_sensor_prompt(str(prompt)),
         dbus_interface="net.reactivated.Fprint.Device")
     device.Claim(args.username)
     try:

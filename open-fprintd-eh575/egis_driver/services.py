@@ -61,7 +61,7 @@ class EgisService:
                  on_enroll_status=None, on_verify_status=None,
                  on_verify_finger_selected=None, runtime_paths=None,
                  capture_coordinator=None, confirmation_policy=None,
-                 matcher_worker=None):
+                 matcher_worker=None, on_enroll_prompt=None):
         runtime_paths = runtime_paths or RuntimePaths.from_environment()
         self._persistence = persistence or Persistence(str(runtime_paths.data_root))
         self._sensor = (SensorController(backend=driver) if driver is not None
@@ -125,6 +125,7 @@ class EgisService:
         self._stream_capture_outcomes = Counter()
 
         self.on_enroll_status = on_enroll_status
+        self.on_enroll_prompt = on_enroll_prompt
         self.on_verify_status = on_verify_status
         self.on_verify_finger_selected = on_verify_finger_selected
 
@@ -821,11 +822,14 @@ class EgisService:
             self._enroll_touch_count = 0
 
         if self._is_operation_active(operation):
+            self._emit_enroll_prompt("lift-finger", operation)
             self._wait_for_finger_release(
                 operation,
                 clear_frames=ENROLL_RELEASE_CLEAR_FRAMES,
                 clear_seconds=ENROLL_RELEASE_MIN_SECONDS,
             )
+            if self._is_operation_active(operation):
+                self._emit_enroll_prompt("place-finger", operation)
 
     # ------------------------------------------------------------------
     #  Verify logic
@@ -1048,6 +1052,13 @@ class EgisService:
                 operation.terminal = True
         if self.on_enroll_status:
             self.on_enroll_status(result, done)
+        return True
+
+    def _emit_enroll_prompt(self, prompt, operation):
+        if not self._is_operation_active(operation):
+            return
+        if self.on_enroll_prompt:
+            self.on_enroll_prompt(prompt)
         return True
 
     def _emit_verify(self, result, done, operation, allow_inactive=False):

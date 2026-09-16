@@ -74,6 +74,7 @@ class Device(dbus.service.Object):
         self.target.connect_to_signal('VerifyStatus', self.VerifyStatus)
         self.target.connect_to_signal('VerifyFingerSelected', self.VerifyFingerSelected)
         self.target.connect_to_signal('EnrollStatus', self.EnrollStatus)
+        self.target.connect_to_signal('EnrollPrompt', self.EnrollPrompt)
 
         watcher = None
         def watch_cb(name):
@@ -296,6 +297,10 @@ class Device(dbus.service.Object):
         if done:
             self.busy = False
             self.busy_operation = None
+
+    @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='s')
+    def EnrollPrompt(self, prompt):
+        pass
 
     # ------------------ Props --------------------------
 

@@ -247,6 +247,8 @@ class ServiceLifecycleTests(unittest.TestCase):
             matcher=matcher,
         )
         self.addCleanup(service.close)
+        prompts = []
+        service.on_enroll_prompt = prompts.append
         operation = ScanOperation(
             1,
             ("enroll", "testuser", "right-index-finger", True),
@@ -271,6 +273,10 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(wait_release.call_count, 9)
         wait_release.assert_called_with(
             operation, clear_frames=4, clear_seconds=0.3)
+        self.assertEqual(
+            prompts,
+            ["lift-finger", "place-finger"] * 9,
+        )
 
     def test_enrollment_does_not_advance_while_finger_remains_present(self):
         matcher = EnrollmentMatcher()

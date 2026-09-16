@@ -34,6 +34,7 @@ class EgisBridge(dbus.service.Object):
 
         self._service = service or EgisService(
             on_enroll_status=self._on_enroll_status,
+            on_enroll_prompt=self._on_enroll_prompt,
             on_verify_status=self._on_verify_status,
             on_verify_finger_selected=self._on_verify_finger_selected,
         )
@@ -60,6 +61,10 @@ class EgisBridge(dbus.service.Object):
     def _on_enroll_status(self, result, done):
         logger.info("Emitting EnrollStatus result=%s done=%s", result, done)
         GLib.idle_add(self.EnrollStatus, result, done)
+
+    def _on_enroll_prompt(self, prompt):
+        logger.info("Emitting EnrollPrompt prompt=%s", prompt)
+        GLib.idle_add(self.EnrollPrompt, prompt)
 
     def _on_verify_status(self, result, done):
         logger.info("Emitting VerifyStatus result=%s done=%s", result, done)
@@ -133,6 +138,10 @@ class EgisBridge(dbus.service.Object):
 
     @dbus.service.signal(DEVICE_IFACE, signature='sb')
     def EnrollStatus(self, result, done):
+        pass
+
+    @dbus.service.signal(DEVICE_IFACE, signature='s')
+    def EnrollPrompt(self, prompt):
         pass
 
 
