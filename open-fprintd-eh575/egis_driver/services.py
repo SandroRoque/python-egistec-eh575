@@ -25,6 +25,7 @@ ENROLL_RELEASE_CLEAR_FRAMES = 4
 ENROLL_RELEASE_MIN_SECONDS = 0.3
 VERIFY_FRAME_COUNT = 3
 VERIFY_CONFIRMATION_ATTEMPTS = 3
+VERIFY_CONTACT_BUDGET_SECONDS = 3.0
 PRODUCTION_CONFIRMATION_POLICY = ConfirmationPolicy(
     frames_per_attempt=VERIFY_FRAME_COUNT,
     required_consecutive_accepts=VERIFY_CONFIRMATION_ATTEMPTS,
@@ -414,7 +415,24 @@ class EgisService:
     def delete_enrolled_fingers(self, username):
         self.cancel()
         self._matcher.delete_user_fingers(username)
+        self._reload_matcher_workers()
+
+    def _reload_matcher_workers(self):
         self._matcher_worker.reload()
+        if self._touch_matcher_worker is not None:
+            try:
+                if not self._touch_matcher_worker.reload():
+                    logger.warning(
+                        "Touch matcher shadow reload failed; shadow matching disabled")
+                    self._touch_matcher_worker.close()
+                    self._touch_matcher_worker = None
+            except Exception as error:
+                logger.warning(
+                    "Touch matcher shadow reload failed; shadow matching disabled: %s",
+                    type(error).__name__,
+                )
+                self._touch_matcher_worker.close()
+                self._touch_matcher_worker = None
 
     def diagnostics_snapshot(self):
         """Return aggregate reliability counters without biometric content."""
@@ -820,7 +838,7 @@ class EgisService:
             success = self._matcher.enroll_finger(unique_name, self._enroll_scans)
 
             if success:
-                self._matcher_worker.reload()
+                self._reload_matcher_workers()
                 logger.info("Enrollment Successful!")
                 self._emit_enroll("enroll-completed", True, operation)
             else:
@@ -858,6 +876,11 @@ class EgisService:
             "shadow_comparison_ms": 0.0,
             "shadow_frames": 0,
             "attempts": 0,
+            "accepted_attempt_ms": [],
+            "max_consecutive_accepts": 0,
+            "inter_frame_ms": [],
+            "last_frame_finished": None,
+            "deadline_expired": False,
         }
         attempt = 0
         confirmation = ConfirmationTracker(self._confirmation_policy)
@@ -877,7 +900,8 @@ class EgisService:
             operation, username, finger_name)
         frames = []
         window_started = None
-        contact_deadline = time.monotonic() + 3.0
+        contact_deadline = time.monotonic() + VERIFY_CONTACT_BUDGET_SECONDS
+        ended_before_deadline = False
         try:
             while (
                     self._is_operation_active(operation) and
@@ -886,6 +910,7 @@ class EgisService:
                     message = pump.stream.receive(timeout=0.1)
                 except queue.Empty:
                     if not pump.alive:
+                        ended_before_deadline = True
                         break
                     continue
                 if (
@@ -908,8 +933,10 @@ class EgisService:
                     if touch_available:
                         touch_available = self._touch_discontinuity()
                 if message.status is FrameStatus.CONTACT_END:
+                    ended_before_deadline = True
                     break
                 if message.status is FrameStatus.DEVICE_UNAVAILABLE:
+                    ended_before_deadline = True
                     self._stream_capture_outcomes["device_unavailable"] += 1
                     self._set_sensor_readiness(sensor, False)
                     logger.info(
@@ -931,6 +958,12 @@ class EgisService:
                     continue
                 if message.status is not FrameStatus.VALID:
                     continue
+
+                previous_frame = operation.verify_latency["last_frame_finished"]
+                if previous_frame is not None:
+                    operation.verify_latency["inter_frame_ms"].append(max(
+                        0.0, (message.captured_finished - previous_frame) * 1000.0))
+                operation.verify_latency["last_frame_finished"] = message.captured_finished
 
                 # Feed continuous evidence before the legacy fixed-window path.
                 # The worker keeps at most one frame in flight, so capture can
@@ -986,6 +1019,10 @@ class EgisService:
             pump.stop()
             self._end_touch_matching()
 
+        operation.verify_latency["deadline_expired"] = bool(
+            self._is_operation_active(operation) and
+            not ended_before_deadline and time.monotonic() >= contact_deadline)
+
         logger.info("No match after %d attempts", attempt)
         if self._is_operation_active(operation):
             self._log_verify_latency(operation, "retry")
@@ -1038,6 +1075,14 @@ class EgisService:
             confirmation.reset()
             return False
         confirmed = confirmation.record(True, identity=name_rest)
+        trace = operation.verify_latency
+        if trace is not None:
+            trace["accepted_attempt_ms"].append(max(
+                0.0, (time.monotonic() - trace["touch_started"]) * 1000.0))
+            trace["max_consecutive_accepts"] = max(
+                trace["max_consecutive_accepts"],
+                confirmation.consecutive_accepts,
+            )
         if confirmation.last_reset_reason == "identity_switch":
             self._match_outcomes["reason:identity_switch"] += 1
             logger.warning(
@@ -1082,13 +1127,24 @@ class EgisService:
             "shadow_comparison_ms": trace["shadow_comparison_ms"],
             "shadow_frames": trace["shadow_frames"],
             "attempts": trace["attempts"],
+            "accepted_attempt_ms": tuple(trace.get("accepted_attempt_ms", ())),
+            "max_consecutive_accepts": trace.get("max_consecutive_accepts", 0),
+            "inter_frame_ms": tuple(trace.get("inter_frame_ms", ())),
+            "deadline_expired": bool(trace.get("deadline_expired", False)),
         }
+        accepted_attempts = ",".join(
+            f"{value:.0f}" for value in summary["accepted_attempt_ms"]
+        ) or "none"
+        inter_frames = ",".join(
+            f"{value:.0f}" for value in summary["inter_frame_ms"]
+        ) or "none"
         logger.info(
             "[LATENCY] outcome=%s request_to_touch_ms=%.0f "
             "touch_to_first_frame_ms=%s touch_to_decision_ms=%.0f "
             "capture_ms=%.0f queue_ms=%.0f matching_ms=%.0f "
             "shadow_extraction_ms=%.0f shadow_comparison_ms=%.0f "
-            "shadow_frames=%d attempts=%d",
+            "shadow_frames=%d attempts=%d max_consecutive_accepts=%d "
+            "accepted_attempt_ms=%s inter_frame_ms=%s deadline_expired=%s",
             summary["outcome"], summary["request_to_touch_ms"],
             (f'{summary["touch_to_first_frame_ms"]:.0f}'
              if summary["touch_to_first_frame_ms"] is not None else "none"),
@@ -1096,6 +1152,8 @@ class EgisService:
             summary["queue_ms"], summary["matching_ms"],
             summary["shadow_extraction_ms"], summary["shadow_comparison_ms"],
             summary["shadow_frames"], summary["attempts"],
+            summary["max_consecutive_accepts"], accepted_attempts, inter_frames,
+            str(summary["deadline_expired"]).lower(),
         )
         return summary
 

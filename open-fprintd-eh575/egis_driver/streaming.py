@@ -384,11 +384,14 @@ def _touch_matcher_process(connection, persistence_root, frame_spec, config):
     from egis_driver.fingerprint_matcher import FingerprintMatcher
     from egis_driver.persistence import Persistence
 
-    matcher = FingerprintMatcher(
-        persistence=Persistence(persistence_root),
-        matcher_config=MatcherConfig.from_dict(config),
-        frame_spec=frame_spec,
-    )
+    def load_matcher():
+        return FingerprintMatcher(
+            persistence=Persistence(persistence_root),
+            matcher_config=MatcherConfig.from_dict(config),
+            frame_spec=frame_spec,
+        )
+
+    matcher = load_matcher()
     session = None
     generation = None
     connection.send(("ready",))
@@ -397,7 +400,12 @@ def _touch_matcher_process(connection, persistence_root, frame_spec, config):
         command = message[0]
         if command == "shutdown":
             return
-        if command == "begin":
+        if command == "reload":
+            matcher = load_matcher()
+            session = None
+            generation = None
+            connection.send(("reloaded",))
+        elif command == "begin":
             _, generation, username, finger_name = message
             session = matcher.new_touch_identity_matcher(username, finger_name)
             if session is not None:
@@ -454,10 +462,28 @@ class TouchMatcherWorker:
             raise RuntimeError("touch matcher worker startup failed")
         self._connection, self._process = parent, process
 
+    def _dispose(self):
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except OSError:
+                pass
+        if self._process is not None and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+        self._connection = self._process = None
+        self._pending = None
+        self._generation = None
+
     def begin(self, generation, username, finger_name):
         with self._lock:
             if self._process is None or not self._process.is_alive():
-                return False
+                self._dispose()
+                try:
+                    self._start()
+                except Exception:
+                    self._dispose()
+                    return False
             self._pending = None
             self._generation = generation
             self._connection.send(("begin", generation, username, finger_name))
@@ -469,6 +495,39 @@ class TouchMatcherWorker:
         with self._lock:
             if self._process is None or not self._process.is_alive():
                 self._start()
+
+    def reload(self):
+        """Discard all process-local galleries and rebuild them from disk."""
+        with self._lock:
+            if self._process is None or not self._process.is_alive():
+                self._dispose()
+                try:
+                    self._start()
+                except Exception:
+                    self._dispose()
+                    return False
+                return True
+            if not self._drain_pending(1.0):
+                try:
+                    self._start()
+                except Exception:
+                    self._dispose()
+                    return False
+                return True
+            try:
+                self._connection.send(("reload",))
+                if not self._connection.poll(self.startup_timeout):
+                    self._dispose()
+                    return False
+                if self._connection.recv() != ("reloaded",):
+                    self._dispose()
+                    return False
+            except (BrokenPipeError, EOFError, OSError):
+                self._dispose()
+                return False
+            self._pending = None
+            self._generation = None
+            return True
 
     def observe(self, frame, sequence):
         with self._lock:
@@ -530,3 +589,5 @@ class TouchMatcherWorker:
                     self._process.terminate()
                     self._process.join(timeout=1.0)
             self._connection = self._process = None
+            self._pending = None
+            self._generation = None

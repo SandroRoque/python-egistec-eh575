@@ -68,6 +68,37 @@ class TemplateInvalidationTests(unittest.TestCase):
         matcher.delete_user_fingers.assert_called_once_with("test")
         worker.reload.assert_called_once_with()
 
+    def test_deletion_invalidates_authoritative_and_touch_workers(self):
+        matcher = mock.Mock()
+        worker = mock.Mock()
+        touch_worker = mock.Mock()
+        touch_worker.reload.return_value = True
+        service = EgisService(driver=FakeDriver(), matcher=matcher,
+                              matcher_worker=worker)
+        self.addCleanup(service.close)
+        service._touch_matcher_worker = touch_worker
+
+        service.delete_enrolled_fingers("test")
+
+        worker.reload.assert_called_once_with()
+        touch_worker.reload.assert_called_once_with()
+
+    def test_failed_touch_reload_disables_only_shadow_matching(self):
+        matcher = mock.Mock()
+        worker = mock.Mock()
+        touch_worker = mock.Mock()
+        touch_worker.reload.return_value = False
+        service = EgisService(driver=FakeDriver(), matcher=matcher,
+                              matcher_worker=worker)
+        self.addCleanup(service.close)
+        service._touch_matcher_worker = touch_worker
+
+        service.delete_enrolled_fingers("test")
+
+        worker.reload.assert_called_once_with()
+        touch_worker.close.assert_called_once_with()
+        self.assertIsNone(service._touch_matcher_worker)
+
 
 class EnrollmentMatcher(FakeMatcher):
     def __init__(self):
@@ -174,6 +205,10 @@ class ServiceLifecycleTests(unittest.TestCase):
             "shadow_comparison_ms": 45.0,
             "shadow_frames": 3,
             "attempts": 3,
+            "accepted_attempt_ms": [100.0, 300.0, 480.0],
+            "max_consecutive_accepts": 3,
+            "inter_frame_ms": [30.0, 32.0],
+            "deadline_expired": False,
         }
         with mock.patch("egis_driver.services.time.monotonic", return_value=2.5):
             summary = service._log_verify_latency(operation, "match")
@@ -182,6 +217,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["touch_to_decision_ms"], 500.0)
         self.assertEqual(summary["matching_ms"], 210.0)
         self.assertEqual(summary["shadow_comparison_ms"], 45.0)
+        self.assertEqual(summary["accepted_attempt_ms"], (100.0, 300.0, 480.0))
 
     def _wait_until(self, predicate, timeout=1.0):
         deadline = time.monotonic() + timeout
@@ -323,7 +359,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         worker.join(timeout=2.0)
         self.assertFalse(worker.is_alive())
 
-    def test_verification_requires_three_consecutive_matches(self):
+    def test_third_consecutive_match_inside_budget_authenticates(self):
         matcher = AlwaysMatchMatcher()
         statuses = []
         service = EgisService(
