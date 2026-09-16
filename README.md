@@ -87,11 +87,11 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
-`EGIS_MATCH_MODE` selects `window`, `shadow`, or `touch` matching. The default
+`EGIS_MATCH_MODE` selects `window` or `shadow` matching. The default
 is `shadow`: the window matcher remains authoritative while a bounded worker
-accumulates touch-atlas evidence and emits sanitized `[SHADOW]` metrics. `touch`
-fails closed when its worker or atlas is unavailable; it must be enabled only
-after replay and live holdout gates pass.
+accumulates touch-atlas evidence and emits sanitized `[SHADOW]` metrics. Touch
+matching is not an authoritative runtime mode and cannot authenticate; it must
+pass replay and live holdout gates before any future promotion.
 
 Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment includes a root-only derived touch atlas while excluding raw recorded sequences. Older template schemas are ignored.
 
@@ -272,9 +272,11 @@ sudo ./egis-lab record-sequence --label left-thumb-enrollment \
 ./egis-lab evaluate --config lab-configs/production-parity.json
 ```
 
-After a candidate passes the development dataset, one `sudo ./egis-lab holdout`
-session collects the untouched physical acceptance matrix. Only a passing holdout
-report can produce an artifact for the final manual promotion command. See
+After a candidate passes the development dataset, freeze its source and policy
+with `./egis-lab freeze-candidate`, then pass that record to
+`sudo ./egis-lab holdout --candidate-freeze FILE`. Only a passing, post-freeze
+holdout report from two distinct capture sessions can produce an artifact for the
+final manual promotion command. See
 [`docs/offline-development.md`](docs/offline-development.md) for the complete
 workflow and rollback behavior.
 

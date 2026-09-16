@@ -1,0 +1,572 @@
+#!/usr/bin/python3
+"""
+Egis EH575 Interactive Sensor Inspector.
+
+A REPL for exploring the sensor protocol interactively.
+Sends raw hex commands and displays responses with timing.
+Useful for register discovery, command fuzzing, and protocol documentation.
+
+Usage:
+    sudo python3 egis-inspect          # Full init + interactive mode
+    sudo python3 egis-inspect --light  # Skip init, just claim the device
+"""
+
+import argparse
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import usb.util
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "open-fprintd-eh575"))
+from egis_driver.egis_driver import (
+    VENDOR_ID,
+    PRODUCT_ID,
+    ENDPOINT_OUT,
+    ENDPOINT_IN,
+    IMG_WIDTH,
+    IMG_HEIGHT,
+    EgisDriver,
+)
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+RED = "\033[31m"
+
+
+def ensure_private_directory(path):
+    path = Path(path)
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        stat = path.lstat()
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"refusing unsafe output directory: {path}")
+        if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
+            raise RuntimeError(f"output directory is not private: {path}")
+    return path
+
+
+def write_private_png(path, image):
+    path = Path(path)
+    encoded, payload = cv2.imencode(".png", image)
+    if not encoded:
+        raise RuntimeError(f"failed to encode fingerprint image: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload.tobytes())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+class Inspector:
+    def __init__(self, light=False):
+        self.driver = None
+        self.light = light
+        self.last_frame = None
+        self.last_contrast = 0.0
+        self.last_response = None
+        self.last_response_ms = 0.0
+        self.frame_count = 0
+        self.save_dir = "/tmp/egis-inspect"
+
+        if not self.light:
+            self._init_driver()
+
+    def _init_driver(self):
+        print(f"{CYAN}[SENSOR] Initializing...{RESET}")
+        self.driver = EgisDriver()
+        bus = self.driver.dev.bus
+        addr = self.driver.dev.address
+        print(f"{GREEN}[SENSOR] EGIS EH575 found on bus {bus:03d}, addr {addr:03d}{RESET}")
+        print(f"{GREEN}[SENSOR] Endpoints: OUT=0x{ENDPOINT_OUT:02x}, IN=0x{ENDPOINT_IN:02x}{RESET}")
+        print(f"{GREEN}[SENSOR] Image: {IMG_WIDTH}x{IMG_HEIGHT}, lock={type(self.driver._usb_lock).__name__}{RESET}")
+
+    def _ensure_driver(self):
+        if self.driver is None:
+            self._init_driver()
+
+    # ------------------------------------------------------------------
+    #  Command dispatch
+    # ------------------------------------------------------------------
+
+    def cmd_raw(self, args):
+        """Send a raw hex command string and show the response.
+
+        Usage: raw <hex bytes...>
+        Example: raw 60 00 00
+        Example: raw 45 47 49 53 60 00 00
+
+        If the hex string starts with "45 47 49 53" (EGIS), the full string is
+        sent as-is. Otherwise, "45 47 49 53" is prepended automatically.
+        """
+        self._ensure_driver()
+        if not args:
+            print(f"{YELLOW}Usage: raw <hex bytes...>{RESET}")
+            return
+
+        hex_str = " ".join(args).lower()
+        raw_bytes = bytes.fromhex(hex_str)
+
+        if len(raw_bytes) < 4 or raw_bytes[:4] != b"EGIS":
+            raw_bytes = b"EGIS" + raw_bytes
+            hex_str = "45 47 49 53 " + hex_str
+
+        start = time.time()
+        try:
+            self.driver.dev.write(ENDPOINT_OUT, raw_bytes)
+            resp = self.driver.dev.read(ENDPOINT_IN, 64, timeout=1000)
+            elapsed = (time.time() - start) * 1000.0
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000.0
+            print(f"{RED}→ USB error after {elapsed:.0f}ms: {e}{RESET}")
+            return
+
+        self.last_response = resp
+        self.last_response_ms = elapsed
+
+        resp_hex = resp.hex(" ")
+        resp_ascii = "".join(chr(b) if 0x20 <= b < 0x7f else "." for b in resp)
+
+        print(f"{DIM}→ sent: {hex_str} ({len(raw_bytes)} bytes){RESET}")
+        print(f"{GREEN}← resp: {resp_hex} ({len(resp)} bytes) [{elapsed:.0f}ms]{RESET}")
+        print(f"{DIM}← ascii: {resp_ascii}{RESET}")
+
+    def cmd_read(self, args):
+        """Read a register using category 0x60.
+
+        Usage: read <addr>
+        Example: read 00
+        Example: read 0a
+        """
+        self._ensure_driver()
+        if not args:
+            print(f"{YELLOW}Usage: read <addr>{RESET}")
+            return
+        self.cmd_raw(["60", args[0], "00"])
+
+    def cmd_write(self, args):
+        """Write a value to a register (category 0x60 or 0x61).
+
+        Usage: write <category> <addr> <value>
+        Example: write 60 00 06
+        Example: write 61 0a fc
+        """
+        if len(args) < 3:
+            print(f"{YELLOW}Usage: write <category> <addr> <value>{RESET}")
+            return
+        self.cmd_raw(args)
+
+    def cmd_scan(self, args):
+        """Scan all register addresses in a category.
+
+        Usage: scan <category> [start] [end]
+        Example: scan 60         # Scan 0x00-0xFF in category 0x60
+        Example: scan 61 00 20   # Scan 0x00-0x20 in category 0x61
+
+        For each address, sends a read and reports the response.
+        Times out after 250ms per address.
+        """
+        self._ensure_driver()
+        if not args:
+            print(f"{YELLOW}Usage: scan <category> [start] [end]{RESET}")
+            return
+
+        category = args[0]
+        start_addr = int(args[1], 16) if len(args) > 1 else 0x00
+        end_addr = int(args[2], 16) if len(args) > 2 else 0xFF
+
+        responded = 0
+        timed_out = 0
+        errored = 0
+        start_time = time.time()
+
+        print(f"{CYAN}[SCAN] Category 0x{category}, range 0x{start_addr:02x}→0x{end_addr:02x}{RESET}")
+        print(f"{DIM}{'Addr':>5}  {'Response':<30}  {'ASCII':<16}  {'ms':>5}{RESET}")
+        print(f"{DIM}{'─'*5}  {'─'*30}  {'─'*16}  {'─'*5}{RESET}")
+
+        for addr in range(start_addr, end_addr + 1):
+            hex_str = f"45 47 49 53 {category} {addr:02x} 00"
+            raw_bytes = bytes.fromhex(hex_str)
+
+            t0 = time.time()
+            try:
+                self.driver.dev.write(ENDPOINT_OUT, raw_bytes)
+                resp = self.driver.dev.read(ENDPOINT_IN, 64, timeout=250)
+                elapsed = (time.time() - t0) * 1000.0
+            except Exception:
+                elapsed = (time.time() - t0) * 1000.0
+                print(f"{RED}{addr:#05x}  {'─ TIMEOUT / ERROR ─':<30}  {'':16}  {elapsed:4.0f}{RESET}")
+                timed_out += 1
+                continue
+
+            responded += 1
+            resp_hex = resp.hex(" ")
+            resp_ascii = "".join(chr(b) if 0x20 <= b < 0x7f else "." for b in resp[:16])
+            resp_display = resp_hex[:30] if len(resp_hex) <= 30 else resp_hex[:27] + "..."
+            print(f"0x{addr:02x}  {resp_display:<30}  {resp_ascii:<16}  {elapsed:4.0f}")
+
+        total_ms = (time.time() - start_time) * 1000.0
+        total = end_addr - start_addr + 1
+        print(f"{DIM}─{RESET}")
+        print(f"{GREEN}Scanned {total} addresses: {responded} responded, {timed_out} timeout, "
+              f"{errored} error ({total_ms:.0f}ms total){RESET}")
+
+    def cmd_diff(self, args):
+        """Try all values for a register to find accepted range.
+
+        Usage: diff <category> <addr>
+        Example: diff 60 00    # Try 0x00-0xFF on register 0x00 cat 0x60
+        Example: diff 61 0a    # Try 0x00-0xFF on register 0x0a cat 0x61
+
+        For each value, writes it to the register, reads back, and checks
+        if the response contains the expected value.
+        """
+        self._ensure_driver()
+        if len(args) < 2:
+            print(f"{YELLOW}Usage: diff <category> <addr>{RESET}")
+            return
+
+        category = args[0]
+        addr = args[1]
+
+        accepting = []
+        rejecting = []
+        start_time = time.time()
+
+        print(f"{CYAN}[DIFF] Category 0x{category}, register 0x{addr}{RESET}")
+        print(f"{DIM}{'Val':>5}  {'Response':<30}  {'Status':>8}{RESET}")
+        print(f"{DIM}{'─'*5}  {'─'*30}  {'─'*8}{RESET}")
+
+        for val in range(0x00, 0x100):
+            hex_str = f"45 47 49 53 {category} {addr} {val:02x}"
+            raw_bytes = bytes.fromhex(hex_str)
+
+            # Write
+            self.driver.dev.write(ENDPOINT_OUT, raw_bytes)
+            try:
+                resp = self.driver.dev.read(ENDPOINT_IN, 64, timeout=100)
+            except Exception:
+                resp = None
+
+            if resp and len(resp) >= 1:
+                resp_hex = resp.hex(" ")
+                resp_display = resp_hex[:30]
+                accepting.append(val)
+                status = f"{GREEN}ACCEPT{RESET}"
+            else:
+                resp_display = "(no response)"
+                rejecting.append(val)
+                status = f"{RED}REJECT{RESET}"
+
+            if val % 16 == 0 or val in (0x00, 0xFF) or resp is None:
+                print(f"0x{val:02x}  {resp_display:<30}  {status}")
+
+            time.sleep(0.002)
+
+        total_ms = (time.time() - start_time) * 1000.0
+        print(f"{DIM}─{RESET}")
+        print(f"{GREEN}Accepted: {len(accepting)} values {[f'0x{v:02x}' for v in accepting]}{RESET}")
+        print(f"{RED}Rejected: {len(rejecting)} values{RESET}")
+        print(f"{DIM}({total_ms:.0f}ms total){RESET}")
+
+    def cmd_capture(self, args):
+        """Capture a single frame: rearm → trigger → read.
+
+        Usage: capture [--save]
+        """
+        self._ensure_driver()
+        do_save = "--save" in args
+
+        start = time.time()
+        img, contrast = self.driver.get_live_frame()
+        elapsed = (time.time() - start) * 1000.0
+
+        if img is None:
+            print(f"{RED}[CAPTURE] No frame data ({elapsed:.0f}ms){RESET}")
+            return
+
+        self.last_frame = img
+        self.last_contrast = contrast
+        self.frame_count += 1
+
+        print(f"{GREEN}[FRAME #{self.frame_count}] contrast={contrast:.2f} "
+              f"len={len(img)} bytes ({elapsed:.0f}ms){RESET}")
+
+        if do_save:
+            self._save_frame()
+
+    def cmd_rearm(self, args):
+        """Run only the rearm sequence (no trigger).
+
+        Usage: rearm
+        """
+        self._ensure_driver()
+        start = time.time()
+        self.driver._rearm()
+        elapsed = (time.time() - start) * 1000.0
+        print(f"{GREEN}[REARM] 8 commands, {elapsed:.0f}ms{RESET}")
+
+    def cmd_trigger(self, args):
+        """Send only the trigger command + read (no rearm).
+
+        Usage: trigger
+        """
+        self._ensure_driver()
+        start = time.time()
+        try:
+            self.driver.dev.write(ENDPOINT_OUT, bytes.fromhex("45 47 49 53 64 14 ec"))
+            data = self.driver.dev.read(ENDPOINT_IN, 10000, timeout=1500)
+            try:
+                self.driver.dev.read(ENDPOINT_IN, 512, timeout=20)
+            except Exception:
+                pass
+            elapsed = (time.time() - start) * 1000.0
+
+            if data and len(data) >= 5000:
+                arr = np.array(list(data[:IMG_WIDTH * IMG_HEIGHT]), dtype=np.uint8)
+                contrast = np.std(arr)
+                self.last_frame = data
+                self.last_contrast = contrast
+                self.frame_count += 1
+                print(f"{GREEN}[TRIGGER #{self.frame_count}] contrast={contrast:.2f} "
+                      f"len={len(data)} ({elapsed:.0f}ms){RESET}")
+            else:
+                print(f"{YELLOW}[TRIGGER] Short response: {len(data) if data else 0} bytes "
+                      f"({elapsed:.0f}ms){RESET}")
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000.0
+            print(f"{RED}[TRIGGER] Failed ({elapsed:.0f}ms): {e}{RESET}")
+
+    def cmd_init(self, args):
+        """Re-initialize the sensor (full init sequence).
+
+        Usage: init
+        """
+        self._ensure_driver()
+        start = time.time()
+        self.driver._initialize_sensor()
+        elapsed = (time.time() - start) * 1000.0
+        print(f"{GREEN}[INIT] Full initialization complete ({elapsed:.0f}ms){RESET}")
+
+    def cmd_reset(self, args):
+        """USB bus reset + full reinit.
+
+        Usage: reset
+        """
+        self._ensure_driver()
+        print(f"{CYAN}[RESET] USB bus reset + reinit...{RESET}")
+        start = time.time()
+        ok = self.driver.force_reconnect(reset=True)
+        elapsed = (time.time() - start) * 1000.0
+        if ok:
+            print(f"{GREEN}[RESET] Complete ({elapsed:.0f}ms){RESET}")
+        else:
+            print(f"{RED}[RESET] Failed ({elapsed:.0f}ms){RESET}")
+
+    def cmd_watch(self, args):
+        """Continuously capture and show contrast values.
+
+        Usage: watch [interval_ms]
+        Press Ctrl+C to stop.
+        """
+        self._ensure_driver()
+        interval = float(args[0]) / 1000.0 if args else 0.2
+
+        print(f"{CYAN}[WATCH] Sampling every {interval*1000:.0f}ms. Ctrl+C to stop.{RESET}")
+        print(f"{DIM}{'#':>5}  {'contrast':>10}  {'touch?':>7}{RESET}")
+
+        count = 0
+        try:
+            while True:
+                img, contrast, present = self.driver.capture_presence_frame()
+                count += 1
+                touch = f"{GREEN}YES{RESET}" if present else f"{DIM}no{RESET}"
+                status = f"{contrast:10.2f}  {touch}"
+                print(f"{count:5d}  {status}")
+                if img is not None:
+                    self.last_frame = img
+                    self.last_contrast = contrast
+                    self.frame_count += 1
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n{CYAN}[WATCH] Stopped after {count} samples{RESET}")
+
+    def cmd_save(self, args):
+        """Save the last captured frame as a PNG.
+
+        Usage: save [filename]
+        Example: save
+        Example: save my_frame.png
+        """
+        if self.last_frame is None:
+            print(f"{YELLOW}No frame to save. Run 'capture' first.{RESET}")
+            return
+
+        save_dir = ensure_private_directory(self.save_dir)
+
+        if args:
+            filename = args[0]
+            if not filename.endswith(".png"):
+                filename += ".png"
+        else:
+            filename = f"frame_{self.frame_count:04d}_c{self.last_contrast:.0f}.png"
+
+        if not filename.startswith("/"):
+            if Path(filename).name != filename:
+                raise RuntimeError("relative output name must not contain directories")
+            filename = str(save_dir / filename)
+
+        img_arr = np.array(list(self.last_frame), dtype=np.uint8).reshape((IMG_HEIGHT, IMG_WIDTH))
+        img_norm = cv2.normalize(img_arr, None, 0, 255, cv2.NORM_MINMAX)
+        write_private_png(filename, img_norm)
+        print(f"{GREEN}[SAVE] {filename} ({IMG_WIDTH}x{IMG_HEIGHT}, contrast={self.last_contrast:.2f}){RESET}")
+
+    def cmd_info(self, args):
+        """Show device information.
+
+        Usage: info
+        """
+        self._ensure_driver()
+        dev = self.driver.dev
+        print(f"{BOLD}Device Info{RESET}")
+        print(f"  VID/PID:      {VENDOR_ID:#06x} / {PRODUCT_ID:#06x}")
+        print(f"  Bus/Addr:     {dev.bus:03d} / {dev.address:03d}")
+        print(f"  Manufacturer: {dev.manufacturer or 'N/A'}")
+        print(f"  Product:      {dev.product or 'N/A'}")
+        print(f"  Config:       {dev.get_active_configuration().bConfigurationValue}")
+
+        try:
+            cfg = dev.get_active_configuration()
+            for intf in cfg:
+                print(f"  Interface {intf.bInterfaceNumber}:")
+                for ep in intf:
+                    direction = "IN" if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN else "OUT"
+                    etype = {0: "CTRL", 1: "ISOCH", 2: "BULK", 3: "INTR"}.get(
+                        usb.util.endpoint_type(ep.bmAttributes), "???"
+                    )
+                    print(f"    EP 0x{ep.bEndpointAddress:02x} {direction} {etype} "
+                          f"max_packet={ep.wMaxPacketSize}")
+        except Exception as e:
+            print(f"  {DIM}(endpoint enumeration failed: {e}){RESET}")
+
+        print(f"  Touch threshold:  {self.driver.touch_threshold:.1f}")
+        print(f"  Last IOK:        {self.driver._last_iok:.1f}s ago" if self.driver._last_iok > 0 else "  Last IOK: never")
+        print(f"  Released sleep:  {self.driver._released_for_sleep}")
+        print(f"  Reconnect delay: {self.driver._reconnect_delay}s")
+
+        if self.last_frame is not None:
+            print(f"  Last frame:      {len(self.last_frame)} bytes, "
+                  f"contrast={self.last_contrast:.2f}")
+        print(f"  Frames captured: {self.frame_count}")
+
+    def cmd_help(self, args):
+        """Show available commands."""
+        print(f"{BOLD}Commands:{RESET}")
+        for name in sorted(self._commands):
+            if name.startswith("_"):
+                continue
+            func = self._commands[name]
+            doc = (func.__doc__ or "").strip().split("\n")[0]
+            print(f"  {GREEN}{name:<12}{RESET} {doc}")
+
+    def cmd_exit(self, args):
+        """Exit the inspector."""
+        print(f"{DIM}Goodbye.{RESET}")
+        sys.exit(0)
+
+
+Inspector._commands = {
+    "raw": Inspector.cmd_raw,
+    "read": Inspector.cmd_read,
+    "write": Inspector.cmd_write,
+    "scan": Inspector.cmd_scan,
+    "diff": Inspector.cmd_diff,
+    "capture": Inspector.cmd_capture,
+    "rearm": Inspector.cmd_rearm,
+    "trigger": Inspector.cmd_trigger,
+    "init": Inspector.cmd_init,
+    "reset": Inspector.cmd_reset,
+    "watch": Inspector.cmd_watch,
+    "save": Inspector.cmd_save,
+    "info": Inspector.cmd_info,
+    "help": Inspector.cmd_help,
+    "exit": Inspector.cmd_exit,
+    "quit": Inspector.cmd_exit,
+    "q": Inspector.cmd_exit,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Egis EH575 Interactive Sensor Inspector")
+    parser.add_argument("--light", action="store_true",
+                        help="Skip full init; send 'init' manually when ready")
+    parser.add_argument("--cmd", type=str, default=None,
+                        help="Run a single command and exit (non-interactive)")
+    args = parser.parse_args()
+
+    inspector = Inspector(light=args.light)
+
+    if args.cmd:
+        try:
+            parts = shlex.split(args.cmd)
+        except ValueError:
+            parts = args.cmd.split()
+        cmd_name = parts[0].lower()
+        cmd_args = parts[1:]
+        func = inspector._commands.get(cmd_name)
+        if func:
+            func(inspector, cmd_args)
+        else:
+            print(f"Unknown command: {cmd_name}")
+            inspector.cmd_help([])
+        return
+
+    print(f"{BOLD}Egis EH575 Inspector{RESET}")
+    print(f"Type {GREEN}help{RESET} for commands, {GREEN}exit{RESET} to quit.\n")
+
+    while True:
+        try:
+            line = input(f"{BOLD}egis>{RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not line:
+            continue
+
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = line.split()
+
+        cmd_name = parts[0].lower()
+        cmd_args = parts[1:]
+
+        func = inspector._commands.get(cmd_name)
+        if func:
+            try:
+                func(inspector, cmd_args)
+            except Exception as e:
+                print(f"{RED}Error: {e}{RESET}")
+        else:
+            print(f"{YELLOW}Unknown command: {cmd_name}. Type 'help' for commands.{RESET}")
+
+
+if __name__ == "__main__":
+    main()

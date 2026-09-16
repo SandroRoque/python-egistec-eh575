@@ -4,16 +4,20 @@ import os
 import shutil
 import subprocess
 import time
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / "open-fprintd-eh575"
+sys.path.insert(0, str(SOURCE))
+
+from egis_driver.runtime_payload import EXECUTABLES, PACKAGES
+
 INSTALL = Path("/opt/egis-driver")
 ENROLLMENT = Path("/var/lib/open-fprintd/egis")
 THRESHOLDS = Path("/var/lib/open-fprintd/egis-calibration/thresholds.json")
-EXECUTABLES = ("open-fprintd", "egis-bridge", "egis-calibrate")
 
 
 def run(command, **kwargs):
@@ -26,8 +30,8 @@ def install_payload(stage):
         shutil.copy2(SOURCE / "bin" / name, stage / name)
         (stage / name).chmod(0o755)
     ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
-    shutil.copytree(SOURCE / "egis_driver", stage / "egis_driver", ignore=ignored)
-    shutil.copytree(SOURCE / "openfprintd", stage / "openfprintd", ignore=ignored)
+    for name in PACKAGES:
+        shutil.copytree(SOURCE / name, stage / name, ignore=ignored)
 
 
 def wait_for_services():

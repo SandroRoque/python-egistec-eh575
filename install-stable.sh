@@ -11,8 +11,17 @@ STAGE_DIR=""
 CONFIG_BACKUP=""
 INSTALLED=0
 COMMITTED=0
+OPEN_FPRINTD_ACTIVE=""
+OPEN_FPRINTD_ENABLED=""
+EGIS_BRIDGE_ACTIVE=""
+EGIS_BRIDGE_ENABLED=""
 
-PAYLOAD=(open-fprintd egis-bridge egis-calibrate egis-enroll)
+PAYLOAD_TEXT="$(PYTHONPATH="$PROJECT_DIR" python3 -c \
+  'from egis_driver.runtime_payload import EXECUTABLES; print(*EXECUTABLES, sep="\n")')"
+PACKAGES_TEXT="$(PYTHONPATH="$PROJECT_DIR" python3 -c \
+  'from egis_driver.runtime_payload import PACKAGES; print(*PACKAGES, sep="\n")')"
+mapfile -t PAYLOAD <<< "$PAYLOAD_TEXT"
+mapfile -t PACKAGES <<< "$PACKAGES_TEXT"
 CONFIG_SOURCES=(
   "70-egis-eh575.rules"
   "io.github.uunicorn.Fprint.Device.Egis.conf"
@@ -62,9 +71,12 @@ preflight() {
       return 1
     }
   done
-  [ -d "$PROJECT_DIR/openfprintd" ]
-  [ -d "$PROJECT_DIR/egis_driver" ]
-  [ -d "$PROJECT_DIR/egis_matcher" ]
+  for source in "${PACKAGES[@]}"; do
+    [ -d "$PROJECT_DIR/$source" ] || {
+      printf 'Missing payload package: %s\n' "$PROJECT_DIR/$source" >&2
+      return 1
+    }
+  done
   [ -f "$SCRIPT_DIR/egis-doctor" ]
 }
 
@@ -93,10 +105,25 @@ rollback() {
   fi
   [ -n "$CONFIG_BACKUP" ] && restore_configs
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl start open-fprintd egis-bridge >/dev/null 2>&1 || true
+  restore_service_state open-fprintd "$OPEN_FPRINTD_ACTIVE" "$OPEN_FPRINTD_ENABLED"
+  restore_service_state egis-bridge "$EGIS_BRIDGE_ACTIVE" "$EGIS_BRIDGE_ENABLED"
   [ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
   [ -n "$CONFIG_BACKUP" ] && rm -rf "$CONFIG_BACKUP"
   exit "$status"
+}
+
+restore_service_state() {
+  local service="$1" active="$2" enabled="$3"
+  if [ "$enabled" = "enabled" ]; then
+    systemctl enable "$service" >/dev/null 2>&1 || true
+  else
+    systemctl disable "$service" >/dev/null 2>&1 || true
+  fi
+  if [ "$active" = "active" ]; then
+    systemctl start "$service" >/dev/null 2>&1 || true
+  else
+    systemctl stop "$service" >/dev/null 2>&1 || true
+  fi
 }
 
 if [ "${1:-}" = "--check" ]; then
@@ -111,6 +138,10 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 preflight
+OPEN_FPRINTD_ACTIVE="$(systemctl is-active open-fprintd 2>/dev/null || true)"
+OPEN_FPRINTD_ENABLED="$(systemctl is-enabled open-fprintd 2>/dev/null || true)"
+EGIS_BRIDGE_ACTIVE="$(systemctl is-active egis-bridge 2>/dev/null || true)"
+EGIS_BRIDGE_ENABLED="$(systemctl is-enabled egis-bridge 2>/dev/null || true)"
 trap 'rollback $?' EXIT
 
 STAGE_DIR="$(mktemp -d /opt/.egis-driver.stage.XXXXXX)"
@@ -120,8 +151,11 @@ for executable in "${PAYLOAD[@]}"; do
   install -m 0755 "$PROJECT_DIR/bin/$executable" "$STAGE_DIR/$executable"
 done
 install -m 0755 "$SCRIPT_DIR/egis-doctor" "$STAGE_DIR/egis-doctor"
-cp -a "$PROJECT_DIR/openfprintd" "$PROJECT_DIR/egis_driver" \
-  "$PROJECT_DIR/egis_matcher" "$STAGE_DIR/"
+PACKAGE_SOURCES=()
+for package in "${PACKAGES[@]}"; do
+  PACKAGE_SOURCES+=("$PROJECT_DIR/$package")
+done
+cp -a "${PACKAGE_SOURCES[@]}" "$STAGE_DIR/"
 find "$STAGE_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$STAGE_DIR" -type f -name '*.pyc' -delete
 

@@ -7,12 +7,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PARTS = {
-    ".egis-lab", ".egistec", "__pycache__", "continuous_scans", "dist",
-    "wireshark",
+    ".codex-sessions", ".egis-lab", ".egistec", "__pycache__",
+    "continuous_scans", "dist", "eh575-private-capture",
+    "tmp-egis-inspect", "wireshark",
 }
 FORBIDDEN_SUFFIXES = {
-    ".bin", ".key", ".npy", ".npz", ".p12", ".pcap", ".pcapng",
-    ".pem", ".pyc", ".raw", ".tar", ".tar.gz", ".tar.xz", ".zip",
+    ".bin", ".bmp", ".gif", ".jpeg", ".jpg", ".key", ".npy", ".npz",
+    ".p12", ".pcap", ".pcapng", ".pem", ".png", ".pyc", ".raw",
+    ".tif", ".tiff", ".tar", ".tar.gz", ".tar.xz", ".webp", ".zip",
 }
 SENSITIVE_PATTERNS = {
     "absolute home path": re.compile(b"/" + rb"home/[A-Za-z0-9._-]+"),
@@ -37,16 +39,25 @@ def forbidden_suffix(path):
     return next((suffix for suffix in FORBIDDEN_SUFFIXES if name.endswith(suffix)), None)
 
 
+def inspect_blob(relative, data, context=None):
+    errors = []
+    location = f"{relative}@{context}" if context else str(relative)
+    if any(part in FORBIDDEN_PARTS for part in relative.parts):
+        return [f"generated/private path is tracked: {location}"]
+    suffix = forbidden_suffix(relative)
+    if suffix:
+        return [f"forbidden capture/archive type {suffix}: {location}"]
+    if b"\0" in data:
+        return [f"unexpected binary file is tracked: {location}"]
+    for label, pattern in SENSITIVE_PATTERNS.items():
+        if pattern.search(data):
+            errors.append(f"{label} found in tracked file: {location}")
+    return errors
+
+
 def inspect_files(paths, root=ROOT):
     errors = []
     for relative in paths:
-        if any(part in FORBIDDEN_PARTS for part in relative.parts):
-            errors.append(f"generated/private path is tracked: {relative}")
-            continue
-        suffix = forbidden_suffix(relative)
-        if suffix:
-            errors.append(f"forbidden capture/archive type {suffix}: {relative}")
-            continue
         path = root / relative
         if not path.exists():
             continue
@@ -55,19 +66,39 @@ def inspect_files(paths, root=ROOT):
         except OSError as error:
             errors.append(f"cannot inspect {relative}: {error}")
             continue
-        if b"\0" in data:
-            errors.append(f"unexpected binary file is tracked: {relative}")
-            continue
-        for label, pattern in SENSITIVE_PATTERNS.items():
-            if pattern.search(data):
-                errors.append(f"{label} found in tracked file: {relative}")
+        errors.extend(inspect_blob(relative, data))
+    return errors
+
+
+def inspect_revision_range(revision_range, root=ROOT):
+    commits = subprocess.run(
+        ["git", "rev-list", "--reverse", revision_range], cwd=root,
+        capture_output=True, check=True, text=True,
+    ).stdout.splitlines()
+    errors = []
+    for commit in commits:
+        names = subprocess.run(
+            ["git", "ls-tree", "-r", "-z", "--name-only", commit], cwd=root,
+            capture_output=True, check=True,
+        ).stdout.split(b"\0")
+        for encoded in names:
+            if not encoded:
+                continue
+            relative = Path(encoded.decode("utf-8"))
+            data = subprocess.run(
+                ["git", "show", f"{commit}:{relative.as_posix()}"], cwd=root,
+                capture_output=True, check=True,
+            ).stdout
+            errors.extend(inspect_blob(relative, data, commit[:12]))
     return errors
 
 
 def main():
     parser = argparse.ArgumentParser("repository-guard")
-    parser.parse_args()
-    errors = inspect_files(tracked_files())
+    parser.add_argument("--revision-range")
+    args = parser.parse_args()
+    errors = (inspect_revision_range(args.revision_range) if args.revision_range
+              else inspect_files(tracked_files()))
     if errors:
         print("\n".join(errors))
         return 1

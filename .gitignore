@@ -8,6 +8,7 @@ __pycache__/
 .vscode/
 .egistec/
 .egis-lab/
+.codex-sessions/
 /eh575-private-capture/
 dist/
 tmp-egis-inspect/

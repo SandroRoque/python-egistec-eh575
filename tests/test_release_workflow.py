@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from egis_driver.version import __version__
+from egis_driver.runtime_payload import EXECUTABLES, PACKAGES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +123,26 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertIn("egis_matcher", arch)
         self.assertIn("egis_matcher", fedora)
 
+        stage = (ROOT / "stage-development").read_text()
+        installer = (ROOT / "install-stable.sh").read_text()
+        artifact = (ROOT / "open-fprintd-eh575" / "egis_driver" /
+                    "lab_artifact.py").read_text()
+        self.assertIn("runtime_payload import EXECUTABLES", stage)
+        self.assertIn("runtime_payload import EXECUTABLES", installer)
+        self.assertIn("runtime_payload import EXECUTABLES", artifact)
+        for executable in EXECUTABLES:
+            self.assertIn(executable, arch)
+            self.assertIn(executable, fedora)
+        for package in PACKAGES:
+            self.assertIn(package, arch)
+            self.assertIn(package, fedora)
+
+    def test_lab_has_no_hard_coded_live_data_root(self):
+        self.assertNotIn(
+            "/var/lib/open-fprintd",
+            (ROOT / "egis-lab").read_text(),
+        )
+
 
 class RepositoryGuardTests(unittest.TestCase):
     def test_private_and_generated_files_are_rejected(self):
@@ -154,6 +175,49 @@ class RepositoryGuardTests(unittest.TestCase):
             errors,
             ["generated/private path is tracked: wireshark/capture.csv"],
         )
+
+    def test_biometric_image_and_private_directories_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "fingerprint.png"
+            image.write_bytes(b"not-even-a-real-image")
+            private = root / "eh575-private-capture" / "frames.txt"
+            private.parent.mkdir()
+            private.write_text("pixels\n")
+
+            errors = guard.inspect_files(
+                [Path("fingerprint.png"),
+                 Path("eh575-private-capture/frames.txt")], root)
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any(".png" in error for error in errors))
+        self.assertTrue(any("private path" in error for error in errors))
+
+    def test_revision_range_includes_files_deleted_by_later_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"],
+                           cwd=root, check=True)
+            (root / "safe.txt").write_text("safe\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                  check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            (root / "fingerprint.png").write_bytes(b"image")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "add private image"],
+                           cwd=root, check=True)
+            (root / "fingerprint.png").unlink()
+            subprocess.run(["git", "add", "-u"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "remove private image"],
+                           cwd=root, check=True)
+
+            errors = guard.inspect_revision_range(f"{base}..HEAD", root)
+
+        self.assertTrue(any("fingerprint.png" in error for error in errors))
 
 
 if __name__ == "__main__":

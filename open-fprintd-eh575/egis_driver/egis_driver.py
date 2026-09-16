@@ -48,8 +48,13 @@ class EgisDriver:
         dev = devices[0]
 
         if dev.is_kernel_driver_active(self.profile.interface_number):
-            try: dev.detach_kernel_driver(self.profile.interface_number)
-            except: pass
+            try:
+                dev.detach_kernel_driver(self.profile.interface_number)
+            except Exception as error:
+                raise RuntimeError(
+                    "failed to detach the kernel driver from fingerprint "
+                    f"interface {self.profile.interface_number}: {error}"
+                ) from error
 
         dev.set_configuration()
         self._validate_device(dev)
@@ -383,8 +388,10 @@ class EgisDriver:
                 data = self.dev.read(self.profile.endpoint_in, 10000, timeout=read_timeout)
 
                 # Drain pipe
-                try: self.dev.read(self.profile.endpoint_in, 512, timeout=20)
-                except: pass
+                try:
+                    self.dev.read(self.profile.endpoint_in, 512, timeout=20)
+                except Exception as error:
+                    logger.debug("Optional USB drain did not complete: %s", error)
 
                 if len(data) > 5000:
                     target = self.frame_spec.byte_count
