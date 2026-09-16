@@ -105,16 +105,18 @@ def _run_once(dataset_root, config):
             if len(attempt_frames) < window:
                 continue
             attempt_started = time.perf_counter()
-            decision = matcher.evaluate_multiframe(
+            decision = matcher.score_multiframe(
                 attempt_frames,
                 username=meta["username"],
                 finger_name=meta["target_finger"],
-                apply_thresholds=False,
-                thresholds_override=config["thresholds"],
+                thresholds=config["thresholds"],
             )
             stats = dict(decision.metrics)
             attempt_stats.append(stats)
-            attempt_outcomes.append(decision.outcome.value)
+            attempt_outcomes.append(
+                "scored" if decision.identity else
+                decision.metrics.get("reject_reason", "unscorable")
+            )
             attempt_elapsed_ms.append(
                 (time.perf_counter() - attempt_started) * 1000.0
             )
@@ -254,7 +256,10 @@ def evaluate(dataset_root, config_path, source_root, repeats=2):
             "root": str(dataset_root),
             "manifest_sha256": manifest_hash,
             "role": manifest.get("role", "unknown"),
+            "created_at": manifest.get("created_at"),
+            "candidate_freeze": manifest.get("candidate_freeze"),
         },
+        "config_file_sha256": sha256_file(config_path),
         "source": {
             "root": str(Path(source_root).resolve()),
             "python_tree_sha256": tree_digest(

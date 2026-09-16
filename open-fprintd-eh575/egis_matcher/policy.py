@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from typing import Mapping
 
 
@@ -12,6 +13,55 @@ THRESHOLD_KEYS = (
     "min_orientation",
     "min_ridge_score",
 )
+
+MIN_HOMOGRAPHY_CORRESPONDENCES = 5
+
+
+def validate_thresholds(values: Mapping):
+    """Return normalized authentication thresholds or reject unsafe input."""
+    missing = sorted(set(THRESHOLD_KEYS) - set(values))
+    unknown = sorted(set(values) - set(THRESHOLD_KEYS))
+    if missing:
+        raise ValueError(f"missing threshold keys: {', '.join(missing)}")
+    if unknown:
+        raise ValueError(f"unknown threshold keys: {', '.join(unknown)}")
+
+    integer_bounds = {
+        "min_inliers": (MIN_HOMOGRAPHY_CORRESPONDENCES, 10_000),
+        "min_inlier_frames": (1, 64),
+        "min_frame_inliers": (MIN_HOMOGRAPHY_CORRESPONDENCES, 10_000),
+    }
+    normalized = {}
+    for key, (minimum, maximum) in integer_bounds.items():
+        value = values[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be an integer")
+        if not math.isfinite(float(value)) or int(value) != value:
+            raise ValueError(f"{key} must be a finite integer")
+        value = int(value)
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        normalized[key] = value
+
+    float_bounds = {
+        "min_inlier_ratio": (0.0, 1.0),
+        "min_margin": (0.0, 1_000_000.0),
+        "min_ncc": (0.0, 1.0),
+        "min_orientation": (0.0, 1.0),
+        "min_ridge_score": (0.0, 1.0),
+    }
+    for key, (minimum, maximum) in float_bounds.items():
+        value = values[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be numeric")
+        value = float(value)
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        normalized[key] = value
+
+    if normalized["min_inliers"] < normalized["min_frame_inliers"]:
+        raise ValueError("min_inliers must be at least min_frame_inliers")
+    return {key: normalized[key] for key in THRESHOLD_KEYS}
 
 
 def passes_thresholds(metrics: Mapping, thresholds: Mapping):

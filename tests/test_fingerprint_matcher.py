@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import hashlib
+import inspect
 
 import cv2
 import numpy as np
@@ -13,6 +14,7 @@ from egis_driver.matcher_config import MatcherConfig
 from egis_driver.persistence import Persistence
 from egis_driver.template_builder import TemplateBuilder
 from egis_matcher.feature_engine import FeatureRecord
+from egis_matcher.policy import validate_thresholds
 
 
 class FingerprintMatcherStorageTests(unittest.TestCase):
@@ -72,6 +74,68 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
             matcher = fingerprint_matcher.FingerprintMatcher(persistence=persistence)
 
             self.assertFalse(matcher.calibrated)
+
+    def test_unsafe_validated_threshold_file_fails_closed(self):
+        unsafe_values = (-1, float("nan"), True)
+        for unsafe in unsafe_values:
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as tmp:
+                persistence = self._persistence(tmp)
+                thresholds = {
+                    "min_inliers": 5,
+                    "min_inlier_ratio": 0.35,
+                    "min_inlier_frames": 1,
+                    "min_frame_inliers": 5,
+                    "min_margin": 1.0,
+                    "min_ncc": 0.28,
+                    "min_orientation": 0.45,
+                    "min_ridge_score": unsafe,
+                }
+                persistence.save_thresholds({
+                    "matcher_version": fingerprint_matcher.MATCHER_VERSION,
+                    "validated": True,
+                    "thresholds": thresholds,
+                })
+
+                matcher = fingerprint_matcher.FingerprintMatcher(
+                    persistence=persistence)
+
+                self.assertFalse(matcher.calibrated)
+
+    def test_threshold_domains_and_consistency_are_enforced(self):
+        values = {
+            "min_inliers": 5,
+            "min_inlier_ratio": 0.35,
+            "min_inlier_frames": 1,
+            "min_frame_inliers": 5,
+            "min_margin": 1.0,
+            "min_ncc": 0.28,
+            "min_orientation": 0.45,
+            "min_ridge_score": 0.45,
+        }
+        self.assertEqual(validate_thresholds(values), values)
+        for key, unsafe in (
+                ("min_inliers", 4),
+                ("min_frame_inliers", 4),
+                ("min_inlier_ratio", 1.1),
+                ("min_ncc", -0.1),
+                ("min_orientation", float("inf")),
+                ("min_ridge_score", True)):
+            with self.subTest(key=key, unsafe=unsafe):
+                candidate = dict(values)
+                candidate[key] = unsafe
+                with self.assertRaises(ValueError):
+                    validate_thresholds(candidate)
+        inconsistent = dict(values, min_inliers=5, min_frame_inliers=6)
+        with self.assertRaisesRegex(ValueError, "min_inliers"):
+            validate_thresholds(inconsistent)
+
+    def test_production_matcher_api_has_no_threshold_bypass(self):
+        for method in (
+                fingerprint_matcher.FingerprintMatcher.evaluate_multiframe,
+                fingerprint_matcher.FingerprintMatcher.verify_finger_multiframe):
+            parameters = inspect.signature(method).parameters
+            self.assertNotIn("apply_thresholds", parameters)
+            self.assertNotIn("thresholds_override", parameters)
 
     def test_legacy_template_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,6 +381,74 @@ class IdentityMatcherCandidateTests(unittest.TestCase):
 
         self.assertIn(("alice_right-thumb.npz", 0), [key for key, _ in selected])
         self.assertEqual(len(selected), 3)
+
+    def test_homography_requires_redundant_correspondence(self):
+        class Features:
+            descriptor_norm = cv2.NORM_L2
+
+            def __init__(self, count):
+                self.points = [(0, 0), (10, 0), (10, 10), (0, 10), (5, 5)][:count]
+
+            def raw_frame_to_image(self, raw):
+                return np.zeros((12, 12), dtype=np.uint8)
+
+            def preprocess(self, image):
+                return image
+
+            def detect_features(self, image):
+                keypoints = [cv2.KeyPoint(x=float(x), y=float(y), size=1)
+                             for x, y in self.points]
+                return keypoints, np.arange(
+                    len(keypoints) * 128, dtype=np.float32).reshape(-1, 128)
+
+            def ridge_consistency(self, image, template, homography):
+                return {"ncc": 1.0, "edge_ncc": 1.0, "orientation": 1.0,
+                        "ridge_score": 1.0, "coverage": 1.0}
+
+        class Matcher:
+            def __init__(self, count):
+                self.count = count
+
+            def knnMatch(self, descriptors, k):
+                return [[cv2.DMatch(i, i, 0, 1.0),
+                         cv2.DMatch(i, i, 0, 10.0)]
+                        for i in range(self.count)]
+
+        thresholds = {
+            "min_inliers": 5, "min_inlier_ratio": 0.35,
+            "min_inlier_frames": 1, "min_frame_inliers": 5,
+            "min_margin": 0.0, "min_ncc": 0.0,
+            "min_orientation": 0.0, "min_ridge_score": 0.0,
+        }
+
+        def evaluate(count):
+            features = Features(count)
+            matcher = IdentityMatcher(
+                features=features,
+                config=MatcherConfig(proposal_scope="global"),
+            )
+            filename = "alice_right-index-finger.npz"
+            template = {
+                "keypoints": [cv2.KeyPoint(x=float(x), y=float(y), size=1)
+                              for x, y in features.points],
+            }
+            lookup = {i: (filename, 0, i) for i in range(count)}
+            return matcher.verify_multiframe(
+                [b"frame"], username="alice", finger_name="right-index-finger",
+                train_descriptors=np.ones((count, 128), dtype=np.float32),
+                descriptor_lookup=lookup,
+                cached_templates={filename: [template]},
+                flann=Matcher(count), thresholds=thresholds,
+                calibrated=True, legacy_templates=[], apply_thresholds=True,
+            )
+
+        four_result, four_metrics = evaluate(4)
+        five_result, five_metrics = evaluate(5)
+
+        self.assertEqual(four_result, (None, 0))
+        self.assertEqual(four_metrics["reject_reason"], "too_few_keypoints")
+        self.assertEqual(five_result[0], "alice_right-index-finger")
+        self.assertEqual(five_metrics["best_inliers"], 5)
 
 
 class TemplateBuilderTouchDiversityTests(unittest.TestCase):

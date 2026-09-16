@@ -8,14 +8,65 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from egis_driver.evaluation import sha256_file, tree_digest
+from egis_driver.runtime_payload import EXECUTABLES as PAYLOAD_EXECUTABLES
+from egis_driver.runtime_payload import PACKAGES as PAYLOAD_PACKAGES
 
 
-PAYLOAD_EXECUTABLES = ("open-fprintd", "egis-bridge", "egis-calibrate")
 PRODUCTION_CONFIRMATION_POLICY = {
     "frames_per_attempt": 3,
     "required_consecutive_accepts": 3,
     "require_same_identity": True,
 }
+
+
+def _canonical_digest(document):
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def seal_candidate_freeze(document):
+    sealed = dict(document)
+    sealed.pop("freeze_sha256", None)
+    sealed["freeze_sha256"] = _canonical_digest(sealed)
+    return sealed
+
+
+def validate_candidate_freeze(document):
+    if document.get("schema_version") != 1:
+        raise ValueError("candidate freeze schema is unsupported")
+    expected = document.get("freeze_sha256")
+    payload = dict(document)
+    payload.pop("freeze_sha256", None)
+    if not expected or expected != _canonical_digest(payload):
+        raise ValueError("candidate freeze digest is invalid")
+    if document.get("development_role") != "development":
+        raise ValueError("candidate freeze must reference development evidence")
+    if document.get("development_passed") is not True:
+        raise ValueError("candidate freeze development evidence did not pass")
+    return document
+
+
+def create_candidate_freeze(source_root, config_path, development_report_path,
+                            generated_at=None):
+    development = _load_json(development_report_path)
+    source_digest = tree_digest(Path(source_root) / "open-fprintd-eh575")
+    if development.get("dataset", {}).get("role") != "development":
+        raise ValueError("freeze requires a development report")
+    if development.get("source", {}).get("python_tree_sha256") != source_digest:
+        raise ValueError("development report source does not match current source")
+    document = {
+        "schema_version": 1,
+        "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+        "source_python_tree_sha256": source_digest,
+        "config_sha256": sha256_file(config_path),
+        "development_role": "development",
+        "development_dataset_sha256": development["dataset"]["manifest_sha256"],
+        "development_decision_sha256": development["decision_sha256"],
+        "development_passed": bool(development.get("gates", {}).get("passed")),
+    }
+    return seal_candidate_freeze(document)
 
 
 def _load_json(path):
@@ -50,9 +101,8 @@ def _copy_payload(source_root, payload):
         shutil.copy2(project / "bin" / executable, payload / executable)
         (payload / executable).chmod(0o755)
     ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
-    shutil.copytree(project / "egis_driver", payload / "egis_driver", ignore=ignored)
-    shutil.copytree(project / "egis_matcher", payload / "egis_matcher", ignore=ignored)
-    shutil.copytree(project / "openfprintd", payload / "openfprintd", ignore=ignored)
+    for package in PAYLOAD_PACKAGES:
+        shutil.copytree(project / package, payload / package, ignore=ignored)
 
 
 def _file_manifest(root):
@@ -75,6 +125,16 @@ def build_candidate(source_root, candidate_report_path, baseline_report_path, ou
         raise ValueError("candidate does not pass acceptance and latency gates")
     if candidate["dataset"].get("role") != "holdout":
         raise ValueError("candidate report must use a holdout dataset")
+    freeze = validate_candidate_freeze(
+        candidate["dataset"].get("candidate_freeze", {}))
+    if freeze["source_python_tree_sha256"] != candidate["source"]["python_tree_sha256"]:
+        raise ValueError("candidate source differs from frozen source")
+    if freeze["config_sha256"] != candidate.get("config_file_sha256"):
+        raise ValueError("candidate configuration differs from frozen configuration")
+    if freeze["development_dataset_sha256"] == candidate["dataset"]["manifest_sha256"]:
+        raise ValueError("development and holdout datasets must be distinct")
+    if freeze["generated_at"] >= candidate["dataset"].get("created_at", ""):
+        raise ValueError("candidate must be frozen before holdout collection")
     policy = candidate.get("config", {}).get("confirmation_policy")
     if policy != PRODUCTION_CONFIRMATION_POLICY:
         raise ValueError("candidate report does not use the production confirmation policy")

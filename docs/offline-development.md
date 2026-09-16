@@ -314,7 +314,13 @@ sudo journalctl -u egis-bridge --since '-30 min' -o cat | \
 ```
 
 The report contains only counts and latency distributions; it excludes images,
-templates, identities, and matcher scores.
+templates, identities, and matcher scores. It separates outcomes and records
+confirmation progress, accepted-attempt timing, inter-frame timing, and deadline
+expiry. The live contact budget remains three seconds until an untouched holdout
+supports a replacement. Derive a candidate by rounding
+`p95(time to third consecutive accept) + p95(inter-frame interval)` up to 100 ms;
+accept it only if the same holdout has zero impostor accepts and no increase over
+the three-second baseline.
 
 When progress depends on a new enrollment format, stage it fail-closed with one
 privileged command:
@@ -330,18 +336,43 @@ authentication stays disabled until a later holdout passes and is promoted.
 
 ## Holdout
 
-After a candidate is frozen, collect the only new physical dataset required:
+After a candidate passes development, freeze its source, configuration, and
+development evidence before touching the holdout:
 
 ```bash
-sudo ./egis-lab holdout
+./egis-lab freeze-candidate \
+  --config lab-configs/production-parity.json \
+  --development-report DEVELOPMENT-CANDIDATE.json \
+  --output .egis-lab/candidates/CANDIDATE.freeze.json
 ```
 
-This single privileged command archives previous live samples, stops the bridge
-once, collects 8 genuine touches for each selected finger and 8 samples for every
-cross-finger target/actual pair, with three verification windows per touch, always
-restarts the bridge, and creates a snapshot labeled `holdout`. The default
-selection is right and left index plus right and left thumb. Development snapshots
-cannot be packaged for promotion.
+Then collect the new physical dataset:
+
+```bash
+sudo ./egis-lab holdout \
+  --candidate-freeze .egis-lab/candidates/CANDIDATE.freeze.json \
+  --session-index 1 --session-id SESSION-A
+sudo ./egis-lab holdout \
+  --candidate-freeze .egis-lab/candidates/CANDIDATE.freeze.json \
+  --session-index 2 --session-id SESSION-B
+```
+
+The first command archives previous samples; each session collects 10 presentations
+for every target/actual pair, with three verification windows per touch, and always
+restarts the bridge. The second session requires a distinct label, verifies at
+least 20 combined presentations per pair, and creates the immutable `holdout`
+snapshot. The default
+selection is right and left index plus right and left thumb. At least three
+selected fingers are required so every target faces two non-target fingers.
+Development snapshots cannot be packaged for promotion, and holdout snapshots
+without a valid pre-collection freeze cannot be evaluated for promotion.
+
+This is a manual critical path: the four-finger all-pairs default is 320 labeled
+presentations and commonly takes 8–16 hours across several sessions once retries,
+full lifts, and USB recovery are included. Wrong-finger, partial, or interrupted
+captures must be recollected, not relabeled. Until a broader multi-person and
+multi-device study exists, the result supports only a single-user, single-EH575
+best-effort claim; it is not a population FAR estimate.
 
 Evaluate the baseline and candidate against the holdout snapshot. A candidate
 artifact can be built only when its holdout report passes and its latency is no

@@ -32,3 +32,7 @@ class RuntimePaths:
     @property
     def gallery_dir(self):
         return self.data_root / "egis-gallery"
+
+    @property
+    def atlas_dir(self):
+        return self.data_root / "egis-atlas"

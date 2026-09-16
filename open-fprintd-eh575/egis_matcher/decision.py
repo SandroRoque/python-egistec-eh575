@@ -24,3 +24,15 @@ class MatchDecision:
 
     def as_legacy_result(self):
         return (self.identity, self.score) if self.accepted else (None, 0)
+
+
+@dataclass(frozen=True)
+class MatchScore:
+    """Offline evidence without an authentication outcome."""
+
+    identity: str | None = None
+    score: int = 0
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_legacy_result(self):
+        return self.identity, self.score

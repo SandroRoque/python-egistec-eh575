@@ -16,7 +16,11 @@ from egis_driver.evaluation import (
     tree_digest,
     write_report,
 )
-from egis_driver.lab_artifact import build_candidate, extract_and_validate
+from egis_driver.lab_artifact import (
+    build_candidate,
+    extract_and_validate,
+    seal_candidate_freeze,
+)
 from egis_driver.lab_artifact import compare_reports
 from egis_driver.matcher_config import MatcherConfig
 from egis_driver.persistence import Persistence
@@ -136,8 +140,24 @@ class EvaluationSummaryTests(unittest.TestCase):
 
 class CandidateArtifactTests(unittest.TestCase):
     def _report(self, p95, source_digest, dataset="dataset-hash", role="holdout"):
+        freeze = seal_candidate_freeze({
+            "schema_version": 1,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "source_python_tree_sha256": source_digest,
+            "config_sha256": "config-hash",
+            "development_role": "development",
+            "development_dataset_sha256": "development-dataset-hash",
+            "development_decision_sha256": "development-decision-hash",
+            "development_passed": True,
+        })
         return {
-            "dataset": {"manifest_sha256": dataset, "role": role},
+            "dataset": {
+                "manifest_sha256": dataset,
+                "role": role,
+                "created_at": "2026-01-02T00:00:00+00:00",
+                "candidate_freeze": freeze,
+            },
+            "config_file_sha256": "config-hash",
             "source": {"python_tree_sha256": source_digest},
             "decision_sha256": "decision",
             "latency": {"p95_ms": p95},
@@ -200,6 +220,27 @@ class CandidateArtifactTests(unittest.TestCase):
             candidate.write_text(json.dumps(report))
 
             with self.assertRaisesRegex(ValueError, "production confirmation"):
+                build_candidate(ROOT, candidate, baseline, tmp / "dist")
+
+    def test_candidate_must_be_frozen_before_distinct_holdout(self):
+        digest = tree_digest(ROOT / "open-fprintd-eh575")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            baseline = tmp / "baseline.json"
+            candidate = tmp / "candidate.json"
+            report = self._report(100.0, digest)
+            report["dataset"]["candidate_freeze"] = seal_candidate_freeze({
+                **{
+                    key: value for key, value in
+                    report["dataset"]["candidate_freeze"].items()
+                    if key != "freeze_sha256"
+                },
+                "generated_at": "2026-01-03T00:00:00+00:00",
+            })
+            baseline.write_text(json.dumps(report))
+            candidate.write_text(json.dumps(report))
+
+            with self.assertRaisesRegex(ValueError, "before holdout"):
                 build_candidate(ROOT, candidate, baseline, tmp / "dist")
 
     def test_failed_baseline_is_not_a_relative_latency_reference(self):

@@ -5,8 +5,9 @@ import os
 import time
 
 from egis_matcher.core import MatcherCore
+from egis_matcher.decision import MatchScore
 from egis_matcher.matcher_config import MatcherConfig
-from egis_matcher.policy import THRESHOLD_KEYS
+from egis_matcher.policy import validate_thresholds
 from egis_driver.persistence import Persistence
 from egis_matcher.template_builder import TemplateBuilder
 from egis_matcher.gallery import GalleryBuilder, StreamingGalleryMatcher
@@ -83,19 +84,7 @@ class FingerprintMatcher:
             return False
 
     def _coerce_thresholds(self, thresholds):
-        missing = [key for key in THRESHOLD_KEYS if key not in thresholds]
-        if missing:
-            raise KeyError(f"missing threshold keys: {', '.join(missing)}")
-        return {
-            "min_inliers": int(thresholds["min_inliers"]),
-            "min_inlier_ratio": float(thresholds["min_inlier_ratio"]),
-            "min_inlier_frames": int(thresholds["min_inlier_frames"]),
-            "min_frame_inliers": int(thresholds["min_frame_inliers"]),
-            "min_margin": float(thresholds["min_margin"]),
-            "min_ncc": float(thresholds["min_ncc"]),
-            "min_orientation": float(thresholds["min_orientation"]),
-            "min_ridge_score": float(thresholds["min_ridge_score"]),
-        }
+        return validate_thresholds(thresholds)
 
     def _default_thresholds(self):
         return {
@@ -368,9 +357,7 @@ class FingerprintMatcher:
             self,
             raw_frames,
             username=None,
-            finger_name=None,
-            apply_thresholds=True,
-            thresholds_override=None):
+            finger_name=None):
         """
         Multi-frame verification.
         SIFT/FLANN proposes candidate alignments. Authentication then requires
@@ -388,20 +375,16 @@ class FingerprintMatcher:
             raw_frames,
             username=username,
             finger_name=finger_name,
-            apply_thresholds=apply_thresholds,
-            thresholds_override=thresholds_override,
         ).as_legacy_result()
 
     def evaluate_multiframe(
             self,
             raw_frames,
             username=None,
-            finger_name=None,
-            apply_thresholds=True,
-            thresholds_override=None):
+            finger_name=None):
         """Return a structured decision for one completed frame window."""
         finger_name = self._normalize_verify_finger(finger_name)
-        thresholds = thresholds_override or self._active_thresholds(username, finger_name)
+        thresholds = self._active_thresholds(username, finger_name)
         train_descriptors, descriptor_lookup, flann, index_scope = (
             self._verification_index(username)
         )
@@ -416,7 +399,7 @@ class FingerprintMatcher:
             thresholds=thresholds,
             calibrated=self.calibrated,
             legacy_templates=self.legacy_templates,
-            apply_thresholds=apply_thresholds,
+            apply_thresholds=True,
         )
         stats = dict(decision.metrics)
         stats["index_scope"] = index_scope
@@ -428,6 +411,32 @@ class FingerprintMatcher:
             decision.reason,
             stats,
         )
+
+    def score_multiframe(self, raw_frames, username=None, finger_name=None,
+                         thresholds=None):
+        """Return offline candidate evidence without an auth decision."""
+        finger_name = self._normalize_verify_finger(finger_name)
+        thresholds = validate_thresholds(thresholds or self._default_thresholds())
+        train_descriptors, descriptor_lookup, flann, index_scope = (
+            self._verification_index(username)
+        )
+        result, metrics = self.identity_matcher.verify_multiframe(
+            raw_frames,
+            username=username,
+            finger_name=finger_name,
+            train_descriptors=train_descriptors,
+            descriptor_lookup=descriptor_lookup,
+            cached_templates=self.cached_templates,
+            flann=flann,
+            thresholds=thresholds,
+            calibrated=False,
+            legacy_templates=self.legacy_templates,
+            apply_thresholds=False,
+        )
+        identity, score = result
+        stats = dict(metrics)
+        stats["index_scope"] = index_scope
+        return MatchScore(identity=identity, score=int(score), metrics=stats)
 
     def get_enrolled_fingers(self, username):
         """Returns list of fingers for fprintd"""

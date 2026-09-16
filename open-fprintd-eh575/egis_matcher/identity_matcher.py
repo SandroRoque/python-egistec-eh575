@@ -5,6 +5,7 @@ import numpy as np
 
 from egis_matcher.image_features import ImageFeatureExtractor
 from egis_matcher.matcher_config import MatcherConfig
+from egis_matcher.policy import MIN_HOMOGRAPHY_CORRESPONDENCES
 
 logger = logging.getLogger("IDENTITY")
 
@@ -55,12 +56,13 @@ class IdentityMatcher:
             query_images.append(img)
             kp, des = self.features.detect_features(img)
 
-            if des is not None and len(kp) >= 4:
+            if des is not None and len(kp) >= MIN_HOMOGRAPHY_CORRESPONDENCES:
                 all_keypoints.extend(kp)
                 all_descriptors_list.append(des)
                 query_frame_ids.extend([frame_idx] * len(des))
 
-        if not all_descriptors_list or len(all_keypoints) < 4:
+        if (not all_descriptors_list or
+                len(all_keypoints) < MIN_HOMOGRAPHY_CORRESPONDENCES):
             logger.info("Too few keypoints across %d frames", len(raw_frames))
             return (None, 0), {
                 "frames": len(raw_frames),
@@ -93,7 +95,7 @@ class IdentityMatcher:
 
         logger.info("Good matches after ratio test: %d", len(good_matches))
 
-        if len(good_matches) < 4:
+        if len(good_matches) < MIN_HOMOGRAPHY_CORRESPONDENCES:
             return (None, 0), {
                 "frames": len(raw_frames),
                 "keypoints": len(all_keypoints),
@@ -127,7 +129,7 @@ class IdentityMatcher:
         candidate_records = []
 
         for i, (candidate_key, candidate_matches) in enumerate(top_candidates):
-            if len(candidate_matches) < 4:
+            if len(candidate_matches) < MIN_HOMOGRAPHY_CORRESPONDENCES:
                 continue
 
             filename, t_idx = candidate_key
@@ -147,7 +149,7 @@ class IdentityMatcher:
                     if query_frame_ids[m.queryIdx] == frame_id
                 ]
                 valid_votes += len(frame_matches)
-                if len(frame_matches) < 4:
+                if len(frame_matches) < MIN_HOMOGRAPHY_CORRESPONDENCES:
                     continue
 
                 src_pts = np.float32([all_keypoints[m.queryIdx].pt for m in frame_matches]).reshape(-1, 1, 2)
@@ -163,7 +165,7 @@ class IdentityMatcher:
                     continue
 
                 inliers = int(np.sum(mask))
-                if inliers < 4:
+                if inliers < MIN_HOMOGRAPHY_CORRESPONDENCES:
                     continue
 
                 sx = np.sqrt(homography[0, 0] ** 2 + homography[1, 0] ** 2)

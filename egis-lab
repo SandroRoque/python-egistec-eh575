@@ -18,11 +18,16 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "open-fprintd-eh575"))
 
 from egis_driver.evaluation import evaluate, sha256_file, write_report
-from egis_driver.lab_artifact import build_candidate
+from egis_driver.lab_artifact import (
+    build_candidate,
+    create_candidate_freeze,
+    validate_candidate_freeze,
+)
 from egis_driver.compatibility import doctor_report, public_compatibility_report
 from egis_driver.egis_driver import EgisDriver
 from egis_driver.fingerprint_matcher import FingerprintMatcher as ProductionMatcher
 from egis_driver.persistence import Persistence
+from egis_driver.runtime_config import RuntimePaths
 from egis_driver.sequence_recording import SequenceRecorder, load_sequence
 from egis_driver.streaming import CapturePump
 from egis_driver.atlas_storage import load_atlas, save_atlas, write_private_json
@@ -60,7 +65,7 @@ def cmd_latency_report(args):
     return 0 if report["sessions"] else 2
 
 
-def _manifest_for(root, role):
+def _manifest_for(root, role, candidate_freeze=None):
     files = {}
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.name != "dataset-manifest.json":
@@ -68,13 +73,16 @@ def _manifest_for(root, role):
                 "sha256": sha256_file(path),
                 "size": path.stat().st_size,
             }
-    return {
+    manifest = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "source": "/var/lib/open-fprintd",
+        "source": "runtime-data-root",
         "role": role,
         "files": files,
     }
+    if candidate_freeze is not None:
+        manifest["candidate_freeze"] = candidate_freeze
+    return manifest
 
 
 def _chown_tree(root, uid, gid):
@@ -98,7 +106,7 @@ def cmd_snapshot(args):
     if not target_user or target_user == "root":
         raise SystemExit("SUDO_USER is unavailable; invoke through sudo as your normal user")
     account = pwd.getpwnam(target_user)
-    source = Path("/var/lib/open-fprintd")
+    source = RuntimePaths.from_environment().data_root
     for required in (source / "egis", source / "egis-calibration"):
         if not required.is_dir():
             raise SystemExit(f"required dataset directory is missing: {required}")
@@ -121,7 +129,16 @@ def cmd_snapshot(args):
         path = source / "egis-calibration" / filename
         if path.is_file():
             shutil.copy2(path, calibration_snapshot / filename)
-    manifest = _manifest_for(snapshot, args.role)
+    candidate_freeze = None
+    if args.role == "holdout":
+        if not getattr(args, "holdout_validated", False):
+            raise SystemExit("create holdout snapshots through egis-lab holdout")
+        freeze_path = getattr(args, "candidate_freeze", None)
+        if not freeze_path:
+            raise SystemExit("holdout snapshots require --candidate-freeze")
+        candidate_freeze = validate_candidate_freeze(_load_report(freeze_path))
+        write_private_json(snapshot / "candidate-freeze.json", candidate_freeze)
+    manifest = _manifest_for(snapshot, args.role, candidate_freeze)
     (snapshot / "dataset-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -144,15 +161,36 @@ def cmd_holdout(args):
     username = args.username or os.environ.get("SUDO_USER")
     if not username or username == "root":
         raise SystemExit("A non-root username is required")
+    if len(set(args.fingers)) < 3:
+        raise SystemExit("holdout requires each target to face at least two impostor fingers")
 
-    calibration_root = Path("/var/lib/open-fprintd/egis-calibration")
+    freeze = validate_candidate_freeze(_load_report(args.candidate_freeze))
+    freeze_sha256 = freeze["freeze_sha256"]
+    calibration_root = RuntimePaths.from_environment().calibration_dir
     sample_dir = calibration_root / "samples"
     archive_root = calibration_root / "archive"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if sample_dir.exists():
-        os.replace(sample_dir, archive_root / stamp)
-    sample_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.session_index == 1:
+        if sample_dir.exists():
+            os.replace(sample_dir, archive_root / stamp)
+        sample_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    elif not sample_dir.is_dir():
+        raise SystemExit("holdout session 2 requires a completed session 1")
+    else:
+        existing = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(sample_dir.glob("*.json"))
+        ]
+        existing_sessions = {item.get("session_id") for item in existing}
+        if (not existing or None in existing_sessions or
+                args.session_id in existing_sessions):
+            raise SystemExit(
+                "holdout session 2 requires a new session id and labeled session 1")
+        if any(item.get("candidate_freeze_sha256") != freeze_sha256
+               for item in existing):
+            raise SystemExit(
+                "session 1 samples belong to a different frozen candidate")
 
     calibrate = ROOT / "open-fprintd-eh575" / "bin" / "egis-calibrate"
     env = {**os.environ, "PYTHONPATH": str(ROOT / "open-fprintd-eh575")}
@@ -174,6 +212,8 @@ def cmd_holdout(args):
                     "--label", label,
                     "--samples", str(args.samples),
                     "--frames", str(args.frames),
+                    "--session-id", args.session_id,
+                    "--candidate-freeze-sha256", freeze_sha256,
                 ],
                 check=True,
                 env=env,
@@ -181,8 +221,40 @@ def cmd_holdout(args):
     finally:
         subprocess.run(["systemctl", "start", "egis-bridge"], check=False)
 
+    if args.session_index == 1:
+        print("Holdout session 1 complete; run session 2 with a new --session-id.")
+        return 0
+
+    records = []
+    for path in sorted(sample_dir.glob("*.json")):
+        records.append(json.loads(path.read_text(encoding="utf-8")))
+    sessions = {item.get("session_id") for item in records}
+    if None in sessions or len(sessions) < 2 or args.session_id not in sessions:
+        raise SystemExit("holdout requires two distinct labeled capture sessions")
+    if any(item.get("candidate_freeze_sha256") != freeze_sha256 for item in records):
+        raise SystemExit("holdout samples do not share the frozen candidate digest")
+    for target, actual, _ in matrix:
+        count = sum(
+            item.get("target_finger") == target and
+            item.get("actual_finger") == actual
+            for item in records
+        )
+        if count < 20:
+            raise SystemExit(
+                f"holdout needs 20 presentations for {target}/{actual}; found {count}")
+
     args.role = "holdout"
+    args.holdout_validated = True
     cmd_snapshot(args)
+
+
+def cmd_freeze_candidate(args):
+    output = _private_lab_path(args.output)
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    document = create_candidate_freeze(
+        ROOT, args.config, args.development_report)
+    write_private_json(output, document)
+    print(output)
 
 
 def cmd_record_sequence(args):
@@ -502,9 +574,10 @@ def cmd_install_enrollment_session(args):
             f"session {args.session_id} lacks three trusted touches for: " +
             ", ".join(missing))
 
-    enrollment = Path("/var/lib/open-fprintd/egis")
-    atlas_root = Path("/var/lib/open-fprintd/egis-atlas")
-    gallery_root = Path("/var/lib/open-fprintd/egis-gallery")
+    runtime_paths = RuntimePaths.from_environment()
+    enrollment = runtime_paths.enrollment_dir
+    atlas_root = runtime_paths.atlas_dir
+    gallery_root = runtime_paths.gallery_dir
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = enrollment.with_name(f"egis.pre-schema6.{stamp}")
     failed = enrollment.with_name(f"egis.failed-schema6.{stamp}")
@@ -523,7 +596,7 @@ def cmd_install_enrollment_session(args):
         enrollment.mkdir(mode=0o700, parents=True)
         atlas_root.mkdir(mode=0o700, parents=True)
         gallery_root.mkdir(mode=0o700, parents=True)
-        matcher = ProductionMatcher(Persistence("/var/lib/open-fprintd"))
+        matcher = ProductionMatcher(Persistence(str(runtime_paths.data_root)))
         for finger in FINGER_ORDER:
             if not matcher.enroll_finger(
                     f"{username}_{finger}", grouped[finger]):
@@ -1106,6 +1179,7 @@ def build_parser():
         choices=("development", "holdout"),
         default="development",
     )
+    snapshot.add_argument("--candidate-freeze")
     snapshot.set_defaults(func=cmd_snapshot)
 
     holdout = sub.add_parser(
@@ -1121,9 +1195,21 @@ def build_parser():
                  "right-thumb", "left-thumb"),
         help="Fingers used for the genuine/impostor matrix",
     )
-    holdout.add_argument("--samples", type=int, default=8)
+    holdout.add_argument("--samples", type=int, default=10)
     holdout.add_argument("--frames", type=int, default=9)
+    holdout.add_argument("--candidate-freeze", required=True)
+    holdout.add_argument("--session-id", required=True)
+    holdout.add_argument("--session-index", type=int, choices=(1, 2), required=True)
     holdout.set_defaults(func=cmd_holdout)
+
+    freeze = sub.add_parser(
+        "freeze-candidate",
+        help="Freeze source/configuration after passing development evidence",
+    )
+    freeze.add_argument("--config", required=True)
+    freeze.add_argument("--development-report", required=True)
+    freeze.add_argument("--output", required=True)
+    freeze.set_defaults(func=cmd_freeze_candidate)
 
     record = sub.add_parser(
         "record-sequence",

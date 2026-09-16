@@ -58,20 +58,26 @@ def capture_attempt(driver, frame_count):
     print("Touch the sensor now...")
 
     frames = []
+    frame_elapsed_ms = []
+    first_frame_at = None
     while len(frames) < frame_count:
         img, contrast, present = driver.capture_presence_frame()
         if present and img is not None:
+            captured_at = time.monotonic()
+            if first_frame_at is None:
+                first_frame_at = captured_at
             frames.append(bytes(img))
+            frame_elapsed_ms.append((captured_at - first_frame_at) * 1000.0)
             print(f"  frame {len(frames)}/{frame_count}, contrast={contrast:.1f}")
             time.sleep(0.02)
         else:
             time.sleep(0.05)
 
     wait_for_release(driver)
-    return frames
+    return frames, frame_elapsed_ms
 
 
-def save_sample(args, frames):
+def save_sample(args, frames, frame_elapsed_ms=None):
     ensure_dirs()
     ts = int(time.time() * 1000)
     safe_user = args.username.replace("/", "_")
@@ -87,6 +93,9 @@ def save_sample(args, frames):
         "actual_finger": args.actual_finger,
         "label": args.label,
         "num_frames": len(frames),
+        "session_id": args.session_id,
+        "candidate_freeze_sha256": args.candidate_freeze_sha256,
+        "frame_elapsed_ms": list(frame_elapsed_ms or ()),
     }
 
     save_data = {}
@@ -101,8 +110,8 @@ def collect(args):
     driver = egis_driver.EgisDriver()
     for idx in range(args.samples):
         print(f"\nSample {idx + 1}/{args.samples}: {args.label} actual={args.actual_finger} target={args.target_finger}")
-        frames = capture_attempt(driver, args.frames)
-        save_sample(args, frames)
+        frames, frame_elapsed_ms = capture_attempt(driver, args.frames)
+        save_sample(args, frames, frame_elapsed_ms)
 
 
 def load_samples():
@@ -292,12 +301,11 @@ def analyze(args):
             attempt_frames = frames[offset:offset + ATTEMPT_FRAME_COUNT]
             if len(attempt_frames) < ATTEMPT_FRAME_COUNT:
                 continue
-            decision = matcher.evaluate_multiframe(
+            decision = matcher.score_multiframe(
                 attempt_frames,
                 username=sample["username"],
                 finger_name=sample["target_finger"],
-                apply_thresholds=False,
-                thresholds_override=IDENTITY_POLICY,
+                thresholds=IDENTITY_POLICY,
             )
             attempts.append(decision.metrics.get("best", {}))
             identity, _ = decision.as_legacy_result()
@@ -382,6 +390,8 @@ def main():
     collect_p.add_argument("--label", choices=["genuine", "impostor"], required=True)
     collect_p.add_argument("--samples", type=int, default=5)
     collect_p.add_argument("--frames", type=int, default=3)
+    collect_p.add_argument("--session-id")
+    collect_p.add_argument("--candidate-freeze-sha256")
     collect_p.set_defaults(func=collect)
 
     analyze_p = sub.add_parser("analyze")

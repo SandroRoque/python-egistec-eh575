@@ -24,7 +24,9 @@ hardware evidence.
 
 Before tagging:
 
-1. Re-run the frozen private holdout at least five times.
+1. Freeze the candidate before collecting the private holdout; require at least
+   20 independent genuine presentations per target and 20 presentations from
+   each of at least two non-target fingers.
 2. Require deterministic decisions, zero impostor accepts, every target at or
    above its genuine-pass gate, and p95 matching latency at or below 250 ms.
 3. Install the exact release candidate through the package/source path.
