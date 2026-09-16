@@ -2,8 +2,8 @@ import json
 import os
 import tempfile
 import unittest
-import hashlib
 import inspect
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -13,7 +13,6 @@ from egis_driver.identity_matcher import IdentityMatcher
 from egis_driver.matcher_config import MatcherConfig
 from egis_driver.persistence import Persistence
 from egis_driver.template_builder import TemplateBuilder
-from egis_matcher.feature_engine import FeatureRecord
 from egis_matcher.policy import validate_thresholds
 
 
@@ -225,60 +224,25 @@ class FingerprintMatcherStorageTests(unittest.TestCase):
                 default_thresholds,
             )
 
-    def test_enrollment_succeeds_when_optional_gallery_engine_is_absent(self):
-        class UnavailableEngine:
-            available = False
-
+    def test_enrollment_never_starts_optional_feature_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
             matcher = self._matcher(tmp)
-            matcher.gallery_engine = UnavailableEngine()
             scene = np.random.default_rng(12).integers(
                 0, 256, size=(60, 150), dtype=np.uint8)
             frames = [scene[:52, x:x + 103].tobytes() for x in (0, 12, 24, 36)]
 
-            self.assertTrue(matcher.enroll_finger(
-                "testuser_right-index-finger", [frames]))
+            with mock.patch(
+                    "subprocess.Popen",
+                    side_effect=AssertionError("live enrollment launched a process")) as launch:
+                self.assertTrue(matcher.enroll_finger(
+                    "testuser_right-index-finger", [frames]))
+            launch.assert_not_called()
 
             self.assertEqual(
                 matcher.get_enrolled_fingers("testuser"),
                 ["right-index-finger"],
             )
-            self.assertIsNone(matcher.new_touch_identity_matcher("testuser"))
-
-    def test_enrollment_builds_pixel_free_shadow_gallery_when_engine_is_available(self):
-        class Engine:
-            VERSION = "3.18.1"
-            available = True
-
-            def config(self):
-                return {"engine": "sourceafis", "version": self.VERSION,
-                        "scale": 3.0, "invert": False, "dpi": 500}
-
-            def extract_record(self, image):
-                data = hashlib.sha256(image.image.tobytes()).digest()
-                return FeatureRecord("sourceafis", self.VERSION, data), "ok", 1.0
-
-            def compare_records(self, left, right):
-                return float(left.data == right.data)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            matcher = self._matcher(tmp)
-            matcher.gallery_engine = Engine()
-            scene = np.random.default_rng(13).integers(
-                0, 256, size=(60, 150), dtype=np.uint8)
-            frames = [scene[:52, x:x + 103].tobytes()
-                      for x in (0, 12, 24, 36)]
-
-            self.assertTrue(matcher.enroll_finger(
-                "testuser_right-index-finger", [frames]))
-
-            gallery = os.path.join(
-                matcher.persistence.gallery_dir, "testuser_right-index-finger")
-            self.assertTrue(os.path.isfile(os.path.join(gallery, "records.bin")))
-            with open(os.path.join(gallery, "manifest.json")) as stream:
-                manifest = json.load(stream)
-            self.assertFalse(manifest["contains_raw_frames"])
-            self.assertIsNotNone(matcher.new_touch_identity_matcher("testuser"))
+            self.assertEqual(os.listdir(matcher.persistence.gallery_dir), [])
 
     def test_username_index_excludes_other_users_before_matching(self):
         with tempfile.TemporaryDirectory() as tmp:

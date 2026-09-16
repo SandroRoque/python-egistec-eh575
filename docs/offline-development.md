@@ -153,19 +153,8 @@ regions with sufficient motion and consistent alignment. The report records each
 frame's reason, supported cells, admitted-frame count, experimental sufficiency,
 processing latency, and time to sufficient evidence along the capture timeline.
 
-The feature-specific ridge/minutiae backend can be replayed without touching the
-service or sensor. It produces private, versioned evidence only and is not an
-authentication decision:
-
-```bash
-./egis-lab match-fingerprint-sequences \
-  .egis-lab/sequences/ENROLLMENT-TOUCH-1 \
-  .egis-lab/sequences/ENROLLMENT-TOUCH-2 \
-  --probe .egis-lab/sequences/PROBE
-```
-
-The SIFT matcher remains the baseline. Compare false accepts, false rejects, and
-processing time on the same replay set before considering production integration.
+The retired custom minutiae backend and its replay command have been removed.
+SourceAFIS and NBIS remain available for offline comparisons.
 
 Replay a complete touch once against every enrolled experimental atlas with
 shared feature extraction and identity-margin rejection:
@@ -176,20 +165,10 @@ shared feature extraction and identity-margin rejection:
   --atlas-root .egis-lab/atlases/SESSION_ID
 ```
 
-The result is still shadow evidence. It cannot unlock the system until the
-production persistence, worker protocol, replay gates, and live holdout are complete.
-
-After schema-v6 deployment, inspect live shadow evidence without exposing
-biometric payloads:
-
-```bash
-sudo journalctl -u egis-bridge -f -o short-precise | rg '\[SHADOW\]'
-```
-
-Shadow mode is the default. `EGIS_MATCH_MODE` accepts only `window` and `shadow`;
-the uncalibrated gallery has no runtime promotion switch. Missing galleries,
-worker failure, queue loss, and discontinuities leave production verification
-unchanged.
+Atlas results are offline research evidence and cannot unlock the system.
+Production accepts only `EGIS_MATCH_MODE=window` (the default); verification and
+enrollment do not load experimental galleries or start Java. Remove old `shadow`
+overrides before installing an updated service.
 
 Build presentation galleries and replay every labeled development probe without
 writing per-finger shell loops:
@@ -302,7 +281,7 @@ waiting for an already-dispatched backend call.
 
 The service emits one privacy-safe `[LATENCY]` record for every completed live
 touch. It separates request-to-touch time, first-frame delay, capture, queueing,
-authoritative matching, shadow extraction/comparison, confirmation attempts, and
+authoritative matching, confirmation attempts, and
 touch-to-decision time. D-Bus dispatch queueing is recorded separately.
 
 After several genuine and impostor lock-screen attempts, aggregate the journal:

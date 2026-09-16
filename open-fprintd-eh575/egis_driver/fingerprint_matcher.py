@@ -10,9 +10,6 @@ from egis_matcher.matcher_config import MatcherConfig
 from egis_matcher.policy import validate_thresholds
 from egis_driver.persistence import Persistence
 from egis_matcher.template_builder import TemplateBuilder
-from egis_matcher.gallery import GalleryBuilder, StreamingGalleryMatcher
-from egis_matcher.sourceafis import SourceAfisEngine
-from egis_driver.gallery_storage import load_gallery, save_gallery
 
 logger = logging.getLogger("MATCHER")
 
@@ -50,8 +47,6 @@ class FingerprintMatcher:
         self.threshold_source = None
         self.legacy_templates = []
         self.thresholds_by_target = {}
-        self.feature_galleries = {}
-        self.gallery_engine = SourceAfisEngine(scale=3.0)
         self._load_thresholds()
 
         self.rebuild_index()
@@ -145,7 +140,6 @@ class FingerprintMatcher:
         self.cached_templates = {}
         self.legacy_templates = []
         self._scoped_indexes = {}
-        self.feature_galleries = {}
 
         current_idx_offset = 0
 
@@ -238,19 +232,6 @@ class FingerprintMatcher:
 
             if unpacked_templates:
                 self.cached_templates[filename] = unpacked_templates
-                gallery_path = os.path.join(
-                    self.persistence.gallery_dir, filename.removesuffix(".npz"))
-                try:
-                    gallery, _ = load_gallery(gallery_path)
-                    if gallery.identity != filename.removesuffix(".npz"):
-                        raise ValueError("gallery identity does not match template")
-                    if (gallery.engine != "sourceafis" or
-                            gallery.engine_version != self.gallery_engine.VERSION or
-                            gallery.engine_config != self.gallery_engine.config()):
-                        raise ValueError("gallery engine is incompatible")
-                    self.feature_galleries[filename] = gallery
-                except (OSError, KeyError, TypeError, ValueError) as error:
-                    logger.info("Feature gallery unavailable for %s: %s", filename, error)
 
         if all_descriptors:
             self.train_descriptors = np.vstack(all_descriptors)
@@ -327,24 +308,6 @@ class FingerprintMatcher:
         self.persistence.save_template(safe_name, save_data, meta)
         self.persistence.delete_atlases({safe_name})
         self.persistence.delete_galleries({safe_name})
-        if self.gallery_engine.available:
-            try:
-                groups = self.template_builder._normalize_touch_groups(raw_frames)
-                gallery = GalleryBuilder(
-                    self.gallery_engine, self.features.frame_spec,
-                    features=self.features).build(safe_name, groups)
-                if gallery.entries:
-                    self.persistence.replace_gallery(
-                        safe_name, gallery, save_gallery)
-                    logger.info(
-                        "Saved shadow feature gallery with %d opaque records",
-                        len(gallery.entries))
-            except Exception as error:
-                logger.warning(
-                    "Shadow feature gallery unavailable; enrollment remains valid: %s",
-                    type(error).__name__)
-        else:
-            logger.info("SourceAFIS unavailable; skipping shadow feature gallery")
         logger.info("Saved %d templates for %s", template_count, name)
         self.rebuild_index()
         return True
@@ -452,22 +415,6 @@ class FingerprintMatcher:
                 continue
             fingers.append(rest)
         return fingers
-
-    def new_touch_identity_matcher(self, username, finger_name=None):
-        finger_name = self._normalize_verify_finger(finger_name)
-        prefix = f"{username}_"
-        galleries = {}
-        for filename, gallery in self.feature_galleries.items():
-            if not filename.startswith(prefix) or not filename.endswith(".npz"):
-                continue
-            identity = filename[len(prefix):-4]
-            if "_" in identity or (finger_name and identity != finger_name):
-                continue
-            galleries[f"{username}_{identity}"] = gallery
-        if not galleries or not self.gallery_engine.available:
-            return None
-        return StreamingGalleryMatcher(
-            self.gallery_engine, galleries, self.features.frame_spec)
 
     def delete_user_fingers(self, username):
         """Wipes all fingers for a user"""

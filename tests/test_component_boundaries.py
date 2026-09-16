@@ -29,6 +29,16 @@ class ScriptedBackend:
 
 
 class MatcherLibraryBoundaryTests(unittest.TestCase):
+    def test_live_imports_do_not_load_experimental_engines(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; import egis_driver.services; "
+             "assert all(name not in sys.modules for name in "
+             "('egis_matcher.sourceafis', 'egis_matcher.gallery', 'egis_matcher.atlas'))"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_package_import_does_not_load_linux_or_usb_modules(self):
         result = subprocess.run(
             [

@@ -7,18 +7,18 @@ from pathlib import Path
 class RuntimePaths:
     data_root: Path = Path("/var/lib/open-fprintd")
     install_root: Path = Path("/opt/egis-driver")
-    match_mode: str = "shadow"
+    match_mode: str = "window"
 
     def __post_init__(self):
-        if self.match_mode not in {"window", "shadow"}:
-            raise ValueError("EGIS_MATCH_MODE must be window or shadow")
+        if self.match_mode != "window":
+            raise ValueError("EGIS_MATCH_MODE must be window; shadow matching has moved to offline egis-lab tooling")
 
     @classmethod
     def from_environment(cls):
         return cls(
             data_root=Path(os.environ.get("EGIS_DATA_ROOT", "/var/lib/open-fprintd")),
             install_root=Path(os.environ.get("EGIS_INSTALL_ROOT", "/opt/egis-driver")),
-            match_mode=os.environ.get("EGIS_MATCH_MODE", "shadow"),
+            match_mode=os.environ.get("EGIS_MATCH_MODE", "window"),
         )
 
     @property

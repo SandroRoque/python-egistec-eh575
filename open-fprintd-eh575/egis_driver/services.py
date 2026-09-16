@@ -14,7 +14,6 @@ from egis_driver.streaming import (
     DirectMatcherWorker,
     FrameStatus,
     MatcherWorker,
-    TouchMatcherWorker,
 )
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker
 
@@ -89,22 +88,6 @@ class EgisService:
         self._capture = capture_coordinator or CaptureCoordinator(self._sensor.session())
         self._confirmation_policy = (
             confirmation_policy or PRODUCTION_CONFIRMATION_POLICY)
-        self._match_mode = runtime_paths.match_mode
-        self._touch_matcher_worker = None
-        if matcher is None and self._match_mode != "window":
-            try:
-                self._touch_matcher_worker = TouchMatcherWorker(
-                    self._persistence.root_dir,
-                    self._sensor.frame_spec,
-                    self._matcher.matcher_config,
-                )
-                self._touch_matcher_worker.start()
-            except Exception as error:
-                logger.warning("Touch matcher shadow unavailable: %s", error)
-                if self._touch_matcher_worker is not None:
-                    self._touch_matcher_worker.close()
-                self._touch_matcher_worker = None
-
         self._operation_lock = threading.RLock()
         self._operation_generation = 0
         self._active_operation = None
@@ -298,8 +281,6 @@ class EgisService:
         self._stop_scan("service-close")
         self._sensor.close()
         self._matcher_worker.close()
-        if self._touch_matcher_worker is not None:
-            self._touch_matcher_worker.close()
 
     def suspend(self):
         with self._resume_lock:
@@ -419,20 +400,6 @@ class EgisService:
 
     def _reload_matcher_workers(self):
         self._matcher_worker.reload()
-        if self._touch_matcher_worker is not None:
-            try:
-                if not self._touch_matcher_worker.reload():
-                    logger.warning(
-                        "Touch matcher shadow reload failed; shadow matching disabled")
-                    self._touch_matcher_worker.close()
-                    self._touch_matcher_worker = None
-            except Exception as error:
-                logger.warning(
-                    "Touch matcher shadow reload failed; shadow matching disabled: %s",
-                    type(error).__name__,
-                )
-                self._touch_matcher_worker.close()
-                self._touch_matcher_worker = None
 
     def diagnostics_snapshot(self):
         """Return aggregate reliability counters without biometric content."""
@@ -564,74 +531,6 @@ class EgisService:
             VERIFY_PRESENCE_THRESHOLD,
             VERIFY_PRESENCE_DELTA,
         )
-
-    def _begin_touch_matching(self, operation, username, finger_name):
-        if self._touch_matcher_worker is None:
-            self._match_outcomes["touch:unavailable"] += 1
-            return False
-        try:
-            available = self._touch_matcher_worker.begin(
-                operation.generation, username, finger_name)
-        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
-                TypeError) as error:
-            logger.warning("Touch matcher session unavailable: %s", error)
-            available = False
-        self._match_outcomes[
-            "touch:ready" if available else "touch:unavailable"] += 1
-        return available
-
-    def _touch_discontinuity(self):
-        try:
-            self._touch_matcher_worker.discontinuity()
-            return True
-        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
-                TypeError) as error:
-            logger.warning("Touch matcher discontinuity failed: %s", error)
-            self._match_outcomes["touch:worker_failure"] += 1
-            return False
-
-    def _observe_touch(self, message):
-        try:
-            return self._touch_matcher_worker.observe(
-                message.pixels, message.sequence)
-        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
-                TypeError) as error:
-            logger.warning("Touch matcher observation failed: %s", error)
-            self._match_outcomes["touch:worker_failure"] += 1
-            return None
-
-    def _record_touch_decision(self, decision, operation=None):
-        if operation is not None and operation.verify_latency is not None:
-            trace = operation.verify_latency
-            trace["shadow_frames"] += 1
-            trace["shadow_extraction_ms"] += float(
-                decision.metrics.get("extraction_ms", 0.0))
-            trace["shadow_comparison_ms"] += float(
-                decision.metrics.get("comparison_ms", 0.0))
-        logger.info(
-            "[SHADOW] component=touch_matching accepted=%s identity=%s "
-            "reason=%s score=%.3f margin=%.3f frames=%d extraction_failures=%d",
-            decision.accepted,
-            decision.identity or "none",
-            decision.reason,
-            decision.score,
-            decision.margin,
-            decision.metrics["best"]["frames_seen"],
-            decision.metrics["best"]["extraction_failures"],
-        )
-        self._match_outcomes[
-            "touch:accept" if decision.accepted
-            else f"touch:reject:{decision.reason}"] += 1
-
-    def _end_touch_matching(self):
-        if self._touch_matcher_worker is None:
-            return
-        try:
-            self._touch_matcher_worker.end()
-        except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError,
-                TypeError) as error:
-            logger.warning("Touch matcher cleanup failed: %s", error)
-            self._match_outcomes["touch:worker_failure"] += 1
 
     # ------------------------------------------------------------------
     #  Scan loop
@@ -890,9 +789,6 @@ class EgisService:
             "capture_ms": 0.0,
             "queue_ms": 0.0,
             "match_ms": 0.0,
-            "shadow_extraction_ms": 0.0,
-            "shadow_comparison_ms": 0.0,
-            "shadow_frames": 0,
             "attempts": 0,
             "accepted_attempt_ms": [],
             "max_consecutive_accepts": 0,
@@ -914,8 +810,6 @@ class EgisService:
             initial_img,
             initial_contrast,
         ).start()
-        touch_available = self._begin_touch_matching(
-            operation, username, finger_name)
         frames = []
         window_started = None
         contact_deadline = time.monotonic() + VERIFY_CONTACT_BUDGET_SECONDS
@@ -948,8 +842,6 @@ class EgisService:
                     frames = []
                     window_started = None
                     confirmation.reset()
-                    if touch_available:
-                        touch_available = self._touch_discontinuity()
                 if message.status is FrameStatus.CONTACT_END:
                     ended_before_deadline = True
                     break
@@ -965,8 +857,6 @@ class EgisService:
                     frames = []
                     window_started = None
                     confirmation.reset()
-                    if touch_available:
-                        touch_available = self._touch_discontinuity()
                     self._stream_capture_outcomes["io_error"] += 1
                     logger.info(
                         "[METRIC] component=verification_capture outcome=io_error "
@@ -983,13 +873,6 @@ class EgisService:
                         0.0, (message.captured_finished - previous_frame) * 1000.0))
                 operation.verify_latency["last_frame_finished"] = message.captured_finished
 
-                # Feed continuous evidence before the legacy fixed-window path.
-                # The worker keeps at most one frame in flight, so capture can
-                # never accumulate an unbounded matching backlog.
-                touch_decision = (
-                    self._observe_touch(message) if touch_available else None)
-                if touch_decision is not None:
-                    self._record_touch_decision(touch_decision, operation)
                 if operation.verify_latency["first_frame_finished"] is None:
                     operation.verify_latency["first_frame_finished"] = (
                         message.captured_finished)
@@ -1035,7 +918,6 @@ class EgisService:
                     return
         finally:
             pump.stop()
-            self._end_touch_matching()
 
         operation.verify_latency["deadline_expired"] = bool(
             self._is_operation_active(operation) and
@@ -1141,9 +1023,6 @@ class EgisService:
             "capture_ms": trace["capture_ms"],
             "queue_ms": trace["queue_ms"],
             "matching_ms": trace["match_ms"],
-            "shadow_extraction_ms": trace["shadow_extraction_ms"],
-            "shadow_comparison_ms": trace["shadow_comparison_ms"],
-            "shadow_frames": trace["shadow_frames"],
             "attempts": trace["attempts"],
             "accepted_attempt_ms": tuple(trace.get("accepted_attempt_ms", ())),
             "max_consecutive_accepts": trace.get("max_consecutive_accepts", 0),
@@ -1160,16 +1039,14 @@ class EgisService:
             "[LATENCY] outcome=%s request_to_touch_ms=%.0f "
             "touch_to_first_frame_ms=%s touch_to_decision_ms=%.0f "
             "capture_ms=%.0f queue_ms=%.0f matching_ms=%.0f "
-            "shadow_extraction_ms=%.0f shadow_comparison_ms=%.0f "
-            "shadow_frames=%d attempts=%d max_consecutive_accepts=%d "
+            "attempts=%d max_consecutive_accepts=%d "
             "accepted_attempt_ms=%s inter_frame_ms=%s deadline_expired=%s",
             summary["outcome"], summary["request_to_touch_ms"],
             (f'{summary["touch_to_first_frame_ms"]:.0f}'
              if summary["touch_to_first_frame_ms"] is not None else "none"),
             summary["touch_to_decision_ms"], summary["capture_ms"],
             summary["queue_ms"], summary["matching_ms"],
-            summary["shadow_extraction_ms"], summary["shadow_comparison_ms"],
-            summary["shadow_frames"], summary["attempts"],
+            summary["attempts"],
             summary["max_consecutive_accepts"], accepted_attempts, inter_frames,
             str(summary["deadline_expired"]).lower(),
         )

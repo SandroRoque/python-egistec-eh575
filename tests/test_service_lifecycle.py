@@ -68,37 +68,6 @@ class TemplateInvalidationTests(unittest.TestCase):
         matcher.delete_user_fingers.assert_called_once_with("test")
         worker.reload.assert_called_once_with()
 
-    def test_deletion_invalidates_authoritative_and_touch_workers(self):
-        matcher = mock.Mock()
-        worker = mock.Mock()
-        touch_worker = mock.Mock()
-        touch_worker.reload.return_value = True
-        service = EgisService(driver=FakeDriver(), matcher=matcher,
-                              matcher_worker=worker)
-        self.addCleanup(service.close)
-        service._touch_matcher_worker = touch_worker
-
-        service.delete_enrolled_fingers("test")
-
-        worker.reload.assert_called_once_with()
-        touch_worker.reload.assert_called_once_with()
-
-    def test_failed_touch_reload_disables_only_shadow_matching(self):
-        matcher = mock.Mock()
-        worker = mock.Mock()
-        touch_worker = mock.Mock()
-        touch_worker.reload.return_value = False
-        service = EgisService(driver=FakeDriver(), matcher=matcher,
-                              matcher_worker=worker)
-        self.addCleanup(service.close)
-        service._touch_matcher_worker = touch_worker
-
-        service.delete_enrolled_fingers("test")
-
-        worker.reload.assert_called_once_with()
-        touch_worker.close.assert_called_once_with()
-        self.assertIsNone(service._touch_matcher_worker)
-
 
 class EnrollmentMatcher(FakeMatcher):
     def __init__(self):
@@ -191,7 +160,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.addCleanup(service.close)
         return service
 
-    def test_latency_summary_separates_capture_matching_and_shadow_costs(self):
+    def test_latency_summary_separates_capture_and_matching_costs(self):
         service = self._service()
         operation = ScanOperation(1, ("verify", "test", None))
         operation.created_at = 1.0
@@ -201,9 +170,6 @@ class ServiceLifecycleTests(unittest.TestCase):
             "capture_ms": 90.0,
             "queue_ms": 12.0,
             "match_ms": 210.0,
-            "shadow_extraction_ms": 30.0,
-            "shadow_comparison_ms": 45.0,
-            "shadow_frames": 3,
             "attempts": 3,
             "accepted_attempt_ms": [100.0, 300.0, 480.0],
             "max_consecutive_accepts": 3,
@@ -216,7 +182,6 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertAlmostEqual(summary["touch_to_first_frame_ms"], 50.0)
         self.assertEqual(summary["touch_to_decision_ms"], 500.0)
         self.assertEqual(summary["matching_ms"], 210.0)
-        self.assertEqual(summary["shadow_comparison_ms"], 45.0)
         self.assertEqual(summary["accepted_attempt_ms"], (100.0, 300.0, 480.0))
 
     def test_unhandled_verify_scan_failure_emits_one_terminal_error(self):

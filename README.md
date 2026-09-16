@@ -76,7 +76,7 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 1. 10 touches, each captures continuously at ~29 FPS while finger is on sensor
 2. Quality-gated frame selection (contrast, sharpness, foreground, ridge clarity)
 3. SSIM-based near-duplicate removal
-4. Schema-v6 stores the hardened SIFT representation plus a derived touch atlas; production atlases omit raw capture frames
+4. Schema-v6 stores the hardened SIFT representation; production enrollment does not build experimental galleries
 
 ### Verification
 1. 3-frame ensemble capture per attempt
@@ -87,13 +87,14 @@ Calibration samples and generated thresholds are stored in `/var/lib/open-fprint
 
 The matcher logs a diagnostic score with distance weighting and ridge consistency. That score is for tuning/debugging; authentication uses calibrated metric thresholds.
 
-`EGIS_MATCH_MODE` selects `window` or `shadow` matching. The default
-is `shadow`: the window matcher remains authoritative while a bounded worker
-accumulates touch-atlas evidence and emits sanitized `[SHADOW]` metrics. Touch
-matching is not an authoritative runtime mode and cannot authenticate; it must
-pass replay and live holdout gates before any future promotion.
+`EGIS_MATCH_MODE` defaults to `window`, the only supported live mode.
+Remove old `shadow` overrides or change them to `window` before upgrading.
+Verification and enrollment never start SourceAFIS or a shadow worker.
+SourceAFIS remains available offline through `egis-lab evaluate-feature-gallery`,
+which builds galleries from recorded enrollment sequences before replaying probes.
+These development reports are not promotion evidence.
 
-Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment includes a root-only derived touch atlas while excluding raw recorded sequences. Older template schemas are ignored.
+Verification fails closed until validated calibrated thresholds exist. Matcher v5 builds the nearest-neighbor index for the claimed username before applying the ratio test, keeps candidate slots available for competing enrolled fingers, and measures identity margin between fingers rather than between templates of the same finger. Schema-v6 enrollment excludes raw recorded sequences. Older template schemas are ignored.
 
 ## Fingerprint-engine evaluation
 

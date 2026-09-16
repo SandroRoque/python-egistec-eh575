@@ -113,13 +113,15 @@ Production enrollment requires ten independent presentations. After each accepte
 stage, progress is reported to the client and capture remains blocked until the
 sensor observes four consecutive no-contact frames spanning at least 300 ms.
 Continuous contact can therefore contribute only one presentation, and every
-presentation remains a separate input to template and gallery construction.
+presentation remains a separate input to production template construction.
 
-The live gallery worker consumes the ordered stream one frame at a time and
-reports per-identity scores, margins, extraction failures, and timing as shadow
-telemetry. Queue loss, capture discontinuities, and worker restarts clear its
-trajectory. `EGIS_MATCH_MODE` deliberately exposes only `window` and `shadow`;
-an uncalibrated gallery cannot emit a D-Bus match.
+The live service has one matching worker, for the window/SIFT decision.
+`EGIS_MATCH_MODE` defaults to `window`; old `shadow` configurations are rejected
+with migration guidance. Live enrollment neither loads nor builds galleries.
+Offline `egis-lab evaluate-feature-gallery` builds SourceAFIS galleries from
+recorded enrollment presentations and evaluates recorded probes. Atlas replay
+remains lab-only because sequence experiments still consume it. The abandoned
+minutiae extractor and matcher have been removed.
 
 `TouchStitcher` is the engine-independent swipe-to-image boundary. It uses SIFT
 only to estimate relationships between ordered frames, excludes the physical
@@ -140,8 +142,8 @@ and numeric scores; it implements no minutiae extraction or identity scoring.
 Evaluation includes complete-touch leave-one-touch-out comparisons and
 progressive swipe prefixes. Candidate engines and their templates remain
 strictly outside production until both replay modes pass. Presentation galleries
-pin SourceAFIS scale 3 and remain optional; a missing worker disables only shadow
-evidence.
+pin SourceAFIS scale 3 and remain offline; a missing Java worker prevents the
+requested lab evaluation, without affecting the production service.
 
 ## Security Boundaries
 

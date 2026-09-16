@@ -34,7 +34,6 @@ from egis_driver.atlas_storage import load_atlas, save_atlas, write_private_json
 from egis_driver.sequence_evaluation import enroll_sequences, evaluate_sequence, sequence_events
 from egis_matcher.sequence import TouchTracker
 from egis_matcher.atlas import TouchIdentityMatcher
-from egis_matcher.fingerprint_matcher import FingerprintMatcher, FINGERPRINT_MATCHER_VERSION
 from egis_driver.sequence_evaluation import read_touch
 from egis_driver.streaming import FrameStatus
 from egis_driver.nbis_evaluation import evaluate_nbis
@@ -723,72 +722,6 @@ def cmd_match_sequence(args):
     print(output)
 
 
-def _valid_sequence_frames(directory):
-    directory = Path(directory)
-    if not (directory / "manifest.json").is_file() or not (directory / "frames.bin").is_file():
-        raise ValueError(
-            f"sequence directory is missing manifest.json or frames.bin: {directory}"
-        )
-    manifest, messages, spec = read_touch(directory)
-    frames = [message.pixels for message in messages
-              if message.status is FrameStatus.VALID]
-    # A sequence contains hundreds of near-identical sensor frames.  Keep a
-    # deterministic spread for the expensive skeleton/minutiae extraction so
-    # replay remains practical while retaining the full raw recording.
-    limit = 24
-    if len(frames) > limit:
-        indices = np.linspace(0, len(frames) - 1, limit, dtype=int)
-        frames = [frames[index] for index in indices]
-    return manifest, spec, frames
-
-
-def cmd_match_fingerprint_sequences(args):
-    matcher = FingerprintMatcher()
-    enrollment_frames = []
-    enrollment_sources = []
-    spec = None
-    for directory in args.enrollment:
-        manifest, current_spec, frames = _valid_sequence_frames(directory)
-        if spec is not None and current_spec != spec:
-            raise ValueError("enrollment sequences have different frame geometry")
-        spec = current_spec
-        enrollment_frames.extend(frames)
-        enrollment_sources.append({
-            "path": str(Path(directory).resolve()),
-            "finger": manifest.get("metadata", {}).get("finger"),
-            "frames": len(frames),
-        })
-    probe_manifest, probe_spec, probe_frames = _valid_sequence_frames(args.probe)
-    if spec != probe_spec:
-        raise ValueError("probe geometry differs from enrollment")
-    template = matcher.build_template(enrollment_frames)
-    result = matcher.match(probe_frames, template)
-    report = {
-        "schema_version": 1,
-        "experimental": True,
-        "promotable": False,
-        "matcher_version": FINGERPRINT_MATCHER_VERSION,
-        "candidate_match": result.matched,
-        "score": result.score,
-        "reason": result.reason,
-        "metrics": result.metrics,
-        "enrollment_sources": enrollment_sources,
-        "probe": {
-            "path": str(Path(args.probe).resolve()),
-            "finger": probe_manifest.get("metadata", {}).get("finger"),
-            "frames": len(probe_frames),
-        },
-    }
-    output = _private_lab_path(args.output or LAB_ROOT / "results" /
-                               f"fingerprint-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json")
-    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    write_private_json(output, report)
-    print("Experimental ridge/minutiae evidence; not a calibrated authentication result.")
-    print(json.dumps({key: report[key] for key in ("candidate_match", "score", "reason", "metrics")},
-                     indent=2, sort_keys=True))
-    print(output)
-
-
 def cmd_match_touch_identity(args):
     atlas_root = _private_lab_path(args.atlas_root)
     atlases = {}
@@ -1308,16 +1241,6 @@ def build_parser():
     match_sequence.add_argument("--expected", choices=("genuine", "impostor"), required=True)
     match_sequence.add_argument("--output")
     match_sequence.set_defaults(func=cmd_match_sequence)
-
-    fingerprint_match = sub.add_parser(
-        "match-fingerprint-sequences",
-        help="Replay the experimental ridge/minutiae backend against private sequences",
-    )
-    fingerprint_match.add_argument("enrollment", nargs="+",
-                                   help="one or more private enrollment sequence directories")
-    fingerprint_match.add_argument("--probe", required=True)
-    fingerprint_match.add_argument("--output")
-    fingerprint_match.set_defaults(func=cmd_match_fingerprint_sequences)
 
     touch_identity = sub.add_parser(
         "match-touch-identity",
