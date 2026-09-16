@@ -48,6 +48,8 @@ class ScanOperation:
         self.thread = None
         self.terminal = False
         self.sensor = None
+        self.created_at = time.monotonic()
+        self.verify_latency = None
 
 
 class EgisService:
@@ -562,7 +564,14 @@ class EgisService:
             self._match_outcomes["touch:worker_failure"] += 1
             return None
 
-    def _record_touch_decision(self, decision):
+    def _record_touch_decision(self, decision, operation=None):
+        if operation is not None and operation.verify_latency is not None:
+            trace = operation.verify_latency
+            trace["shadow_frames"] += 1
+            trace["shadow_extraction_ms"] += float(
+                decision.metrics.get("extraction_ms", 0.0))
+            trace["shadow_comparison_ms"] += float(
+                decision.metrics.get("comparison_ms", 0.0))
         logger.info(
             "[SHADOW] component=touch_matching accepted=%s identity=%s "
             "reason=%s score=%.3f margin=%.3f frames=%d extraction_failures=%d",
@@ -838,6 +847,18 @@ class EgisService:
     def _handle_verify_continuous(self, operation, username, finger_name,
                                    initial_img=None, initial_contrast=0.0):
         logger.info("Continuous verify - trying while finger is on sensor...")
+        touch_started = time.monotonic()
+        operation.verify_latency = {
+            "touch_started": touch_started,
+            "first_frame_finished": None,
+            "capture_ms": 0.0,
+            "queue_ms": 0.0,
+            "match_ms": 0.0,
+            "shadow_extraction_ms": 0.0,
+            "shadow_comparison_ms": 0.0,
+            "shadow_frames": 0,
+            "attempts": 0,
+        }
         attempt = 0
         confirmation = ConfirmationTracker(self._confirmation_policy)
         self._capture_epoch += 1
@@ -917,7 +938,10 @@ class EgisService:
                 touch_decision = (
                     self._observe_touch(message) if touch_available else None)
                 if touch_decision is not None:
-                    self._record_touch_decision(touch_decision)
+                    self._record_touch_decision(touch_decision, operation)
+                if operation.verify_latency["first_frame_finished"] is None:
+                    operation.verify_latency["first_frame_finished"] = (
+                        message.captured_finished)
                 if not frames:
                     window_started = message.captured_started
                 frames.append(message.pixels)
@@ -937,6 +961,10 @@ class EgisService:
                 match_ms = (time.monotonic() - match_start) * 1000.0
                 capture_ms = (
                     message.captured_finished - window_started) * 1000.0
+                operation.verify_latency["capture_ms"] += capture_ms
+                operation.verify_latency["queue_ms"] += queue_age_ms
+                operation.verify_latency["match_ms"] += match_ms
+                operation.verify_latency["attempts"] = attempt
                 logger.info(
                     "[METRIC] component=verification_capture outcome=captured "
                     "frames=%d elapsed_ms=%.0f dropped_before=%d queue_age_ms=%.0f",
@@ -960,6 +988,7 @@ class EgisService:
 
         logger.info("No match after %d attempts", attempt)
         if self._is_operation_active(operation):
+            self._log_verify_latency(operation, "retry")
             self._emit_verify("verify-retry-scan", False, operation)
             logger.info("Ready for another verification touch.")
         else:
@@ -1026,9 +1055,49 @@ class EgisService:
         if not confirmed:
             return False
         logger.info("AUTHENTICATED!")
+        self._log_verify_latency(operation, "match")
         self._emit_verify("verify-match", True, operation)
         self._finish_operation(operation)
         return True
+
+    def _log_verify_latency(self, operation, outcome):
+        trace = operation.verify_latency
+        if trace is None:
+            return None
+        now = time.monotonic()
+        first_frame = trace["first_frame_finished"]
+        summary = {
+            "outcome": outcome,
+            "request_to_touch_ms": max(
+                0.0, (trace["touch_started"] - operation.created_at) * 1000.0),
+            "touch_to_first_frame_ms": (
+                max(0.0, (first_frame - trace["touch_started"]) * 1000.0)
+                if first_frame is not None else None),
+            "touch_to_decision_ms": max(
+                0.0, (now - trace["touch_started"]) * 1000.0),
+            "capture_ms": trace["capture_ms"],
+            "queue_ms": trace["queue_ms"],
+            "matching_ms": trace["match_ms"],
+            "shadow_extraction_ms": trace["shadow_extraction_ms"],
+            "shadow_comparison_ms": trace["shadow_comparison_ms"],
+            "shadow_frames": trace["shadow_frames"],
+            "attempts": trace["attempts"],
+        }
+        logger.info(
+            "[LATENCY] outcome=%s request_to_touch_ms=%.0f "
+            "touch_to_first_frame_ms=%s touch_to_decision_ms=%.0f "
+            "capture_ms=%.0f queue_ms=%.0f matching_ms=%.0f "
+            "shadow_extraction_ms=%.0f shadow_comparison_ms=%.0f "
+            "shadow_frames=%d attempts=%d",
+            summary["outcome"], summary["request_to_touch_ms"],
+            (f'{summary["touch_to_first_frame_ms"]:.0f}'
+             if summary["touch_to_first_frame_ms"] is not None else "none"),
+            summary["touch_to_decision_ms"], summary["capture_ms"],
+            summary["queue_ms"], summary["matching_ms"],
+            summary["shadow_extraction_ms"], summary["shadow_comparison_ms"],
+            summary["shadow_frames"], summary["attempts"],
+        )
+        return summary
 
     # ------------------------------------------------------------------
     #  Callback emission (private)

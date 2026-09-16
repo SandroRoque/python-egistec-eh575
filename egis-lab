@@ -35,12 +35,29 @@ from egis_driver.streaming import FrameStatus
 from egis_driver.nbis_evaluation import evaluate_nbis
 from egis_driver.sourceafis_evaluation import evaluate_sourceafis
 from egis_driver.gallery_evaluation import evaluate_feature_gallery
+from egis_driver.latency import summarize_latency_log
 from egis_matcher.sourceafis import SourceAfisEngine
 from egis_driver.windows_capture import write_capture_analysis, compare_raw_captures
 from egis_matcher.calibration import CalibrationProfile, FramePreprocessor
 
 
 LAB_ROOT = ROOT / ".egis-lab"
+
+
+def cmd_latency_report(args):
+    text = (sys.stdin.read() if args.input == "-" else
+            Path(args.input).read_text(encoding="utf-8"))
+    report = summarize_latency_log(text)
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        output = _private_lab_path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
+        output.chmod(0o600)
+        print(output)
+    else:
+        print(rendered, end="")
+    return 0 if report["sessions"] else 2
 
 
 def _manifest_for(root, role):
@@ -1257,6 +1274,15 @@ def build_parser():
     gallery_evaluate.add_argument("--scale", type=float, default=3.0)
     gallery_evaluate.add_argument("--output", required=True)
     gallery_evaluate.set_defaults(func=cmd_evaluate_feature_gallery)
+
+    latency = sub.add_parser(
+        "latency-report",
+        help="Aggregate privacy-safe live verification latency records",
+    )
+    latency.add_argument(
+        "--input", default="-", help="journal text file, or - for standard input")
+    latency.add_argument("--output", help="optional report path below .egis-lab")
+    latency.set_defaults(func=cmd_latency_report)
 
     windows_capture = sub.add_parser(
         "analyze-windows-capture",

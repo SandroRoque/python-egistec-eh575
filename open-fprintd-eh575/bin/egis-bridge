@@ -5,6 +5,7 @@ import dbus.service
 import dbus.mainloop.glib
 import logging
 import signal
+import time
 from gi.repository import GLib
 
 from egis_driver.services import EgisService
@@ -67,8 +68,17 @@ class EgisBridge(dbus.service.Object):
         GLib.idle_add(self.EnrollPrompt, prompt)
 
     def _on_verify_status(self, result, done):
-        logger.info("Emitting VerifyStatus result=%s done=%s", result, done)
-        GLib.idle_add(self.VerifyStatus, result, done)
+        queued = time.monotonic()
+
+        def emit():
+            logger.info(
+                "[METRIC] component=dbus_verify_status result=%s done=%s "
+                "queue_ms=%.1f",
+                result, done, (time.monotonic() - queued) * 1000.0)
+            self.VerifyStatus(result, done)
+            return False
+
+        GLib.idle_add(emit)
 
     def _on_verify_finger_selected(self, finger):
         logger.info("Emitting VerifyFingerSelected finger=%s", finger)

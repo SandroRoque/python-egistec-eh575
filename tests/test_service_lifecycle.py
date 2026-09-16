@@ -160,6 +160,29 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.addCleanup(service.close)
         return service
 
+    def test_latency_summary_separates_capture_matching_and_shadow_costs(self):
+        service = self._service()
+        operation = ScanOperation(1, ("verify", "test", None))
+        operation.created_at = 1.0
+        operation.verify_latency = {
+            "touch_started": 2.0,
+            "first_frame_finished": 2.05,
+            "capture_ms": 90.0,
+            "queue_ms": 12.0,
+            "match_ms": 210.0,
+            "shadow_extraction_ms": 30.0,
+            "shadow_comparison_ms": 45.0,
+            "shadow_frames": 3,
+            "attempts": 3,
+        }
+        with mock.patch("egis_driver.services.time.monotonic", return_value=2.5):
+            summary = service._log_verify_latency(operation, "match")
+        self.assertEqual(summary["request_to_touch_ms"], 1000.0)
+        self.assertAlmostEqual(summary["touch_to_first_frame_ms"], 50.0)
+        self.assertEqual(summary["touch_to_decision_ms"], 500.0)
+        self.assertEqual(summary["matching_ms"], 210.0)
+        self.assertEqual(summary["shadow_comparison_ms"], 45.0)
+
     def _wait_until(self, predicate, timeout=1.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

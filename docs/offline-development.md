@@ -298,6 +298,24 @@ reads and matching, but physical USB release and desktop behavior still require
 this live check. A log reporting pending USB release means the owner is still
 waiting for an already-dispatched backend call.
 
+## Live latency reports
+
+The service emits one privacy-safe `[LATENCY]` record for every completed live
+touch. It separates request-to-touch time, first-frame delay, capture, queueing,
+authoritative matching, shadow extraction/comparison, confirmation attempts, and
+touch-to-decision time. D-Bus dispatch queueing is recorded separately.
+
+After several genuine and impostor lock-screen attempts, aggregate the journal:
+
+```bash
+sudo journalctl -u egis-bridge --since '-30 min' -o cat | \
+  ./egis-lab latency-report --input - \
+  --output .egis-lab/results/live-latency.json
+```
+
+The report contains only counts and latency distributions; it excludes images,
+templates, identities, and matcher scores.
+
 When progress depends on a new enrollment format, stage it fail-closed with one
 privileged command:
 
