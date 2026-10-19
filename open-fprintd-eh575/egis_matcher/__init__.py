@@ -23,6 +23,7 @@ _EXPORTS = {
     "CalibrationProfile": ("egis_matcher.calibration", "CalibrationProfile"),
     "FramePreprocessor": ("egis_matcher.calibration", "FramePreprocessor"),
     "UnsupportedCorrection": ("egis_matcher.calibration", "UnsupportedCorrection"),
+    "windows_difference_lut": ("egis_matcher.calibration", "windows_difference_lut"),
 }
 
 __all__ = (
@@ -48,6 +49,7 @@ __all__ = (
     "CalibrationProfile",
     "FramePreprocessor",
     "UnsupportedCorrection",
+    "windows_difference_lut",
 )
 
 

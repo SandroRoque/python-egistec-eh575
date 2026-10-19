@@ -4,8 +4,71 @@ import numpy as np
 
 from egis_matcher.calibration import (
     CalibrationProfile, FramePreprocessor, UnsupportedCorrection,
+    WINDOWS_DIFFERENCE_CONVERSION_PROVENANCE, windows_difference_lut,
 )
 from egis_matcher.frame import FrameSpec
+
+
+def _int32(value):
+    return (value + 2 ** 31) % 2 ** 32 - 2 ** 31
+
+
+def _slot_0x120(edx, gain, offset, high, low):
+    """Instruction-level transcription of EgisTouchFP0575 0x18001c870."""
+    edx = _int32(edx - offset)                      # sub edx,[rcx+0x1c]
+    if edx < 0:                                     # jns
+        return 0xff
+    eax = _int32(gain * edx + 8)                    # imul eax,edx; add eax,8
+    eax = _int32(eax + ((eax >> 31) & 0xf)) >> 4    # cdq; and edx,0xf; add; sar 4
+    eax = _int32(eax * 0xff)
+    ecx = _int32(high - low)
+    quotient = abs(eax) // abs(ecx)                 # idiv truncates toward zero
+    eax = _int32((quotient if (eax < 0) == (ecx < 0) else -quotient) - low)
+    ecx = 0xff if eax > 0xff else eax               # cmovg
+    ecx = 0 if eax < 0 else ecx                     # cmovs
+    return (0xff - ecx) & 0xff
+
+
+class WindowsDifferenceConversionTests(unittest.TestCase):
+    def test_default_lut_matches_instruction_transcription(self):
+        lut = windows_difference_lut()
+        self.assertEqual(len(lut), 511)
+        self.assertEqual(
+            list(lut), [_slot_0x120(d, 48, 0, 128, 0) for d in range(-255, 256)])
+
+    def test_default_lut_shape(self):
+        lut = windows_difference_lut()
+        at = lambda difference: lut[difference + 255]
+        self.assertTrue(all(at(d) == 255 for d in range(-255, 1)))
+        self.assertEqual([at(d) for d in (1, 2, 21, 42)], [250, 244, 130, 4])
+        self.assertTrue(all(at(d) == 0 for d in range(43, 256)))
+
+    def test_nondefault_fields_match_instruction_transcription(self):
+        for fields in ({"gain": 16, "offset": 5, "high": 200, "low": 20},
+                       {"gain": 100, "offset": -10, "high": 64, "low": -32},
+                       {"gain": 7, "offset": 0, "high": 0, "low": 255}):
+            with self.subTest(**fields):
+                self.assertEqual(
+                    list(windows_difference_lut(**fields)),
+                    [_slot_0x120(d, fields["gain"], fields["offset"],
+                                 fields["high"], fields["low"]) for d in range(-255, 256)])
+
+    def test_empty_range_is_rejected(self):
+        with self.assertRaises(ValueError):
+            windows_difference_lut(high=50, low=50)
+
+    def test_profile_with_recovered_lut_corrects_frames(self):
+        profile = CalibrationProfile(
+            frame_spec=FrameSpec(3, 2),
+            background=bytes([20, 20, 20, 100, 100, 100]),
+            bad_pixels=bytes(6),
+            difference_lut=windows_difference_lut(),
+            provenance=(WINDOWS_DIFFERENCE_CONVERSION_PROVENANCE,),
+        )
+        self.assertTrue(profile.correction_supported)
+        corrected = FramePreprocessor(profile).correct(bytes([10, 20, 30, 80, 100, 120]))
+        np.testing.assert_array_equal(corrected, [[196, 255, 255], [136, 255, 255]])
+        self.assertEqual(CalibrationProfile.from_dict(profile.to_dict()), profile)
 
 
 class CalibrationTests(unittest.TestCase):

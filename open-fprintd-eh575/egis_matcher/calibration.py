@@ -10,6 +10,33 @@ import numpy as np
 from egis_matcher.frame import FrameSpec
 
 
+# CET300 slot 0x120 (EgisTouchFP0575.dll 3.7.1.1, 0x18001c870) and the field
+# defaults written by its base constructor 0x18001ba70; see windows-pipeline.md.
+WINDOWS_DIFFERENCE_CONVERSION_PROVENANCE = "EgisTouchFP0575.dll:3.7.1.1:0x18001c870"
+
+
+def _c_div(numerator, denominator):
+    quotient = abs(numerator) // abs(denominator)
+    return quotient if (numerator < 0) == (denominator < 0) else -quotient
+
+
+def windows_difference_conversion(difference, gain=48, offset=0, high=128, low=0):
+    """Map one background-minus-raw difference exactly as the Windows driver does."""
+    if high == low:
+        raise ValueError("conversion range must be non-empty")
+    shifted = difference - offset
+    if shifted < 0:
+        return 255
+    scaled = _c_div(gain * shifted + 8, 16)
+    value = _c_div(scaled * 255, high - low) - low
+    return 255 - min(255, max(0, value))
+
+
+def windows_difference_lut(**fields):
+    """Return the 511-entry LUT indexed by ``difference + 255``."""
+    return bytes(windows_difference_conversion(index - 255, **fields) for index in range(511))
+
+
 @dataclass(frozen=True)
 class CalibrationProfile:
     """Versioned sensor evidence; opaque operations remain explicitly absent."""

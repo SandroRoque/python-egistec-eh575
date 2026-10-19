@@ -1,15 +1,20 @@
 # Windows EH575 Pipeline Evidence
 
-This document records sanitized conclusions from the private Ghidra exports.
-Addresses identify the decompiled `EgisTouchFP0575` and
-`EgisTouchFPEngine0575` images retained under `.egis-lab/windows-driver`; the
-exports themselves, driver binaries, captures, and biometric payloads are not
-part of the repository.
+This document records sanitized conclusions from the private Ghidra exports
+and the driver package retained under `.egis-lab/windows-driver`; the exports
+themselves, driver binaries, captures, and biometric payloads are not part of
+the repository.
+
+The analyzed package is `egistouchfp0575.inf` version 3.7.1.1 (2020-06-15).
+`EgisTouchFP0575.dll` (the UMDF driver, SHA-256 `25704878...7b2631`) loads at
+image base 0x180000000; virtual addresses below are in that image. "Line"
+references point into the private `ghidra_dumps/EgisTouchFP0575.c` export,
+whose function addresses match this build.
 
 ## Confirmed Sensor Calibration Layout
 
 The EH575 image geometry is 0x67 by 0x34 pixels (103 by 52), or 0x14ec (5,356)
-bytes. Calibration serialization near FP offsets 0x8308 and 0x8443 names four
+bytes. Calibration serialization near export lines 8308 and 8443 names four
 one-byte sensor settings: `sensor_gain`, `sensor_vref_sel`, `sensor_dc_p`, and
 `sensor_dc_c`.
 
@@ -29,14 +34,50 @@ routine subsequently expands some adjacent marks and rejects an excessive map.
 The exact adjacency traversal and the production replacement consumer remain
 unresolved, so neither is implemented yet.
 
-The capture path near FP offset 0x11484 computes `background_byte - raw_byte`
-for every pixel when `FetchImageMode != 2`. It passes each signed difference
-through the sensor object's unresolved virtual method at vtable offset 0x120
-before writing the image submitted to the next stage. Consequently, subtraction
-direction is confirmed, but clipping, offset, and nonlinear conversion are not.
-The implementation exposes the signed difference only as diagnostics and fails
-closed if asked for corrected pixels without a recovered 511-entry conversion
-table.
+`CET300::GetImage` (0x1800107d0, export line 11484) computes
+`background_byte - raw_byte` for every pixel when `FetchImageMode != 2` and
+passes each signed difference through virtual slot 0x120 before writing the
+image submitted to the next stage.
+
+## Recovered Difference Conversion
+
+The CET300 constructor (0x18000e894) installs vtable 0x18003e570; slot 0xb8
+holds `GetImage`, confirming the base, and slot 0x120 holds 0x18001c870. That
+target is a leaf function with no direct callers, so Ghidra does not define it;
+the result below comes from its raw x86-64 disassembly. It reads four 32-bit
+object fields:
+
+| Field | Role | Default |
+|-------|------|---------|
+| `+0x18` | gain, in 1/16 units | 48 |
+| `+0x1c` | difference offset | 0 |
+| `+0x20` | range high | 128 |
+| `+0x24` | range low | 0 |
+
+For a signed difference `d`, with C (truncate-toward-zero) integer division:
+
+```text
+d' = d - offset
+if d' < 0: return 255
+t  = (gain * d' + 8) / 16
+v  = t * 255 / (high - low) - low
+return 255 - clamp(v, 0, 255)
+```
+
+The defaults are written as two 8-byte stores (`0x30`, `0x80`) by the base
+constructor 0x18001ba70, which CET300's constructor calls first. No other
+write to these fields was found in the export, and no registry or calibration
+string names them, so the defaults are the observed production values. This
+is static evidence only; a runtime override was not excluded by observation.
+
+With the defaults the conversion is `255 - min(255, (3 * d) * 255 / 128)` for
+`d >= 0` and 255 otherwise: non-positive differences are white, values fall by
+about six per step, and differences of 43 or more are black. The 511 possible
+inputs are this function's domain; there is no stored table.
+`windows_difference_lut()` in `calibration.py` generates the `difference_lut`
+indexed by `d + 255`, and its tests check it against an instruction-level
+transcription of 0x18001c870. That LUT reproduces this function exactly; whether Linux replay then matches
+Windows images still depends on the background frame and bad-pixel handling.
 
 Calibration metadata includes `CALIBRATE_VERSION(Sensor)`,
 `CALIBRATE_TYPE(Sensor)`, and `CALIBRATE_DATE(Sensor)`. Calibration and image
@@ -51,7 +92,7 @@ The observed Windows-side lifecycle is:
 2. select detect or sensor calibration mode;
 3. configure sensor registers and image mode;
 4. fetch one 103×52 raw image;
-5. optionally subtract `vdm_bk` through the unresolved conversion;
+5. optionally subtract `vdm_bk` through the recovered slot-0x120 conversion;
 6. submit the resulting image to the Windows biometric engine;
 7. restore detection/remote-wakeup behavior.
 
