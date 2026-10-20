@@ -8,7 +8,7 @@ from egis_matcher.core import MatcherCore
 from egis_matcher.decision import MatchScore
 from egis_matcher.matcher_config import MatcherConfig
 from egis_matcher.policy import validate_thresholds
-from egis_driver.persistence import Persistence
+from egis_driver.persistence import Persistence, background_mismatch
 from egis_matcher.template_builder import TemplateBuilder
 
 logger = logging.getLogger("MATCHER")
@@ -62,6 +62,11 @@ class FingerprintMatcher:
                 return False
             if data.get("validated") is not True:
                 logger.warning("Calibration thresholds are not validated; verification will fail closed.")
+                return False
+            if background_mismatch(data, self.persistence.sensor_background_sha256()):
+                logger.warning(
+                    "Calibration thresholds were fit under a different sensor background; "
+                    "verification will fail closed until they are rebuilt.")
                 return False
             thresholds = self._coerce_thresholds(data.get("thresholds", {}))
             self._set_default_thresholds(thresholds)
@@ -142,6 +147,7 @@ class FingerprintMatcher:
         self._scoped_indexes = {}
 
         current_idx_offset = 0
+        background = self.persistence.sensor_background_sha256()
 
         for filename in self.persistence.list_template_files():
             if filename.endswith(".npy"):
@@ -160,6 +166,13 @@ class FingerprintMatcher:
             if meta.get("schema_version") != TEMPLATE_SCHEMA_VERSION:
                 self.legacy_templates.append(filename)
                 logger.warning("Ignoring incompatible template %s; re-enrollment required.", filename)
+                continue
+
+            if background_mismatch(meta, background):
+                self.legacy_templates.append(filename)
+                logger.warning(
+                    "Ignoring template %s enrolled under a different sensor background; "
+                    "re-enrollment required.", filename)
                 continue
 
             try:

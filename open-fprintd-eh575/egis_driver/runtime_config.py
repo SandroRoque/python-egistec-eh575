@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+SENSOR_BACKGROUND_FILENAME = "egis-sensor-background.bin"
+
 
 @dataclass(frozen=True)
 class RuntimePaths:
@@ -32,7 +34,7 @@ class RuntimePaths:
     @property
     def sensor_background_path(self):
         """Per-device vdm_bk table; the driver uploads it only if present."""
-        return self.data_root / "egis-sensor-background.bin"
+        return self.data_root / SENSOR_BACKGROUND_FILENAME
 
     @property
     def gallery_dir(self):

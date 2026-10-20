@@ -62,7 +62,7 @@ class EgisDriver:
                 raise ValueError("sensor background must contain one byte per pixel")
         # Optional vdm_bk upload (EGIS opcode 0x73). The Windows driver sends it
         # between the init and final commands; without it the sensor does not
-        # subtract its background. Experimental: thresholds assume no upload.
+        # subtract its background.
         self.background = background
         self._usb_core = usb_core or usb.core
         self._usb_util = usb_util or usb.util

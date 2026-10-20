@@ -13,7 +13,7 @@ from egis_driver.fingerprint_matcher import (
     MATCHER_VERSION,
     FingerprintMatcher,
 )
-from egis_driver.persistence import Persistence
+from egis_driver.persistence import Persistence, background_mismatch
 from egis_driver.runtime_config import RuntimePaths
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker, passes_thresholds
 
@@ -337,6 +337,13 @@ def analyze(args):
         min_genuine_samples=args.min_genuine_samples,
         min_impostor_samples=args.min_impostor_samples,
     )
+    background = persistence.sensor_background_sha256()
+    stale = sum(1 for sample in samples if background_mismatch(sample, background))
+    if stale:
+        warnings.append(
+            f"{stale} sample(s) were collected under a different sensor background; "
+            "move them aside and collect new ones"
+        )
     report = {
         "matcher_version": MATCHER_VERSION,
         "generated_at": int(time.time()),

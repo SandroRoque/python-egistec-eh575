@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from egis_driver.device_profile import EH575_PROFILE
 from egis_driver.fingerprint_matcher import MATCHER_VERSION, TEMPLATE_SCHEMA_VERSION
+from egis_driver.persistence import BACKGROUND_KEY, background_mismatch
 from egis_driver.runtime_config import RuntimePaths
 from egis_driver.version import __version__
 
@@ -219,10 +221,49 @@ def _state_entry(path):
     }
 
 
+def _sensor_background(path):
+    """Return (status, digest) for the installed sensor background."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unavailable", None
+    if len(data) != EH575_PROFILE.frame.byte_count:
+        return "invalid", None
+    return "installed", hashlib.sha256(data).hexdigest()
+
+
+def _background_consistency(records, background_status, digest):
+    """Compare the background each record was made under with the current one."""
+    if background_status in ("unavailable", "invalid") or not records:
+        return "unavailable"
+    if any(background_mismatch(record, digest) for record in records):
+        return "mismatch"
+    if any(BACKGROUND_KEY not in record for record in records):
+        return "unrecorded"
+    return "consistent"
+
+
+def _template_records(enrollment_dir):
+    records = []
+    try:
+        names = sorted(enrollment_dir.glob("*.json"))
+    except OSError:
+        return records
+    for path in names:
+        try:
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return records
+
+
 def state_report(runtime_paths=None):
     paths = runtime_paths or RuntimePaths.from_environment()
     calibration = "unavailable"
     threshold_file = paths.calibration_dir / "thresholds.json"
+    records = []
     try:
         thresholds = json.loads(threshold_file.read_text(encoding="utf-8"))
         calibration = (
@@ -231,12 +272,17 @@ def state_report(runtime_paths=None):
             thresholds.get("matcher_version") == MATCHER_VERSION
             else "invalid"
         )
+        records.append(thresholds)
     except (OSError, json.JSONDecodeError):
         pass
+    records.extend(_template_records(paths.enrollment_dir))
+    background, digest = _sensor_background(paths.sensor_background_path)
     return {
         "enrollment": _state_entry(paths.enrollment_dir),
         "calibration": _state_entry(paths.calibration_dir),
         "thresholds": calibration,
+        "sensor_background": background,
+        "background_consistency": _background_consistency(records, background, digest),
     }
 
 

@@ -74,6 +74,12 @@ def main():
             "not ready"
         )
         print(f"Services: {service_status}")
+        state = report["state"]
+        print(f"Sensor background: {state['sensor_background']}")
+        print(f"Background consistency: {state['background_consistency']}")
+        if state["background_consistency"] == "mismatch":
+            print("Warning: enrollment or thresholds were made under a different "
+                  "sensor background; re-enroll and rebuild thresholds")
         for warning in report["hardware"]["warnings"]:
             print(f"Warning: {warning}")
     return 0 if report["compatible"] else 1

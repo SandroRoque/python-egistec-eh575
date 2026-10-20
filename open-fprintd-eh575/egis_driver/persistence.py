@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -6,7 +7,21 @@ from pathlib import Path
 
 import numpy as np
 
+from egis_driver.runtime_config import SENSOR_BACKGROUND_FILENAME
+
 logger = logging.getLogger("PERSISTENCE")
+
+# Templates, thresholds and samples record the sensor background they were made
+# under; a different background changes the frame domain they describe.
+BACKGROUND_KEY = "sensor_background_sha256"
+
+
+def background_mismatch(record, current):
+    """True when a record names a background other than the current one.
+
+    Records written before the key existed carry no claim and never mismatch.
+    """
+    return BACKGROUND_KEY in record and record[BACKGROUND_KEY] != current
 
 
 class Persistence:
@@ -24,6 +39,7 @@ class Persistence:
         self.sample_dir = os.path.join(self.calibration_dir, "samples")
         self._threshold_file = os.path.join(self.calibration_dir, "thresholds.json")
         self._report_file = os.path.join(self.calibration_dir, "report.json")
+        self.sensor_background_file = os.path.join(root_dir, SENSOR_BACKGROUND_FILENAME)
 
     # ------------------------------------------------------------------
     #  Lifecycle
@@ -35,6 +51,17 @@ class Persistence:
         os.makedirs(self.gallery_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.calibration_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.sample_dir, mode=0o700, exist_ok=True)
+
+    def sensor_background_sha256(self):
+        """Digest of the installed sensor background, or None without one."""
+        try:
+            with open(self.sensor_background_file, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except FileNotFoundError:
+            return None
+
+    def _stamp_background(self, data):
+        return {**data, BACKGROUND_KEY: self.sensor_background_sha256()}
 
     # ------------------------------------------------------------------
     #  Templates  (enroll_dir)
@@ -69,7 +96,7 @@ class Persistence:
         os.chmod(npz_path, 0o600)
 
         with open(json_path, "w") as f:
-            json.dump(meta, f)
+            json.dump(self._stamp_background(meta), f)
         os.chmod(json_path, 0o600)
 
     def delete_template_files(self, filenames):
@@ -176,7 +203,7 @@ class Persistence:
         os.makedirs(self.calibration_dir, mode=0o700, exist_ok=True)
         tmp = self._threshold_file + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
+            json.dump(self._stamp_background(data), f, indent=2, sort_keys=True)
         os.chmod(tmp, 0o600)
         os.replace(tmp, self._threshold_file)
 
@@ -200,7 +227,7 @@ class Persistence:
         npz_path = os.path.join(self.sample_dir, base_name + ".npz")
 
         with open(json_path, "w") as f:
-            json.dump(meta, f)
+            json.dump(self._stamp_background(meta), f)
         os.chmod(json_path, 0o600)
 
         np.savez(npz_path, **npz_data)

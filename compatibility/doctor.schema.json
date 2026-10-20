@@ -55,7 +55,11 @@
       "properties": {
         "enrollment": {"$ref": "#/$defs/state_entry"},
         "calibration": {"$ref": "#/$defs/state_entry"},
-        "thresholds": {"enum": ["validated", "invalid", "unavailable"]}
+        "thresholds": {"enum": ["validated", "invalid", "unavailable"]},
+        "sensor_background": {"enum": ["installed", "absent", "invalid", "unavailable"]},
+        "background_consistency": {
+          "enum": ["consistent", "mismatch", "unrecorded", "unavailable"]
+        }
       }
     },
     "compatible": {"type": "boolean"}

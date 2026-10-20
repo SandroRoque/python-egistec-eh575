@@ -1,8 +1,7 @@
-# Project Status — 2026-09-16
+# Project Status — 2026-10-20
 
-This is the pause point for a multi-week break. The working revision is
-`38de042` on `main`. [CI run 35149146998](https://github.com/SandroRoque/python-egistec-eh575/actions/runs/35149146998)
-passed every job, and `./tools/check` passes 178 tests.
+The working revision is `599c3fa` on `main`, which uploads the sensor
+background and ports the Windows frame chain. `./tools/check` passes.
 
 ## Installed State
 
@@ -87,6 +86,20 @@ Rollback restores the `/opt/egis-driver.backup.*` directory reported by
   requires two consecutive 3-frame attempts, so no default sample could pass;
   the default is now 6. `install-stable.sh` left `/opt/egis-driver` mode 0700,
   so `egis-enroll` failed for normal users; it now stages the payload 0755.
+- Templates, thresholds and calibration samples now record the SHA-256 of the
+  sensor background they were made under. The matcher fails closed on
+  thresholds from a different background and treats such templates as
+  requiring re-enrollment; `egis-calibrate analyze` refuses samples from a
+  different background; and `egis-doctor` reports `sensor_background` and
+  `background_consistency`. Records written before this change carry no hash
+  and report `unrecorded` until they are rewritten.
+- The touch threshold of 31 was kept after the background was installed. Live
+  journal data shows empty frames at contrast 2.1 (maximum 5.2), lift
+  transitions up to about 20, and enrollment touches at 31–40. Verification
+  already triggers at 24 or at baseline + 8, and enrollment stores the first
+  frame that crosses the threshold, so lowering it would enroll less settled
+  frames. The constant also still serves installations without a background,
+  whose empty frames sit near 13.
 
 The durable design and research context lives in
 [architecture.md](architecture.md),
@@ -107,8 +120,9 @@ stages before the repair were recovered and ported (`windows_image.py`).
 SourceAFIS replay through that chain improved one genuine touch only. It also
 exposed an evidence-backed sensor-configuration difference: Linux omits the
 `vdm_bk` background upload. A live test confirmed the upload removes Linux
-saturation, and Linux can now fit the table itself. What remains is installing
-the table, re-recording enrollment and probes with it, and wiring the Windows
+saturation, and Linux can now fit the table itself. The table is installed and
+enrollment and thresholds were rebuilt with it on 2026-10-20. What remains is
+an untouched holdout session and, only if it disappoints, wiring the Windows
 chain into capture.
 
 If matching on uploaded, Windows-processed frames still does not separate
@@ -122,5 +136,7 @@ SourceAFIS offline.
 2. Confirm the actual CI conclusion on `main`; inspecting `ci.yml` is not enough.
 3. Run `egis-doctor --json`.
 4. Confirm `EGIS_MATCH_MODE=window` is still effective.
-5. Install the sensor background (`sudo ./egis-lab calibrate-sensor-background`)
-   and re-record enrollment and probes with it before any further matcher work.
+5. Confirm `egis-doctor` reports `sensor_background: installed` and a
+   `background_consistency` other than `mismatch`. After any background
+   recalibration, re-enroll and rebuild thresholds.
+6. Collect an untouched holdout session before any further matcher work.
