@@ -24,9 +24,9 @@ The same structure serializes:
 - one intermediate byte at offset 0x14fa;
 - `bad_pixel`: 5,356 binary bytes beginning at offset 0x14fb.
 
-The intermediate byte is used as a replacement/fill value by the calibration
-statistics path (`FUN_1800082d4`). The image-repair path below does not read
-it.
+The intermediate byte is the bad-pixel fill value used by `FUN_1800082d4`,
+which runs on every captured frame (stage 1 under "Recovered Frame
+Processing"). The image-repair path below does not read it.
 
 Bad-pixel calibration (`FUN_180008bf4`) clears the map, captures three frames,
 computes a frame reference value, and marks pixels whose absolute deviation
@@ -109,9 +109,103 @@ The bad-pixel repair is therefore on the live capture path. `FUN_180016468`
 additionally subtracts the image minimum and returns 0xe without repair for
 quality scores below 60. Its caller was not traced.
 
-The remaining unrecovered stages between the USB frame and the repair are
-`FUN_1800099d4`, `FUN_18000b5d0`, `FUN_180008010`, and `FUN_180005184`;
-the repair cannot be reproduced on Linux until they are known.
+The stages between the USB frame and the repair are recovered below.
+
+## Recovered Frame Processing
+
+Recovered 2026-10-19 and ported to `egis_matcher/windows_image.py`. Every
+routine was checked bit for bit against the driver's own code, executed under
+CPU emulation (Unicorn, x86-64) on real v4 frames, synthetic ridge patterns,
+noise, flat images, and random bad-pixel maps up to 15% density: 120 cases for
+each stage primitive (genuine and impostor captures) and 480 for stage 1 and
+the repair, with no mismatches.
+A mutation check confirmed that the comparison detects single-constant
+changes. `tests/test_windows_image.py` pins the full chain to digests the
+emulated driver produced for deterministic synthetic (non-biometric) frames,
+so CI enforces equivalence without the DLL.
+
+The per-frame chain in state 0x15 (`FUN_18000a93c`) is:
+
+1. **Exposure and minimum subtraction** (`FUN_1800099d4` → `FUN_18000938c` →
+   `FUN_1800095e0`). `FUN_18000938c` is hardware exposure control: it samples a
+   window and steps sensor registers 0x0f and 0x12 using a 16-entry step table
+   when the window saturates or bottoms out; it changes no pixels. The frame is
+   then read (`FUN_18000c220`), and `FUN_1800082d4` overwrites every pixel
+   whose `bad_pixel` byte is exactly 1 with `calib[0x14fa] + 1` and returns
+   the minimum of the other pixels. `FUN_1800095e0` subtracts that minimum
+   from every byte with uint8 wraparound. No host-side `vdm_bk` subtraction
+   occurs anywhere on this path: the calibration loader uploads `vdm_bk` to
+   the sensor as the 5,356-byte `0x73` payload (see the replay notes under
+   "Matcher Diagnostics"), so background subtraction happens on the sensor.
+2. **Inversion** (`FUN_18000b5d0(image, 0)`): `p = 255 - p`.
+3. **Corner correction** (`FUN_180008010(image, 103, 52, 0)`). Resample a copy
+   to 160×80 (`FUN_180005e70`: separable area-weighted box resampling in
+   1/1024 fixed point, vertical pass first, `(sum + step/2) / step`), then
+   segment it (`FUN_1800138e0` mode 3; below) into a 10×5 block coherence
+   map. For each image corner's 8×8 block, the coherence of the matching map
+   corner (grid bytes 0, 9, 40, 49) selects a bucket: below 60 is background,
+   above 120 is ridge, otherwise ignored (`FUN_18000a43c`). With `bg` and
+   `fg` the bucket means, if any background corner exists and
+   `255 - bg <= 255 - fg`, add `255 - bg` to every pixel with clamping
+   (`FUN_18000610c`). If the resampled image's mean is at least 245 the
+   segmentation is skipped and the corners are read from the resampled
+   pixels themselves.
+4. **Quality score** (`FUN_18000b670` → `FUN_180014dac`), on a 144×80 resample
+   (9×5 blocks). It returns `(score, corners, edges)`:
+   - if the image mean is at least 245, the score is 0;
+   - a copy with its brightest eighth saturated (`FUN_18000623c`) gives an
+     Otsu threshold `t` and upper-class mean `u` (`FUN_180005b34`); a 16×16
+     block is "bright" when its mean is below `max(245, u - (u - t)/8)`;
+     `corners` counts bright blocks among the four corners and `edges` among
+     those four plus four edge blocks inset `(blocks_x - 4)/3` blocks;
+   - segmentation yields orientation and coherence maps; each bright block
+     whose mean is at least the image mean and whose map coherence is below
+     80 is subtracted back out of the counts;
+   - `score = 0` when at least two-thirds of the blocks have orientation
+     outside 4..116 (near-horizontal); otherwise
+     `score = 256 - 256 * background_blocks / blocks`, where a block is
+     background when at most half of its 3×3 neighbourhood has coherence
+     above 80 (`FUN_180013bbc`).
+5. **Frame selection** (`FUN_18000a93c`). The processed finger-detect frame
+   seeds the best image. Each new frame replaces it when both its score and
+   `edges` are at least the best's. The loop stops on a score below 60, on the
+   tenth frame, or from the second frame on when `edges > 7` and the score
+   moved by less than 9. Best `edges` below 2 sets flag 0x1, below 8 flag 0x8.
+6. **Normalisation** (`FUN_180005184(image, 103, 52, 0x8c)`). With `t` the Otsu
+   threshold over pixels below 240 (`FUN_180005d38`; first strict maximum of
+   the 64-bit between-class variance), `k = (255 - 0x8c) * 16 / (255 - t)`
+   (16 when `t = 255`) and each pixel becomes
+   `255 - clamp(((255 - p) * k + 8) >> 4, 0, 255)`.
+7. The bad-pixel repair above, then the vertical flip in `GetImage`.
+
+Segmentation (`FUN_1800138e0` / `FUN_180014dac`) applies, on 16×16 blocks:
+a 3×3 box mean (`FUN_18001497c`); a 9×9 box mean of that (`FUN_180014b1c`);
+a local contrast stretch of the 3×3 image around the 9×9 mean ± the mean
+absolute deviation over a radius-64 window (`FUN_18001456c`); another 3×3
+box mean; then per-block gradient moments (`FUN_180013d2c`). Box means clip
+their window at the image edge and divide by the clipped sample count.
+Gradients use 1-4-1 weights,
+`gx = (b[x+1]-t[x-1]) + 4(m[x+1]-m[x-1]) + (t[x+1]-b[x-1])` and
+`gy = (b[x+1]-t[x-1]) + 4(b[x]-t[x]) - (t[x+1]-b[x-1])`, accumulated in
+32-bit integers over each block (excluding the outer image ring) and summed
+over the clipped 3×3 block neighbourhood, divided by 2304 with rounding.
+Orientation uses the same half-angle arctangent as the repair. Coherence is
+`sqrt(((Sxx'-Syy')² + (2Sxy')²) / ((Sxx'+Syy')²/65025))` on the moments
+divided by 36 and halved twice (truncated at each step), zero when the
+divided-by-36 `Sxx + Syy` is below 50². The square root uses a tiered table whose entries are
+exactly `round(sqrt((q >> s) << s))` for `s = 0, 4, 5, 6, 7`, followed by a
+nearest-integer refinement. Neither table needs to be copied from the driver.
+
+Two shipped-code quirks are reproduced deliberately. The repair's widening
+step can write one byte past its 5,356-byte stack copy of the map, and the
+orientation mask check (a 32-bit load) can read that byte; the port models it
+as an extra map byte that starts at zero. The repair interpolator advances
+its weight index only inside rows that are in range, so at the top and bottom
+image rows the weights shift relative to their neighbours.
+
+Hardware exposure control and the finger-detect state (`FUN_18000ac9c`,
+including its `FUN_18001542c` touch test) are not ported; they decide when
+frames are taken, not how pixels are computed.
 
 ## CET300 Difference Conversion (Not on the EH575 Path)
 
@@ -173,8 +267,9 @@ The observed Windows-side lifecycle is:
 2. select detect or sensor calibration mode;
 3. configure sensor registers and image mode;
 4. fetch one 103×52 raw image;
-5. process it through the unrecovered stages listed under Production Capture
-   Path, then repair bad pixels and flip it vertically;
+5. process it through the stages under "Recovered Frame Processing", select
+   the best of up to ten frames, normalise, repair bad pixels, and flip it
+   vertically;
 6. submit the resulting image to the Windows biometric engine;
 7. restore detection/remote-wakeup behavior.
 
@@ -228,6 +323,80 @@ untouched controls produced zero frames. The same 5,356-byte `0x73` calibration
 upload (SHA-256 `183c3fad...fb676`) recurred byte-for-byte across independent
 processes and touches, which establishes that it is stable device calibration
 state rather than touch image data.
+
+### Linux omits the background upload (2026-10-19)
+
+Decoding the v4 genuine-touch PCAP command by command shows that the Linux
+`EH575_PROFILE` init, final, rearm, and trigger strings are a byte-for-byte
+replay of the Windows stream, with one omission: Windows sends `73 14 ec` and
+the 5,356-byte `vdm_bk` payload immediately after `61 50 03` / `60 50 03` and
+before `60 40 ec`; Linux never does. Since that payload is the sensor
+background (see "Matcher Diagnostics"), Linux frames are never
+background-subtracted on the sensor. The difference is visible in the data:
+
+| Source | Frames | Mean | Pixels at 255 | Frames reaching 255 |
+|--------|--------|------|---------------|---------------------|
+| Windows v4 stream | 714 | 119 | 1.8% (p95 7.8%) | 27% |
+| Linux sequences | 10,191 | 207 | 19.3% (p95 61%) | 96% |
+
+Linux also replays the Windows exposure probe (`63 2c 02 00 57`, `62 67 03`
+reads min/max/mean) but ignores the result; Windows reads register 0x0f and
+would step it (`FUN_18000938c`) on saturation. In the v4 session the probe
+never saturated, so Windows left 0x0f at 0x20.
+
+`EgisDriver(background=...)` can now send the upload at the Windows position.
+It is off by default: every Linux threshold and enrollment was built from
+non-subtracted frames.
+
+A live A/B on the same sensor (2026-10-20, 20 empty and 40 touch frames per
+mode, same finger) confirmed the effect. The sensor acknowledged the upload
+(`SIGE 14 ec 01`) and its output moved to Windows levels:
+
+| | Current Linux init | With `vdm_bk` upload |
+|---|---|---|
+| Empty mean / within-frame std | 228 / 13.0 | 102 / 2.8 |
+| Empty pixels at 255 | 2.3% | 0% |
+| Touch mean | 193 | 121 |
+| Touch pixels at 255 / frames reaching 255 | 5.5% / 100% | 0% / 0% |
+| Windows quality score, median | 228 | 256 |
+
+A repeat run minutes later reproduced it: current-init touch frames saturated
+26.7% of pixels (every frame clipped) against 0% with the upload, and empty
+frames again settled at mean 102, std 2.8. Linux clipping therefore varies
+widely between touches; the upload removes it in both runs.
+
+The empty-frame level matches the Windows exposure probe (min/mean/max 97–104
+in the v4 PCAP). After the Windows chain, ridges in the uploaded frames are
+continuous where the current frames show broken, noisy ridges. The payload
+used was the v4 Windows upload for this sensor.
+
+**Generating the table on Linux.** Windows builds `vdm_bk` once, at
+calibration (`FUN_180007bc0`): pre-calibration `FUN_180009a40` reads the
+min/max/mean statistics (`63 2c 02 00 15`, poll 0x2d, `62 67 03`) and writes
+the mean to register 0x33 (`63 33 03 <mean> 10 01`, poll 0x35); then
+`FUN_1800096d8` sets register 0x50 to 1 and reads 5,356 bytes with opcode
+0x72 (`FUN_180017f64`, framed exactly like the `0x64` image read). No Windows
+capture contains this exchange; every session reused the stored table. On
+the live sensor the same sequence is acknowledged and the registers settle as
+expected, but `0x72` returned 5,356 zero bytes in every state tried: after
+init, after uploading the Windows table, and after the full pre-calibration.
+Uploading an all-zero table then zeroed every frame, so `vdm_bk` is a
+per-pixel level control rather than a subtracted image, and it persists
+across re-initialisation until replaced.
+
+The table is instead fitted directly. With uniform tables the empty-frame
+output is linear in the table value for every pixel (slope 5.52, p5–p95
+5.46–5.59; residual RMS 0.35 over levels 24–38). Solving each pixel's line for
+the Windows empty level (102.6) gives a table with mean 31.11 and std 2.41,
+against 31.09 and 2.31 for Windows; 99.87% of pixels are within one step of
+the Windows table (correlation 0.976). Empty frames with the fitted table were
+flatter than with Windows' own (std 2.09 versus 2.83). `EgisDriver.calibrate_background()`
+implements this fit with levels 24, 31, and 38; it needs an untouched sensor.
+`sudo ./egis-lab calibrate-sensor-background` runs it, rejects results whose
+empty frames are not flat near the target (a finger on the sensor), and
+installs the table as `egis-sensor-background.bin` under the data root. The
+service and `record-sequence` upload that file when present, and recorded
+sequences store its SHA-256 as `sensor_background_sha256`.
 
 ## Enrollment Engine
 
@@ -303,6 +472,45 @@ Naive transforms using the repeated 5,356-byte calibration upload—including
 offset background subtraction in both polarities, per-frame normalization, and
 CLAHE—did not recover the two weak genuine trials or create a safe separation.
 They remain diagnostics and must not be promoted into authentication.
+
+### Replay through the recovered Windows chain (2026-10-19)
+
+The same v4 frames were replayed through `windows_image` (stages 1–3, the
+quality gate at 60, normalisation, flip) with an all-zero bad-pixel map: the
+v4 capture does not include the device registry key that holds `bad_pixel`
+(written through WDF registry callbacks by `FUN_18000bb6c`/`FUN_18000bd4c`),
+and no pixel deviated by more than 0x20 from its frame median in even 90% of
+the 714 replayed frames, so no stuck pixels are evident. The Windows output has dark
+ridges on a whitened background; the raw strips' row-stripe artifacts are
+largely suppressed. The quality gate accepted 302 of the enrollment frames and
+36–37 frames per genuine touch.
+
+SourceAFIS at scale 3 against all 302 accepted enrollment frames, 25 evenly
+spaced accepted frames per probe touch, compared with inverted raw frames on
+the same frame selection:
+
+| Probe | Raw max / ≥40 | Windows chain max / ≥40 |
+|-------|---------------|-------------------------|
+| genuine 1 | 16.0 / 0 | 7.6 / 0 |
+| genuine 2 | 46.5 / 4 | 62.2 / 20 |
+| genuine 3 | 11.1 / 0 | 22.4 / 0 |
+| pinky 1–3 | ≤ 23.1 / 0 | ≤ 15.2 / 0 |
+
+Scales 2 and 4 were worse for both inputs. The corrected images strengthen
+one genuine touch markedly and lower impostor maxima, but two touches that
+Windows accepted still have no matching frame. The Windows image correction is
+therefore not the remaining gap; the Egis matcher's handling of these narrow
+strips is. NBIS was not installed on the analysis host and was not run.
+
+The loader also settles the `0x73` upload: `FUN_18000bb6c` reads `vdm_bk`
+and passes it directly to `FUN_180009964` → `FUN_18000c490`, which sends
+`width * height` bytes through transport-object slot 0x78. In the vtable at
+0x18003f4c0 (installed by the constructor at 0x1800154d8) that slot is
+`FUN_180019514`, the opcode-0x73 wrapper. The observed 5,356-byte `0x73`
+payload is therefore the `vdm_bk` background, and background subtraction
+happens on the sensor. Byte 0x14fa is not persisted; it
+is the "vdm target mean" read back from the sensor by `FUN_180009748` during
+calibration.
 
 The implementation direction supported by current evidence is a gallery of
 per-presentation feature records with stream-level temporal evidence. SIFT can

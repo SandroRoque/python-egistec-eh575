@@ -24,7 +24,7 @@ from egis_driver.lab_artifact import (
     validate_candidate_freeze,
 )
 from egis_driver.compatibility import doctor_report, public_compatibility_report
-from egis_driver.egis_driver import EgisDriver
+from egis_driver.egis_driver import EgisDriver, load_sensor_background
 from egis_driver.fingerprint_matcher import FingerprintMatcher as ProductionMatcher
 from egis_driver.persistence import Persistence
 from egis_driver.runtime_config import RuntimePaths
@@ -256,6 +256,44 @@ def cmd_freeze_candidate(args):
     print(output)
 
 
+def cmd_calibrate_sensor_background(args):
+    if os.geteuid() != 0:
+        raise SystemExit("Run with: sudo ./egis-lab calibrate-sensor-background")
+    target = RuntimePaths.from_environment().sensor_background_path
+    if target.exists() and not args.replace:
+        raise SystemExit(f"{target} exists; pass --replace to overwrite it")
+    input("Keep the sensor clear (no finger) until calibration finishes, then press Enter...")
+    subprocess.run(["systemctl", "stop", "egis-bridge"], check=True)
+    driver = None
+    try:
+        driver = EgisDriver()
+        table = driver.calibrate_background()
+        frames = [np.frombuffer(bytes(driver.get_live_frame()[0]), np.uint8)
+                  for _ in range(10)]
+    finally:
+        if driver is not None:
+            driver.release_for_sleep()
+        subprocess.run(["systemctl", "start", "egis-bridge"], check=False)
+    empty = np.stack(frames).astype(float)
+    values = np.frombuffer(table, np.uint8)
+    summary = {
+        "table_mean": round(float(values.mean()), 2),
+        "table_std": round(float(values.std()), 2),
+        "empty_mean": round(float(empty.mean()), 2),
+        "empty_std": round(float(empty.std(axis=1).mean()), 2),
+        "sha256": hashlib.sha256(table).hexdigest(),
+    }
+    if not 90 <= summary["empty_mean"] <= 115 or summary["empty_std"] > 6:
+        raise SystemExit(f"calibration rejected (finger present?): {json.dumps(summary)}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_bytes(table)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(target)
+
+
 def cmd_record_sequence(args):
     if os.geteuid() != 0:
         raise SystemExit("Run with: sudo ./egis-lab record-sequence --label LABEL")
@@ -276,13 +314,16 @@ def cmd_record_sequence(args):
     pump = None
     driver = None
     try:
-        driver = EgisDriver()
+        driver = EgisDriver(background=load_sensor_background(
+            RuntimePaths.from_environment().sensor_background_path))
         recorder = SequenceRecorder(destination, metadata={
             "role": args.role,
             "label": args.label,
             "finger": args.finger,
             "source_commit": commit,
             "sensor_profile": driver.profile.name,
+            "sensor_background_sha256": (hashlib.sha256(driver.background).hexdigest()
+                                         if driver.background is not None else None),
             **({"session_id": args.session_id,
                 "attempt": args.attempt,
                 "capture_order": args.capture_order}
@@ -1143,6 +1184,13 @@ def build_parser():
     freeze.add_argument("--development-report", required=True)
     freeze.add_argument("--output", required=True)
     freeze.set_defaults(func=cmd_freeze_candidate)
+
+    background = sub.add_parser(
+        "calibrate-sensor-background",
+        help="Fit and install this sensor's vdm_bk background table",
+    )
+    background.add_argument("--replace", action="store_true")
+    background.set_defaults(func=cmd_calibrate_sensor_background)
 
     record = sub.add_parser(
         "record-sequence",

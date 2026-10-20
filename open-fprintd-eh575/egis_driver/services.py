@@ -1,3 +1,4 @@
+import functools
 import logging
 import queue
 import threading
@@ -66,8 +67,13 @@ class EgisService:
                  matcher_worker=None, on_enroll_prompt=None):
         runtime_paths = runtime_paths or RuntimePaths.from_environment()
         self._persistence = persistence or Persistence(str(runtime_paths.data_root))
-        self._sensor = (SensorController(backend=driver) if driver is not None
-                        else SensorController(backend_factory=egis_driver.EgisDriver))
+        if driver is not None:
+            self._sensor = SensorController(backend=driver)
+        else:
+            background = egis_driver.load_sensor_background(
+                runtime_paths.sensor_background_path)
+            self._sensor = SensorController(backend_factory=functools.partial(
+                egis_driver.EgisDriver, background=background))
         try:
             self._matcher = matcher or fingerprint_matcher.FingerprintMatcher(
                 persistence=self._persistence,

@@ -26,6 +26,8 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(paths.calibration_dir, Path("/tmp/offline/egis-calibration"))
         self.assertEqual(paths.atlas_dir, Path("/tmp/offline/egis-atlas"))
         self.assertEqual(paths.gallery_dir, Path("/tmp/offline/egis-gallery"))
+        self.assertEqual(paths.sensor_background_path,
+                         Path("/tmp/offline/egis-sensor-background.bin"))
 
 
 if __name__ == "__main__":

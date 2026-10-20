@@ -145,6 +145,8 @@ EGIS_BRIDGE_ENABLED="$(systemctl is-enabled egis-bridge 2>/dev/null || true)"
 trap 'rollback $?' EXIT
 
 STAGE_DIR="$(mktemp -d /opt/.egis-driver.stage.XXXXXX)"
+# mktemp creates 0700; the payload must stay readable so users can run egis-enroll.
+chmod 0755 "$STAGE_DIR"
 CONFIG_BACKUP="$(mktemp -d /tmp/egis-config-backup.XXXXXX)"
 
 for executable in "${PAYLOAD[@]}"; do

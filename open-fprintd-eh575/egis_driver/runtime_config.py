@@ -30,6 +30,11 @@ class RuntimePaths:
         return self.data_root / "egis-calibration"
 
     @property
+    def sensor_background_path(self):
+        """Per-device vdm_bk table; the driver uploads it only if present."""
+        return self.data_root / "egis-sensor-background.bin"
+
+    @property
     def gallery_dir(self):
         return self.data_root / "egis-gallery"
 

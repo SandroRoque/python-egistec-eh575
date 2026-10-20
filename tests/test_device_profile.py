@@ -5,7 +5,11 @@ from unittest import mock
 import numpy as np
 
 from egis_driver.device_profile import EH575_FRAME, EH575_PROFILE, FrameSpec
-from egis_driver.egis_driver import EgisDriver
+import tempfile
+from pathlib import Path
+
+from egis_driver.egis_driver import (
+    EgisDriver, fit_background_table, load_sensor_background)
 from egis_driver.image_features import ImageFeatureExtractor
 
 
@@ -106,6 +110,109 @@ class DeviceProfileTests(unittest.TestCase):
     def test_multiple_devices_require_explicit_selection(self):
         with self.assertRaisesRegex(RuntimeError, "Multiple EgisTec EH575"):
             self._driver([FakeDevice(), FakeDevice()])
+
+
+class RecordingDevice(FakeDevice):
+    """Acknowledges every EGIS command and records the OUT stream."""
+
+    def __init__(self, upload_ack=b"SIGE\x14\xec\x01"):
+        super().__init__()
+        self.writes = []
+        self.upload_ack = upload_ack
+        self._pending = b""
+
+    def write(self, endpoint, data):
+        data = bytes(data)
+        self.writes.append(data)
+        if data[:5] == b"EGIS\x73":
+            self._pending = None
+        elif self._pending is None:
+            self._pending = self.upload_ack
+        else:
+            self._pending = b"SIGE" + data[5:7] + b"\x01"
+
+    def read(self, endpoint, size, timeout=None):
+        return self._pending or b"SIGE\x00\x00\x01"
+
+
+class BackgroundUploadTests(unittest.TestCase):
+    def _initialize(self, device, background):
+        with mock.patch.object(EgisDriver, "_self_test"), mock.patch("time.sleep"):
+            return EgisDriver(usb_core=FakeUsbCore([device]), usb_util=FakeUsbUtil(),
+                              background=background)
+
+    def test_upload_matches_windows_position_and_framing(self):
+        device = RecordingDevice()
+        background = bytes(range(256)) * 20 + bytes(236)
+        self._initialize(device, background)
+        index = device.writes.index(b"EGIS\x73\x14\xec")
+        self.assertEqual(device.writes[index + 1], background)
+        self.assertEqual(device.writes[index - 1], bytes.fromhex("45 47 49 53 60 50 03"))
+        self.assertEqual(device.writes[index + 2], bytes.fromhex("45 47 49 53 60 40 ec"))
+
+    def test_rejected_upload_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "rejected background upload"):
+            self._initialize(RecordingDevice(upload_ack=b"SIGE\x14\xec\x00"), bytes(5356))
+
+    def test_default_driver_sends_no_upload(self):
+        device = RecordingDevice()
+        self._initialize(device, None)
+        self.assertNotIn(b"EGIS\x73\x14\xec", device.writes)
+
+    def test_background_size_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "one byte per pixel"):
+            EgisDriver(usb_core=FakeUsbCore([FakeDevice()]), usb_util=FakeUsbUtil(),
+                       background=b"\0" * 10)
+
+
+class SensorBackgroundFileTests(unittest.TestCase):
+    def test_missing_file_means_no_upload(self):
+        self.assertIsNone(load_sensor_background(Path("/nonexistent/egis-bg.bin")))
+
+    def test_valid_file_is_loaded_and_size_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bg.bin"
+            path.write_bytes(bytes(5356))
+            self.assertEqual(load_sensor_background(path), bytes(5356))
+            path.write_bytes(bytes(10))
+            with self.assertRaisesRegex(ValueError, "5356 bytes"):
+                load_sensor_background(path)
+
+
+class BackgroundFitTests(unittest.TestCase):
+    def test_fit_recovers_per_pixel_table(self):
+        rng = np.random.default_rng(3)
+        truth = rng.integers(25, 38, size=5356)
+        slope = rng.uniform(5.4, 5.6, size=5356)
+        levels = (24, 31, 38)
+        responses = [102.6 + slope * (level - truth) for level in levels]
+        table = np.frombuffer(fit_background_table(levels, responses), np.uint8)
+        np.testing.assert_array_equal(table, truth)
+
+    def test_fit_rejects_flat_response(self):
+        with self.assertRaisesRegex(RuntimeError, "not increasing"):
+            fit_background_table((24, 31), [np.full(4, 50.0), np.full(4, 50.0)])
+
+    def test_calibration_uploads_levels_then_fitted_table(self):
+        driver = EgisDriver.__new__(EgisDriver)
+        driver.frame_spec = EH575_FRAME
+        uploads = []
+        offsets = np.arange(5356) % 7
+
+        def initialize():
+            uploads.append(driver.background)
+
+        def frame():
+            level = driver.background[0]
+            data = np.clip(102.6 + 5.5 * (level - 28 - offsets), 0, 255)
+            return np.rint(data).astype(np.uint8).tobytes(), 0.0
+
+        driver._initialize_sensor = initialize
+        driver.get_live_frame = frame
+        table = driver.calibrate_background(frames=2)
+        self.assertEqual([upload[0] for upload in uploads[:3]], [24, 31, 38])
+        self.assertEqual(uploads[-1], table)
+        np.testing.assert_array_equal(np.frombuffer(table, np.uint8), 28 + offsets)
 
 
 if __name__ == "__main__":

@@ -19,10 +19,51 @@ USB_SYSFS_ROOT = "/sys/bus/usb/devices"
 
 logger = logging.getLogger("DRIVER")
 
+# Empty-frame level the Windows vdm_bk table produces on the EH575, and the
+# uniform tables used to fit a per-pixel replacement (windows-pipeline.md).
+BACKGROUND_TARGET = 102.6
+BACKGROUND_FIT_LEVELS = (24, 31, 38)
+
+
+def fit_background_table(levels, responses, target=BACKGROUND_TARGET):
+    """Solve each pixel's linear vdm_bk response for ``target``.
+
+    ``responses[i]`` is the mean empty frame captured with a uniform table of
+    ``levels[i]``. Returns the per-pixel table as bytes.
+    """
+    levels = np.asarray(levels, dtype=float)
+    responses = np.asarray(responses, dtype=float)
+    if levels.ndim != 1 or len(levels) < 2 or responses.shape[0] != len(levels):
+        raise ValueError("background fit needs at least two uniform levels")
+    slope, intercept = np.polyfit(levels, responses, 1)
+    if np.any(slope <= 0):
+        raise RuntimeError("sensor background response is not increasing")
+    table = np.clip(np.rint((target - intercept) / slope), 0, 255)
+    return table.astype(np.uint8).tobytes()
+
+def load_sensor_background(path, byte_count=EH575_PROFILE.frame.byte_count):
+    """Return the stored vdm_bk table, or None when none is installed."""
+    try:
+        data = open(path, "rb").read()
+    except FileNotFoundError:
+        return None
+    if len(data) != byte_count:
+        raise ValueError(f"sensor background {path} must be {byte_count} bytes")
+    return data
+
+
 class EgisDriver:
-    def __init__(self, profile=EH575_PROFILE, usb_core=None, usb_util=None):
+    def __init__(self, profile=EH575_PROFILE, usb_core=None, usb_util=None, background=None):
         self.profile = profile
         self.frame_spec = profile.frame
+        if background is not None:
+            background = bytes(background)
+            if len(background) != self.frame_spec.byte_count:
+                raise ValueError("sensor background must contain one byte per pixel")
+        # Optional vdm_bk upload (EGIS opcode 0x73). The Windows driver sends it
+        # between the init and final commands; without it the sensor does not
+        # subtract its background. Experimental: thresholds assume no upload.
+        self.background = background
         self._usb_core = usb_core or usb.core
         self._usb_util = usb_util or usb.util
         self._usb_lock = threading.RLock()
@@ -152,6 +193,9 @@ class EgisDriver:
             _counted_send(c)
             time.sleep(0.002)
 
+        if self.background is not None:
+            self._upload_background(read_timeout)
+
         for command in self.profile.final_commands:
             _counted_send(command)
 
@@ -165,6 +209,44 @@ class EgisDriver:
         # image data. Flat empty-frame contrast is still useful diagnostic
         # signal, but it can be normal when no finger is present.
         self._self_test()
+
+    def _upload_background(self, timeout_ms):
+        """Send vdm_bk as Windows does: ``EGIS 73 14 ec``, the payload, then
+        expect the seven-byte ``SIGE 14 ec 01`` acknowledgement."""
+        size = len(self.background)
+        header = b"EGIS\x73" + size.to_bytes(2, "big")
+        self.dev.write(self.profile.endpoint_out, header)
+        self.dev.write(self.profile.endpoint_out, self.background)
+        response = bytes(self.dev.read(self.profile.endpoint_in, 64, timeout=timeout_ms))
+        if response != b"SIGE" + size.to_bytes(2, "big") + b"\x01":
+            raise RuntimeError(f"sensor rejected background upload: {response.hex()}")
+        logger.info("Uploaded %d-byte sensor background", size)
+
+    def calibrate_background(self, levels=BACKGROUND_FIT_LEVELS, frames=10,
+                             target=BACKGROUND_TARGET):
+        """Measure a per-pixel vdm_bk table for this sensor. The sensor must be
+        untouched.
+
+        The Windows install-time calibration (opcode 0x72 after register 0x50
+        mode 1) returns zeros on this hardware, so the table is fitted
+        instead: upload uniform tables, record each pixel's empty-frame
+        response, and solve the linear response for ``target``. Leaves the
+        sensor initialised with the fitted table.
+        """
+        responses = []
+        for level in levels:
+            self.background = bytes([level]) * self.frame_spec.byte_count
+            self._initialize_sensor()
+            captured = []
+            while len(captured) < frames:
+                data, _ = self.get_live_frame()
+                if data is None:
+                    raise RuntimeError("background calibration capture failed")
+                captured.append(np.frombuffer(bytes(data), dtype=np.uint8))
+            responses.append(np.mean(captured, axis=0))
+        self.background = fit_background_table(levels, responses, target)
+        self._initialize_sensor()
+        return self.background
 
     def _self_test(self):
         """Verify the sensor is producing frames after initialization."""

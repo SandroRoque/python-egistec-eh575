@@ -14,6 +14,7 @@ from egis_driver.fingerprint_matcher import (
     FingerprintMatcher,
 )
 from egis_driver.persistence import Persistence
+from egis_driver.runtime_config import RuntimePaths
 from egis_matcher.policy import ConfirmationPolicy, ConfirmationTracker, passes_thresholds
 
 IDENTITY_POLICY = {
@@ -107,7 +108,8 @@ def save_sample(args, frames, frame_elapsed_ms=None):
 
 
 def collect(args):
-    driver = egis_driver.EgisDriver()
+    driver = egis_driver.EgisDriver(background=egis_driver.load_sensor_background(
+        RuntimePaths.from_environment().sensor_background_path))
     for idx in range(args.samples):
         print(f"\nSample {idx + 1}/{args.samples}: {args.label} actual={args.actual_finger} target={args.target_finger}")
         frames, frame_elapsed_ms = capture_attempt(driver, args.frames)
@@ -389,7 +391,8 @@ def main():
     collect_p.add_argument("--actual-finger", required=True)
     collect_p.add_argument("--label", choices=["genuine", "impostor"], required=True)
     collect_p.add_argument("--samples", type=int, default=5)
-    collect_p.add_argument("--frames", type=int, default=3)
+    collect_p.add_argument(
+        "--frames", type=int, default=ATTEMPT_FRAME_COUNT * MIN_CONFIRMED_ATTEMPTS)
     collect_p.add_argument("--session-id")
     collect_p.add_argument("--candidate-freeze-sha256")
     collect_p.set_defaults(func=collect)
