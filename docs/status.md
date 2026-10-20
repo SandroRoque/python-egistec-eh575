@@ -47,12 +47,14 @@ Rollback restores the `/opt/egis-driver.backup.*` directory reported by
 - Only one identity is enrolled per finger, so `min_margin` cannot
   discriminate.
 - SourceAFIS and NBIS remain offline-only and non-authoritative.
-- The Windows difference conversion at vtable slot `0x120` was recovered on
-  2026-10-19: it is a gain/offset/clamp formula, not a stored table, and
-  `windows_difference_lut()` in `calibration.py` generates the 511-entry LUT
-  from it (see [windows-pipeline.md](windows-pipeline.md)). Windows
-  bad-pixel replacement remains unresolved, so `calibration.py` still fails
-  closed for any profile whose bad-pixel map is non-empty.
+- The vtable slot `0x120` difference conversion was recovered on 2026-10-19,
+  but a later trace showed it belongs to the 128×128 `CET300` base class. The
+  EH575 (`ET510` subclass) capture path never calls it, so
+  `windows_difference_lut()` is not an EH575 correction. The EH575 path and
+  its bad-pixel repair are traced in [windows-pipeline.md](windows-pipeline.md);
+  four frame-processing stages before the repair (`FUN_1800099d4`,
+  `FUN_18000b5d0`, `FUN_180008010`, `FUN_180005184`) remain unrecovered, so
+  `calibration.py` still cannot reproduce Windows images.
 
 The durable design and research context lives in
 [architecture.md](architecture.md),
@@ -66,11 +68,12 @@ Part B, Windows calibration recovery, is limited to two hours with a mandatory
 60-minute checkpoint. Part C must produce one sequence representation that both
 engines can replay before any holdout is collected.
 
-The conversion half of Part B is done (2026-10-19). What remains is the
-bad-pixel adjacency traversal and production replacement rule, then corrected
-NBIS/SourceAFIS replay with a real `vdm_bk` background.
+As of 2026-10-19 the production capture path is traced from
+`IOCTL_BIOMETRIC_CAPTURE_DATA` to the WinBio payload, and the bad-pixel repair
+and final vertical flip are recovered. What remains is the four frame-processing
+stages before the repair, then corrected NBIS/SourceAFIS replay.
 
-If bad-pixel replacement is unrecoverable and no evidence-backed
+If those stages are unrecoverable and no evidence-backed
 sensor-configuration difference exists, stop matcher investment. Keep the single SIFT path at its
 experimental ceiling, keep password authentication available, and leave
 SourceAFIS offline.
@@ -81,4 +84,4 @@ SourceAFIS offline.
 2. Confirm the actual CI conclusion on `main`; inspecting `ci.yml` is not enough.
 3. Run `egis-doctor --json`.
 4. Confirm `EGIS_MATCH_MODE=window` is still effective.
-5. Decide explicitly whether to fund the remaining bad-pixel half of Part B.
+5. Decide explicitly whether to fund recovery of the remaining frame-processing stages.

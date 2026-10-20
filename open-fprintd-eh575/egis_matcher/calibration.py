@@ -12,6 +12,8 @@ from egis_matcher.frame import FrameSpec
 
 # CET300 slot 0x120 (EgisTouchFP0575.dll 3.7.1.1, 0x18001c870) and the field
 # defaults written by its base constructor 0x18001ba70; see windows-pipeline.md.
+# The EH575 (ET510 subclass) capture path never calls this slot, so this LUT
+# is not an EH575 correction.
 WINDOWS_DIFFERENCE_CONVERSION_PROVENANCE = "EgisTouchFP0575.dll:3.7.1.1:0x18001c870"
 
 

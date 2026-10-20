@@ -25,21 +25,103 @@ The same structure serializes:
 - `bad_pixel`: 5,356 binary bytes beginning at offset 0x14fb.
 
 The intermediate byte is used as a replacement/fill value by the calibration
-statistics path. That does not yet prove that the production image path uses
-the same bad-pixel replacement rule.
+statistics path (`FUN_1800082d4`). The image-repair path below does not read
+it.
 
-Bad-pixel calibration clears the map, captures three frames, computes a frame
-reference value, and marks pixels whose absolute deviation exceeds 0x20. The
-routine subsequently expands some adjacent marks and rejects an excessive map.
-The exact adjacency traversal and the production replacement consumer remain
-unresolved, so neither is implemented yet.
+Bad-pixel calibration (`FUN_180008bf4`) clears the map, captures three frames,
+computes a frame reference value, and marks pixels whose absolute deviation
+exceeds 0x20. The routine subsequently expands some adjacent marks and rejects
+an excessive map. That calibration-time expansion is still unresolved; it only
+matters when a new map is built, not when a stored map is applied.
 
-`CET300::GetImage` (0x1800107d0, export line 11484) computes
-`background_byte - raw_byte` for every pixel when `FetchImageMode != 2` and
-passes each signed difference through virtual slot 0x120 before writing the
-image submitted to the next stage.
+## Recovered Bad-Pixel Repair
 
-## Recovered Difference Conversion
+`FUN_18000c0f8(image, width, height, map, passes)` applies a stored map. Both
+callers pass width 103, height 52, the calibration `bad_pixel` map, and
+`passes = 2`. The stored map is never modified; the routine works on a stack
+copy.
+
+1. **Widening** (assembly-confirmed). Scan the copy in linear order; when
+   `m[i] == 1`, set `m[i+1] = 1` and skip index `i+1`. Every flagged pixel
+   therefore also flags its right neighbour, including across the row
+   boundary, with no cascade beyond one step.
+2. **Iterative repair** (`FUN_1800051c0`). For up to `passes` passes, visit
+   every pixel in row-major order whose map byte has bit 0 set:
+   - Estimate orientation with `FUN_180005360(image, map, x, y, w, h, 16)`:
+     over the 16×16 window `x-8..x+7`, `y-8..y+7`, skipping image borders, take
+     3×3 Prewitt (1,1,1) gradients `gx`, `gy` at every interior sample whose map bytes
+     at `x..x+2` on rows `y-1..y+1` are all zero. The check is off-centre by
+     one column in the shipped code (a 32-bit load at `x-1` masked with
+     `0xffffff00`; assembly-confirmed). Accumulate `gxx`, `gyy`, `gxy`; with
+     `n` samples and `avg(v) = (v + n/2) / n` in truncating C division,
+     `a = 2*avg(gxy)` and `b = avg(gxx) - avg(gyy)`. The angle is `atan2`-like in units of
+     1.5° (0..120 over 180°) from a 129-entry half-angle arctangent table at
+     0x18002d5b0 (entry `i = round(16*atan(i/128)/2/1.5°)`, verified for all
+     entries), with special results 30 when `b == 0, a <= 0` and 90 when
+     `b == 0, a > 0`. No samples returns 0xff (skip).
+   - Quantize to a direction bucket `((angle + 7) * 274 >> 12) mod 8`.
+   - Interpolate with `FUN_1800057a4`: weighted mean of the eight 3×3
+     neighbours using row `bucket` of the 8×8 weight table at 0x18002d640,
+     skipping neighbours whose map bit 0 is set and columns outside
+     `0..width-2`. Weight rows (neighbour order NW N NE W E SW S SE):
+     `0:[0,0,0,16,16,0,0,0]` (horizontal), `2:[16,0,0,0,0,0,0,16]`,
+     `4:[0,16,0,0,0,0,16,0]` (vertical), `6:[0,0,16,0,0,16,0,0]`, and odd rows
+     split weight 8 across the two adjacent directions. A zero weight sum
+     leaves the pixel flagged.
+   - A repaired pixel is written into the image immediately and its map byte
+     becomes 2, so later pixels in the same pass use the repaired value.
+   A pass that repairs nothing returns early.
+
+## Production Capture Path
+
+The EH575 sensor object is not a plain `CET300`. Its constructor
+`FUN_1800154fc` first runs the CET300 constructor 0x18000e894 and then
+installs vtable 0x18003f128, names the device "Fingerprint ET510", resets the
+image to 103×52, and shrinks the image buffer to 0x14ec bytes. The ET510
+vtable overrides `GetImage` (slot 0xb8 → 0x180016b70) and the WinBio payload
+(slot 0x90 → 0x1800161a4); it inherits slot 0x120 unchanged.
+
+`IOCTL_BIOMETRIC_CAPTURE_DATA` (0x440014) reaches the image as follows, each
+step a direct call unless noted:
+
+1. IOCTL dispatch `FUN_180019af4` → `FUN_18001e06c`, which validates the
+   request and starts worker thread `FUN_18001d85c` → `FUN_18001d19c`;
+2. `FUN_18001bf68` → sensor slot 0xb8 (virtual) = ET510 `GetImage`
+   0x180016b70;
+3. `FUN_18000b9e4` capture loop → `FUN_18000b178` (source file
+   `ET5XX\egis_fp_get_image.c`), a state machine: 0x13 initialise
+   (`FUN_180009d0c`), 0x14 finger wait (`FUN_18000a1a0`, `FUN_18000ac9c`), 0x15
+   frame processing `FUN_18000a93c` (calls `FUN_1800099d4`, `FUN_18000b5d0`,
+   `FUN_180008010`, and quality score `FUN_18000b670`; a low-quality result
+   0xe is tolerated here);
+4. still in state 0x15, copy the 5,356-byte frame, run
+   `FUN_180005184(image, 103, 52, 0x8c)`, then the bad-pixel repair
+   `FUN_18000c0f8`;
+5. back in `GetImage`, copy the result row by row from the last row upward, a
+   vertical flip, into the 0x14ec image buffer;
+6. the worker fills the WinBio payload through sensor slots 0x88 (0x30-byte
+   header, inherited) and 0x90 (0x1800161a4: a 0x1524-byte record with a
+   103×52, 363 dpi image copied from that buffer through sensor slot 0x20).
+
+The bad-pixel repair is therefore on the live capture path. `FUN_180016468`
+(ET510 slot 0xc0) is a separate route: it fetches an image logged as
+`bootRaw` and processes it through `FUN_18000b980` → `FUN_18000a82c`, which
+additionally subtracts the image minimum and returns 0xe without repair for
+quality scores below 60. Its caller was not traced.
+
+The remaining unrecovered stages between the USB frame and the repair are
+`FUN_1800099d4`, `FUN_18000b5d0`, `FUN_180008010`, and `FUN_180005184`;
+the repair cannot be reproduced on Linux until they are known.
+
+## CET300 Difference Conversion (Not on the EH575 Path)
+
+`CET300::GetImage` (0x1800107d0, export line 11484) belongs to the 128×128
+base class, which the ET510 subclass overrides. It computes
+`background_byte - raw_byte` over a 16 KiB background at object offset 0x390
+when `FetchImageMode != 2` and passes each signed difference through virtual
+slot 0x120. Neither the ET510 `GetImage` nor the production path above calls
+slot 0x120, so this conversion does not apply to EH575 images. It is recorded
+because an earlier revision of this document assumed it did.
 
 The CET300 constructor (0x18000e894) installs vtable 0x18003e570; slot 0xb8
 holds `GetImage`, confirming the base, and slot 0x120 holds 0x18001c870. That
@@ -67,17 +149,16 @@ return 255 - clamp(v, 0, 255)
 The defaults are written as two 8-byte stores (`0x30`, `0x80`) by the base
 constructor 0x18001ba70, which CET300's constructor calls first. No other
 write to these fields was found in the export, and no registry or calibration
-string names them, so the defaults are the observed production values. This
+string names them, so the defaults are the values a CET300 instance uses. This
 is static evidence only; a runtime override was not excluded by observation.
 
 With the defaults the conversion is `255 - min(255, (3 * d) * 255 / 128)` for
 `d >= 0` and 255 otherwise: non-positive differences are white, values fall by
 about six per step, and differences of 43 or more are black. The 511 possible
 inputs are this function's domain; there is no stored table.
-`windows_difference_lut()` in `calibration.py` generates the `difference_lut`
-indexed by `d + 255`, and its tests check it against an instruction-level
-transcription of 0x18001c870. That LUT reproduces this function exactly; whether Linux replay then matches
-Windows images still depends on the background frame and bad-pixel handling.
+`windows_difference_lut()` in `calibration.py` reproduces this function exactly
+(tested against an instruction-level transcription of 0x18001c870), but it
+describes CET300 output and must not be used as an EH575 `difference_lut`.
 
 Calibration metadata includes `CALIBRATE_VERSION(Sensor)`,
 `CALIBRATE_TYPE(Sensor)`, and `CALIBRATE_DATE(Sensor)`. Calibration and image
@@ -92,7 +173,8 @@ The observed Windows-side lifecycle is:
 2. select detect or sensor calibration mode;
 3. configure sensor registers and image mode;
 4. fetch one 103×52 raw image;
-5. optionally subtract `vdm_bk` through the recovered slot-0x120 conversion;
+5. process it through the unrecovered stages listed under Production Capture
+   Path, then repair bad pixels and flip it vertically;
 6. submit the resulting image to the Windows biometric engine;
 7. restore detection/remote-wakeup behavior.
 
